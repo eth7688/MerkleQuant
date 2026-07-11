@@ -1,0 +1,21 @@
+{
+  "name": "cryptorank-radar",
+  "version": "1.0.0",
+  "description": "Chinese CryptoRank radar skill for funding, airdrops, public sales, and daily briefs.",
+  "author": "caroline",
+  "tags": [
+    "cryptorank",
+    "web3",
+    "crypto",
+    "chinese",
+    "radar",
+    "latest"
+  ],
+  "requires": {
+    "env": [],
+    "credentials": [],
+    "bins": [
+      "python3"
+    ]
+  }
+}

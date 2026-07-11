@@ -1,0 +1,17 @@
+[Unit]
+Description=春雷交易系统 v1 - 自动交易服务
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/macd_bot
+ExecStart=/usr/bin/python3 /opt/macd_bot/web_ui.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/macd_bot/bot.log
+StandardError=append:/opt/macd_bot/bot.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

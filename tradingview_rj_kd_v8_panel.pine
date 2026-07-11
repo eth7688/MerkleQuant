@@ -1,0 +1,392 @@
+//@version=5
+indicator("AXIOM RJ KD V8 附图", shorttitle="RJ KD V8 附图", overlay=false, max_labels_count=300, max_lines_count=80)
+
+groupRJ = "RJ核心"
+kdjLen = input.int(9, "KDJ RSV长度", minval=1, group=groupRJ)
+kSmooth = input.int(3, "K线平滑长度", minval=1, group=groupRJ)
+dSmooth = input.int(3, "D线平滑长度", minval=1, group=groupRJ)
+rsiLen = input.int(9, "RSI长度", minval=1, group=groupRJ)
+rsiSmooth = input.int(1, "RSI平滑长度（原版=1）", minval=1, group=groupRJ)
+purpleMode = input.string("K线(贴近原版)", "紫线口径", options=["K线(贴近原版)", "普通RSI", "随机RSI", "J线RSI"], group=groupRJ)
+purpleScale = input.float(0.88, "紫线倍率（围绕50）", minval=0.1, maxval=2.0, step=0.01, group=groupRJ)
+purpleOffset = input.float(0.0, "紫线偏移", minval=-50.0, maxval=50.0, step=0.1, group=groupRJ)
+purpleClamp = input.bool(true, "紫线限制0-100", group=groupRJ)
+
+groupSignal = "信号规则"
+setupSource = input.string("原版综合关键K确认", "信号来源", options=["原版综合关键K确认", "原版J线0/100关键K确认", "全部信号", "J/R交叉确认", "J线0/100关键K确认"], group=groupSignal)
+jLongLevel = input.float(0.0, "做多线（J回0确认）", step=1.0, group=groupSignal)
+jShortLevel = input.float(100.0, "做空线（J回100确认）", step=1.0, group=groupSignal)
+confirmBars = input.int(6, "关键K确认根数", minval=1, maxval=100, group=groupSignal)
+engineAlignMode = input.bool(true, "自动交易对齐模式", group=groupSignal)
+
+groupFilter = "过滤"
+filterPreset = input.string("自定义", "过滤强度", options=["宽松", "均衡", "严格", "自定义"], group=groupFilter)
+directionFilter = input.string("关闭", "方向过滤", options=["RJ+EMA", "仅RJ方向", "关闭"], group=groupFilter)
+trendEmaLen = input.int(200, "趋势EMA长度", minval=1, group=groupFilter)
+customMinAdx = input.float(0.0, "自定义最低ADX", minval=0.0, step=0.5, group=groupFilter)
+customMinJRSpread = input.float(0.0, "自定义J/紫线最小差值", minval=0.0, step=0.5, group=groupFilter)
+customConfirmAtrBuffer = input.float(0.08, "自定义确认ATR缓冲", minval=0.0, step=0.01, group=groupFilter)
+customCooldownBars = input.int(0, "自定义信号冷却K数", minval=0, maxval=200, group=groupFilter)
+adxLen = input.int(14, "ADX长度", minval=1, group=groupFilter)
+adxSmooth = input.int(14, "ADX平滑长度", minval=1, group=groupFilter)
+useVolumeFilter = input.bool(true, "启用信号K成交量过滤", group=groupFilter)
+volLen = input.int(20, "成交量均线长度", minval=1, group=groupFilter)
+volMult = input.float(1.1, "信号K成交量倍数", minval=0.0, step=0.1, group=groupFilter)
+
+groupSr = "支撑压力/背离"
+useSrFilter = input.bool(true, "启用支撑压力过滤", group=groupSr)
+srPivotLeft = input.int(5, "支撑压力左侧K数", minval=1, maxval=30, group=groupSr)
+srPivotRight = input.int(3, "支撑压力右侧K数", minval=1, maxval=30, group=groupSr)
+srNearMode = input.string("ATR或百分比", "贴近判定方式", options=["ATR或百分比", "仅ATR", "仅百分比"], group=groupSr)
+srNearAtrMult = input.float(0.8, "贴近ATR倍数", minval=0.0, step=0.1, group=groupSr)
+srNearPct = input.float(0.8, "贴近百分比", minval=0.0, step=0.1, group=groupSr)
+requireDivergence = input.bool(true, "要求J线背离确认", group=groupSr)
+divLookbackBars = input.int(80, "背离有效K数", minval=1, maxval=500, group=groupSr)
+useEarlyDivergence = input.bool(true, "允许正在形成的背离", group=groupSr)
+
+groupView = "显示"
+showBg = input.bool(true, "显示RJ背景", group=groupView)
+showSetups = input.bool(true, "显示候选信号", group=groupView)
+showConfirmed = input.bool(true, "显示确认多空", group=groupView)
+showOriginalCompare = input.bool(true, "显示J0/J100原始触发", group=groupView)
+showCrossCompare = input.bool(true, "显示J/R交叉触发", group=groupView)
+showDivergenceMarks = input.bool(true, "显示背离点", group=groupView)
+showTable = input.bool(true, "显示状态表", group=groupView)
+
+ll = ta.lowest(low, kdjLen)
+hh = ta.highest(high, kdjLen)
+den = hh - ll
+rsv = na(ll) or na(hh) or den == 0.0 ? 50.0 : (close - ll) / den * 100.0
+kLine = ta.sma(rsv, kSmooth)
+dLine = ta.sma(kLine, dSmooth)
+jLine = 3.0 * kLine - 2.0 * dLine
+
+rsiRaw = ta.rsi(close, rsiLen)
+rsiLine = rsiSmooth <= 1 ? (na(rsiRaw) ? 50.0 : rsiRaw) : ta.ema(na(rsiRaw) ? 50.0 : rsiRaw, rsiSmooth)
+rsiLow = ta.lowest(rsiLine, rsiLen)
+rsiHigh = ta.highest(rsiLine, rsiLen)
+rsiDen = rsiHigh - rsiLow
+stochRsiLine = na(rsiLow) or na(rsiHigh) or rsiDen == 0.0 ? 50.0 : (rsiLine - rsiLow) / rsiDen * 100.0
+jRsiRaw = ta.rsi(jLine, rsiLen)
+jRsiLine = rsiSmooth <= 1 ? (na(jRsiRaw) ? 50.0 : jRsiRaw) : ta.ema(na(jRsiRaw) ? 50.0 : jRsiRaw, rsiSmooth)
+rLineBase = purpleMode == "K线(贴近原版)" ? kLine : purpleMode == "随机RSI" ? stochRsiLine : purpleMode == "J线RSI" ? jRsiLine : rsiLine
+rLineAdjusted = 50.0 + (rLineBase - 50.0) * purpleScale + purpleOffset
+rLine = purpleClamp ? math.max(0.0, math.min(100.0, rLineAdjusted)) : rLineAdjusted
+
+rjBull = jLine >= rLine
+rjBear = jLine < rLine
+bgcolor(showBg ? (rjBull ? color.new(color.green, 87) : color.new(color.red, 87)) : na, title="RJ背景")
+
+barCloseOkSignal = barstate.isconfirmed
+useOriginalKey = setupSource == "原版综合关键K确认" or setupSource == "原版J线0/100关键K确认"
+useCross = setupSource == "原版综合关键K确认" or setupSource == "全部信号" or setupSource == "J/R交叉确认"
+useLevel = setupSource == "原版综合关键K确认" or setupSource == "原版J线0/100关键K确认" or setupSource == "全部信号" or setupSource == "J线0/100关键K确认"
+crossLongRaw = ta.crossover(jLine, rLine)
+crossShortRaw = ta.crossunder(jLine, rLine)
+crossLong = barCloseOkSignal and crossLongRaw
+crossShort = barCloseOkSignal and crossShortRaw
+
+var bool jOversoldArmed = false
+var bool jOverboughtArmed = false
+originalLongSignal = false
+originalShortSignal = false
+if barCloseOkSignal
+    if jLine < jLongLevel
+        jOversoldArmed := true
+    if jLine > jShortLevel
+        jOverboughtArmed := true
+    originalLongSignal := jOversoldArmed and jLine >= jLongLevel
+    originalShortSignal := jOverboughtArmed and jLine <= jShortLevel
+    if originalLongSignal
+        jOversoldArmed := false
+    if originalShortSignal
+        jOverboughtArmed := false
+
+longLevelSetupRaw = useLevel and originalLongSignal
+shortLevelSetupRaw = useLevel and originalShortSignal
+longCrossSetupRaw = useCross and crossLong
+shortCrossSetupRaw = useCross and crossShort
+rawLongSetup = longLevelSetupRaw or longCrossSetupRaw
+rawShortSetup = shortLevelSetupRaw or shortCrossSetupRaw
+
+trendEma = ta.ema(close, trendEmaLen)
+[plusDi, minusDi, adxLine] = ta.dmi(adxLen, adxSmooth)
+volMa = ta.sma(volume, volLen)[1]
+minAdx = filterPreset == "宽松" ? 0.0 : filterPreset == "均衡" ? 18.0 : filterPreset == "严格" ? 22.0 : customMinAdx
+minJRSpread = filterPreset == "宽松" ? 0.0 : filterPreset == "均衡" ? 2.0 : filterPreset == "严格" ? 4.0 : customMinJRSpread
+confirmAtrBuffer = filterPreset == "宽松" ? 0.0 : filterPreset == "均衡" ? 0.08 : filterPreset == "严格" ? 0.16 : customConfirmAtrBuffer
+confirmAtrBufferActive = useOriginalKey ? 0.0 : confirmAtrBuffer
+cooldownBars = filterPreset == "宽松" ? 0 : filterPreset == "均衡" ? 12 : filterPreset == "严格" ? 24 : customCooldownBars
+
+longDirectionOk = directionFilter == "关闭" or (directionFilter == "仅RJ方向" and rjBull) or (directionFilter == "RJ+EMA" and rjBull and close >= trendEma)
+shortDirectionOk = directionFilter == "关闭" or (directionFilter == "仅RJ方向" and rjBear) or (directionFilter == "RJ+EMA" and rjBear and close <= trendEma)
+adxOk = minAdx <= 0.0 or adxLine >= minAdx
+volumeRatio = not na(volMa) and volMa > 0.0 ? volume / volMa : na
+volumeOk = not useVolumeFilter or (not na(volumeRatio) and volumeRatio >= volMult)
+longSpreadOk = minJRSpread <= 0.0 or jLine - rLine >= minJRSpread
+shortSpreadOk = minJRSpread <= 0.0 or rLine - jLine >= minJRSpread
+
+pricePivotLow = ta.pivotlow(low, srPivotLeft, srPivotRight)
+pricePivotHigh = ta.pivothigh(high, srPivotLeft, srPivotRight)
+pivotLowFound = not na(pricePivotLow)
+pivotHighFound = not na(pricePivotHigh)
+pivotLowBar = bar_index - srPivotRight
+pivotHighBar = bar_index - srPivotRight
+pivotLowJ = jLine[srPivotRight]
+pivotHighJ = jLine[srPivotRight]
+
+var float lastSupport = na
+var float lastResistance = na
+var int lastSupportBar = na
+var int lastResistanceBar = na
+var float prevPivotLowPrice = na
+var float prevPivotLowJ = na
+var float prevPivotHighPrice = na
+var float prevPivotHighJ = na
+var int lastBullDivBar = na
+var int lastBearDivBar = na
+
+earlyBullDiv = useEarlyDivergence and not na(prevPivotLowPrice) and not na(prevPivotLowJ) and low < prevPivotLowPrice and jLine > prevPivotLowJ
+earlyBearDiv = useEarlyDivergence and not na(prevPivotHighPrice) and not na(prevPivotHighJ) and high > prevPivotHighPrice and jLine < prevPivotHighJ
+bullDivSignal = false
+bearDivSignal = false
+
+if pivotLowFound
+    bullDivSignal := not na(prevPivotLowPrice) and not na(prevPivotLowJ) and pricePivotLow < prevPivotLowPrice and pivotLowJ > prevPivotLowJ
+    lastSupport := pricePivotLow
+    lastSupportBar := pivotLowBar
+    if bullDivSignal
+        lastBullDivBar := pivotLowBar
+    prevPivotLowPrice := pricePivotLow
+    prevPivotLowJ := pivotLowJ
+
+if pivotHighFound
+    bearDivSignal := not na(prevPivotHighPrice) and not na(prevPivotHighJ) and pricePivotHigh > prevPivotHighPrice and pivotHighJ < prevPivotHighJ
+    lastResistance := pricePivotHigh
+    lastResistanceBar := pivotHighBar
+    if bearDivSignal
+        lastBearDivBar := pivotHighBar
+    prevPivotHighPrice := pricePivotHigh
+    prevPivotHighJ := pivotHighJ
+
+srAtr = ta.atr(14)
+supportDistPct = not na(lastSupport) and close != 0.0 ? math.abs(low - lastSupport) / close * 100.0 : na
+resistanceDistPct = not na(lastResistance) and close != 0.0 ? math.abs(high - lastResistance) / close * 100.0 : na
+supportNearAtrOk = not na(lastSupport) and not na(srAtr) and math.abs(low - lastSupport) <= srAtr * srNearAtrMult
+resistanceNearAtrOk = not na(lastResistance) and not na(srAtr) and math.abs(high - lastResistance) <= srAtr * srNearAtrMult
+supportNearPctOk = not na(supportDistPct) and supportDistPct <= srNearPct
+resistanceNearPctOk = not na(resistanceDistPct) and resistanceDistPct <= srNearPct
+longNearSupport = not useSrFilter or (srNearMode == "仅ATR" ? supportNearAtrOk : srNearMode == "仅百分比" ? supportNearPctOk : (supportNearAtrOk or supportNearPctOk))
+shortNearResistance = not useSrFilter or (srNearMode == "仅ATR" ? resistanceNearAtrOk : srNearMode == "仅百分比" ? resistanceNearPctOk : (resistanceNearAtrOk or resistanceNearPctOk))
+bullDivRecent = not na(lastBullDivBar) and bar_index - lastBullDivBar <= divLookbackBars
+bearDivRecent = not na(lastBearDivBar) and bar_index - lastBearDivBar <= divLookbackBars
+bullDivActive = bullDivRecent or earlyBullDiv
+bearDivActive = bearDivRecent or earlyBearDiv
+longDivOk = not useSrFilter or not requireDivergence or bullDivActive
+shortDivOk = not useSrFilter or not requireDivergence or bearDivActive
+longSrOk = not useSrFilter or (longNearSupport and longDivOk)
+shortSrOk = not useSrFilter or (shortNearResistance and shortDivOk)
+
+var float longKeyHigh = na
+var float longKeyLow = na
+var int longKeyBar = na
+var bool longKeyFilterOk = false
+var float longKeyVolumeRatio = na
+var float shortKeyHigh = na
+var float shortKeyLow = na
+var int shortKeyBar = na
+var bool shortKeyFilterOk = false
+var float shortKeyVolumeRatio = na
+var int lastSignalBar = na
+
+cooldownOk = cooldownBars <= 0 or na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+noPendingKey = na(longKeyBar) and na(shortKeyBar)
+longSetupSpreadOk = longLevelSetupRaw or longSpreadOk
+shortSetupSpreadOk = shortLevelSetupRaw or shortSpreadOk
+longVisualFilterOk = longSrOk and longDirectionOk and adxOk and volumeOk and cooldownOk
+shortVisualFilterOk = shortSrOk and shortDirectionOk and adxOk and volumeOk and cooldownOk
+longSetupFilterOk = longVisualFilterOk and longSetupSpreadOk and noPendingKey
+shortSetupFilterOk = shortVisualFilterOk and shortSetupSpreadOk and noPendingKey
+longSetup = barstate.isconfirmed and rawLongSetup and longSetupFilterOk
+shortSetup = barstate.isconfirmed and rawShortSetup and shortSetupFilterOk
+
+longSignal = false
+shortSignal = false
+longExpired = false
+shortExpired = false
+
+if longSetup
+    longKeyHigh := high
+    longKeyLow := low
+    longKeyBar := bar_index
+    longKeyFilterOk := longSetupFilterOk
+    longKeyVolumeRatio := volumeRatio
+    shortKeyHigh := na
+    shortKeyLow := na
+    shortKeyBar := na
+    shortKeyFilterOk := false
+    shortKeyVolumeRatio := na
+
+if shortSetup
+    shortKeyHigh := high
+    shortKeyLow := low
+    shortKeyBar := bar_index
+    shortKeyFilterOk := shortSetupFilterOk
+    shortKeyVolumeRatio := volumeRatio
+    longKeyHigh := na
+    longKeyLow := na
+    longKeyBar := na
+    longKeyFilterOk := false
+    longKeyVolumeRatio := na
+
+atrValue = ta.atr(14)
+if not na(longKeyBar) and bar_index > longKeyBar
+    longAge = bar_index - longKeyBar
+    longConfirmLevel = longKeyHigh + atrValue * confirmAtrBufferActive
+    if barstate.isconfirmed and close < longKeyLow
+        longKeyHigh := na
+        longKeyLow := na
+        longKeyBar := na
+        longKeyFilterOk := false
+        longKeyVolumeRatio := na
+    else if barstate.isconfirmed and close > longConfirmLevel and longKeyFilterOk and cooldownOk
+        longSignal := true
+        lastSignalBar := bar_index
+        longKeyHigh := na
+        longKeyLow := na
+        longKeyBar := na
+        longKeyFilterOk := false
+        longKeyVolumeRatio := na
+    else if barstate.isconfirmed and longAge > confirmBars
+        longExpired := true
+        longKeyHigh := na
+        longKeyLow := na
+        longKeyBar := na
+        longKeyFilterOk := false
+        longKeyVolumeRatio := na
+
+if not na(shortKeyBar) and bar_index > shortKeyBar
+    shortAge = bar_index - shortKeyBar
+    shortConfirmLevel = shortKeyLow - atrValue * confirmAtrBufferActive
+    if barstate.isconfirmed and close > shortKeyHigh
+        shortKeyHigh := na
+        shortKeyLow := na
+        shortKeyBar := na
+        shortKeyFilterOk := false
+        shortKeyVolumeRatio := na
+    else if barstate.isconfirmed and close < shortConfirmLevel and shortKeyFilterOk and cooldownOk
+        shortSignal := true
+        lastSignalBar := bar_index
+        shortKeyHigh := na
+        shortKeyLow := na
+        shortKeyBar := na
+        shortKeyFilterOk := false
+        shortKeyVolumeRatio := na
+    else if barstate.isconfirmed and shortAge > confirmBars
+        shortExpired := true
+        shortKeyHigh := na
+        shortKeyLow := na
+        shortKeyBar := na
+        shortKeyFilterOk := false
+        shortKeyVolumeRatio := na
+
+if engineAlignMode and barstate.isconfirmed
+    engineLongSignal = false
+    engineShortSignal = false
+    for i = 1 to confirmBars
+        engineLongTrigger = crossLongRaw[i] or originalLongSignal[i]
+        engineLongSpreadOkKey = minJRSpread <= 0.0 or jLine[i] - rLine[i] >= minJRSpread
+        engineLongTriggerOk = originalLongSignal[i] or engineLongSpreadOkKey
+        engineLongDirectionOkKey = directionFilter == "关闭" or (directionFilter == "仅RJ方向" and rjBull[i]) or (directionFilter == "RJ+EMA" and rjBull[i] and close[i] >= trendEma[i])
+        engineLongAdxOkKey = minAdx <= 0.0 or adxLine[i] >= minAdx
+        engineLongVolumeRatioKey = volumeRatio[i]
+        engineLongVolumeOkKey = not useVolumeFilter or (not na(engineLongVolumeRatioKey) and engineLongVolumeRatioKey >= volMult)
+        engineLongFilterOk = engineLongDirectionOkKey and engineLongAdxOkKey and engineLongVolumeOkKey and cooldownOk
+        if not engineLongSignal and engineLongTrigger and engineLongTriggerOk and engineLongFilterOk and longSrOk[i] and not na(high[i]) and not na(low[i])
+            keyHigh = high[i]
+            keyLow = low[i]
+            confirmLevel = keyHigh + atrValue * confirmAtrBuffer
+            invalidated = false
+            alreadyConfirmed = false
+            if i > 1
+                for j = 1 to i - 1
+                    invalidated := invalidated or close[j] < keyLow
+                    alreadyConfirmed := alreadyConfirmed or close[j] > confirmLevel
+            if not invalidated and not alreadyConfirmed and close > confirmLevel
+                engineLongSignal := true
+        engineShortTrigger = crossShortRaw[i] or originalShortSignal[i]
+        engineShortSpreadOkKey = minJRSpread <= 0.0 or rLine[i] - jLine[i] >= minJRSpread
+        engineShortTriggerOk = originalShortSignal[i] or engineShortSpreadOkKey
+        engineShortDirectionOkKey = directionFilter == "关闭" or (directionFilter == "仅RJ方向" and rjBear[i]) or (directionFilter == "RJ+EMA" and rjBear[i] and close[i] <= trendEma[i])
+        engineShortAdxOkKey = minAdx <= 0.0 or adxLine[i] >= minAdx
+        engineShortVolumeRatioKey = volumeRatio[i]
+        engineShortVolumeOkKey = not useVolumeFilter or (not na(engineShortVolumeRatioKey) and engineShortVolumeRatioKey >= volMult)
+        engineShortFilterOk = engineShortDirectionOkKey and engineShortAdxOkKey and engineShortVolumeOkKey and cooldownOk
+        if not engineShortSignal and engineShortTrigger and engineShortTriggerOk and engineShortFilterOk and shortSrOk[i] and not na(high[i]) and not na(low[i])
+            keyHigh = high[i]
+            keyLow = low[i]
+            confirmLevel = keyLow - atrValue * confirmAtrBuffer
+            invalidated = false
+            alreadyConfirmed = false
+            if i > 1
+                for j = 1 to i - 1
+                    invalidated := invalidated or close[j] > keyHigh
+                    alreadyConfirmed := alreadyConfirmed or close[j] < confirmLevel
+            if not invalidated and not alreadyConfirmed and close < confirmLevel
+                engineShortSignal := true
+    longSignal := engineLongSignal
+    shortSignal := engineShortSignal
+    if longSignal or shortSignal
+        lastSignalBar := bar_index
+
+activeSignalVolumeRatio = not na(longKeyBar) ? longKeyVolumeRatio : not na(shortKeyBar) ? shortKeyVolumeRatio : volumeRatio
+activeSignalVolumeOk = not useVolumeFilter or (not na(activeSignalVolumeRatio) and activeSignalVolumeRatio >= volMult)
+
+hline(100, "顶部线 100", color=color.new(color.gray, 25), linestyle=hline.style_dashed)
+hline(80, "上轨 80", color=color.new(color.gray, 55), linestyle=hline.style_dashed)
+hline(70, "上执 70", color=color.new(color.red, 35), linestyle=hline.style_dashed)
+hline(50, "中线 50", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+hline(30, "下执 30", color=color.new(color.red, 35), linestyle=hline.style_dashed)
+hline(20, "下轨 20", color=color.new(color.gray, 55), linestyle=hline.style_dashed)
+hline(0, "底部线 0", color=color.new(color.gray, 25), linestyle=hline.style_dashed)
+
+plot(jLine, "J绿线", color=color.rgb(39, 210, 190), linewidth=1)
+plot(rLine, "紫线", color=color.rgb(190, 102, 255), linewidth=1)
+plot(activeSignalVolumeRatio * 10.0, "信号K量能x10", color=color.new(color.orange, 20), style=plot.style_columns, display=display.data_window)
+plot(activeSignalVolumeOk ? 1 : 0, "信号K成交量过滤通过", color=color.orange, display=display.data_window)
+plot(longVisualFilterOk ? 1 : 0, "做多信号K过滤通过", color=color.lime, display=display.data_window)
+plot(shortVisualFilterOk ? 1 : 0, "做空信号K过滤通过", color=color.red, display=display.data_window)
+
+plotshape(showOriginalCompare and originalLongSignal, title="J回0做多触发", style=shape.triangleup, location=location.bottom, color=color.new(color.lime, 0), size=size.tiny, text="J0")
+plotshape(showOriginalCompare and originalShortSignal, title="J回100做空触发", style=shape.triangledown, location=location.top, color=color.new(color.fuchsia, 0), size=size.tiny, text="J100")
+plotshape(showCrossCompare and crossLong, title="RJ金叉触发", style=shape.circle, location=location.bottom, color=color.new(color.aqua, 0), size=size.tiny)
+plotshape(showCrossCompare and crossShort, title="RJ死叉触发", style=shape.circle, location=location.top, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(showDivergenceMarks and bullDivSignal, title="底背离", style=shape.circle, location=location.bottom, color=color.new(color.lime, 0), size=size.tiny, offset=-srPivotRight)
+plotshape(showDivergenceMarks and bearDivSignal, title="顶背离", style=shape.circle, location=location.top, color=color.new(color.red, 0), size=size.tiny, offset=-srPivotRight)
+plotshape(showSetups and longSetup, title="做多候选", style=shape.triangleup, location=location.bottom, color=color.new(color.lime, 0), size=size.small, text="候")
+plotshape(showSetups and shortSetup, title="做空候选", style=shape.triangledown, location=location.top, color=color.new(color.red, 0), size=size.small, text="候")
+plotshape(showConfirmed and longSignal, title="确认做多", style=shape.labelup, location=location.bottom, color=color.new(color.lime, 0), textcolor=color.black, size=size.small, text="多")
+plotshape(showConfirmed and shortSignal, title="确认做空", style=shape.labeldown, location=location.top, color=color.new(color.red, 0), textcolor=color.white, size=size.small, text="空")
+
+var table statusTable = table.new(position.top_right, 2, 7, border_width=1)
+if showTable and barstate.islast
+    bgTxt = rjBull ? "绿色/偏多" : "红色/偏空"
+    waitTxt = not na(longKeyBar) ? "等待多" : not na(shortKeyBar) ? "等待空" : "-"
+    volTxt = not useVolumeFilter ? "关闭" : na(activeSignalVolumeRatio) ? "信号K均量不足" : str.tostring(activeSignalVolumeRatio, "#.##") + "x / " + str.tostring(volMult, "#.##") + "x"
+    table.cell(statusTable, 0, 0, "RJ背景", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 0, bgTxt, text_color=rjBull ? color.lime : color.red, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 1, "J / 紫线", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 1, str.tostring(jLine, "#.##") + " / " + str.tostring(rLine, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 2, "流程", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 2, waitTxt, text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 3, "信号K量能", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 3, volTxt, text_color=not useVolumeFilter ? color.gray : activeSignalVolumeOk ? color.lime : color.orange, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 4, "方向过滤", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 4, (longDirectionOk ? "多OK " : "") + (shortDirectionOk ? "空OK" : ""), text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 5, "ADX", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 5, str.tostring(adxLine, "#.##") + " / " + str.tostring(minAdx, "#.##"), text_color=adxOk ? color.lime : color.orange, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 0, 6, "信号源", text_color=color.white, bgcolor=color.new(color.black, 15))
+    table.cell(statusTable, 1, 6, setupSource, text_color=color.white, bgcolor=color.new(color.black, 15))
+
+alertcondition(longSignal, title="RJ确认做多", message="RJ确认做多：{{ticker}} {{interval}}")
+alertcondition(shortSignal, title="RJ确认做空", message="RJ确认做空：{{ticker}} {{interval}}")

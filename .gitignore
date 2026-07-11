@@ -1,0 +1,48 @@
+.env
+.env.*
+!.env.example
+*.log
+trade_config.json
+demo_bot_config.json
+demo_config.json
+__pycache__/
+*.pyc
+
+# Runtime account and trading state
+*.db
+*.db-*
+positions*.json
+trades*.jsonl
+signal_events*.jsonl
+rj_*_events*.jsonl
+watchlist*.json
+
+# Credentials and private keys
+*ed25519
+*ed25519.pub
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Generated analysis and market data
+analysis_exports/
+backtest_data/
+backtest_runs/
+*.parquet
+backups/
+video_frames/
+
+# Local agent state and private project memory
+.agents/
+.codex/
+memory/
+tmp_skill_review_tech_analysis/
+
+# Local tooling output
+.codex_review/
+.deploy/
+__pycache__/
+*.py[cod]
+_fix2.py
+error.txt
