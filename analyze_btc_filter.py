@@ -10,8 +10,8 @@ import urllib.request
 from pathlib import Path
 
 
-BULL_STATES = {"bull_bias", "strong_bull"}
-BEAR_STATES = {"bear_bias", "strong_bear"}
+REVIEW_HORIZONS = (6, 12, 24)
+BAR_MINUTES = 30
 
 
 def load_jsonl(path):
@@ -61,13 +61,20 @@ def load_blocked_events(project_dir):
 
 def trade_would_be_blocked(trade):
     direction = str(trade.get("direction", "")).upper()
-    h1 = str(trade.get("btc_1h_overall", ""))
-    h4 = str(trade.get("btc_4h_overall", ""))
-    return (
-        direction == "SHORT" and h1 in BULL_STATES and h4 in BULL_STATES
+    stage = str(trade.get("btc_stage", "unknown"))
+    market_direction = str(trade.get("btc_direction", "unknown"))
+    extreme = bool(trade.get("btc_extreme_veto", False))
+    reversal = bool(trade.get("btc_coin_reversal_pass", False))
+    opposite = (
+        direction == "SHORT" and market_direction == "bull"
     ) or (
-        direction == "LONG" and h1 in BEAR_STATES and h4 in BEAR_STATES
+        direction == "LONG" and market_direction == "bear"
     )
+    if not opposite:
+        return False
+    if extreme and stage in {"early_bull", "mid_bull", "early_bear", "mid_bear"}:
+        return True
+    return stage in {"early_bull", "mid_bull", "early_bear", "mid_bear"} and not reversal
 
 
 def event_time_ms(event, offset_hours):
@@ -156,6 +163,18 @@ def evaluate_path(event, candles):
     }
 
 
+def evaluate_horizons(event, candles, horizons=REVIEW_HORIZONS, bar_minutes=BAR_MINUTES):
+    if not candles:
+        return {str(value): evaluate_path(event, []) for value in horizons}
+    first_ms = int(candles[0][0])
+    result = {}
+    for bars in horizons:
+        cutoff = first_ms + int(bars) * int(bar_minutes) * 60_000
+        window = [row for row in candles if int(row[0]) < cutoff]
+        result[str(bars)] = evaluate_path(event, window)
+    return result
+
+
 def review_events(events, horizon_minutes, offset_hours, now_ms=None):
     now_ms = int(now_ms or time.time() * 1000)
     reviewed = []
@@ -177,6 +196,7 @@ def review_events(events, horizon_minutes, offset_hours, now_ms=None):
             end_ms = min(now_ms, horizon_end)
             candles = fetch_candles(event, start_ms, end_ms)
             item.update(evaluate_path(event, candles))
+            item["horizons"] = evaluate_horizons(event, candles)
             item["observed_minutes"] = max(0, int((end_ms - start_ms) // 60000))
             item["complete"] = now_ms >= horizon_end
             item["error"] = "" if candles else "no_candles"
@@ -230,6 +250,7 @@ def historical_summary(project_dir):
 def build_summary(reviewed, min_samples):
     valid = [item for item in reviewed if not item.get("error")]
     complete = [item for item in valid if item.get("complete")]
+    ready = len(complete) >= int(min_samples)
     return {
         "unique_rejects": len(reviewed),
         "valid_paths": len(valid),
@@ -240,7 +261,8 @@ def build_summary(reviewed, min_samples):
         "stop_first": sum(item.get("first_event") == "stop" for item in complete),
         "ambiguous": sum(item.get("first_event") == "same_1m_ambiguous" for item in complete),
         "unresolved": sum(item.get("first_event") == "none" for item in complete),
-        "sample_ready": len(complete) >= int(min_samples),
+        "sample_ready": ready,
+        "status": "READY" if ready else "SAMPLE_NOT_READY",
         "minimum_samples": int(min_samples),
     }
 
@@ -253,6 +275,8 @@ def print_report(report):
         f"Incomplete: {summary['incomplete_paths']} | Ready: {summary['sample_ready']} "
         f"(minimum {summary['minimum_samples']})"
     )
+    if not summary["sample_ready"]:
+        print("SAMPLE_NOT_READY: no filter conclusion is allowed yet")
     print("symbol\tengine\tminutes\tMFE_R\tMAE_R\tfinal_R\tfirst\tcomplete")
     for item in report["events"]:
         if item.get("error"):
@@ -277,9 +301,9 @@ def print_report(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-dir", default=".")
-    parser.add_argument("--horizon-bars", type=int, default=12)
+    parser.add_argument("--horizon-bars", type=int, default=24)
     parser.add_argument("--bar-minutes", type=int, default=30)
-    parser.add_argument("--min-samples", type=int, default=30)
+    parser.add_argument("--min-samples", type=int, default=50)
     parser.add_argument("--event-time-offset-hours", type=float, default=8.0)
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--output", default="")

@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault("AXIOM_DISABLE_AUTOSTART", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from analyze_btc_filter import dedupe_events, evaluate_path, trade_would_be_blocked
+from analyze_btc_filter import build_summary, dedupe_events, evaluate_horizons, evaluate_path, trade_would_be_blocked
 
 
 class AnalyzeBtcFilterTest(unittest.TestCase):
@@ -37,16 +37,42 @@ class AnalyzeBtcFilterTest(unittest.TestCase):
         self.assertAlmostEqual(result["final_r"], -0.5)
         self.assertTrue(result["target_reached"])
 
-    def test_trade_filter_requires_both_btc_timeframes(self):
+    def test_trade_filter_uses_stage_veto_or_missing_reversal_package(self):
         blocked = {
             "direction": "SHORT",
-            "btc_1h_overall": "strong_bull",
-            "btc_4h_overall": "bull_bias",
+            "btc_stage": "early_bull",
+            "btc_direction": "bull",
+            "btc_extreme_veto": True,
         }
-        mixed = dict(blocked, btc_4h_overall="neutral")
+        late = dict(blocked, btc_stage="late_bull", btc_extreme_veto=False)
+        ordinary_missing_reversal = dict(blocked, btc_stage="mid_bull", btc_extreme_veto=False)
+        ordinary_with_reversal = dict(ordinary_missing_reversal, btc_coin_reversal_pass=True)
 
         self.assertTrue(trade_would_be_blocked(blocked))
-        self.assertFalse(trade_would_be_blocked(mixed))
+        self.assertFalse(trade_would_be_blocked(late))
+        self.assertTrue(trade_would_be_blocked(ordinary_missing_reversal))
+        self.assertFalse(trade_would_be_blocked(ordinary_with_reversal))
+
+    def test_evaluate_horizons_reports_6_12_24_bars(self):
+        event = {"direction": "LONG", "entry": 100.0, "sl": 99.0}
+        candles = []
+        for minute in range(24 * 30):
+            price = 100.0 + minute / 300.0
+            candles.append([minute * 60_000, price, price + 0.1, price - 0.1, price])
+
+        result = evaluate_horizons(event, candles)
+
+        self.assertEqual(sorted(result), ["12", "24", "6"])
+        self.assertLess(result["6"]["mfe_r"], result["12"]["mfe_r"])
+        self.assertLess(result["12"]["mfe_r"], result["24"]["mfe_r"])
+
+    def test_summary_requires_50_complete_samples(self):
+        reviewed = [{"complete": True, "error": "", "first_event": "plus_1R"} for _ in range(49)]
+
+        result = build_summary(reviewed, 50)
+
+        self.assertFalse(result["sample_ready"])
+        self.assertEqual(result["status"], "SAMPLE_NOT_READY")
 
 
 if __name__ == "__main__":
