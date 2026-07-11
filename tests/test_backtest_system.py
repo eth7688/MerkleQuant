@@ -16,7 +16,11 @@ from strategy_core import ExitRules
 
 
 class ReplayBot:
+    def __init__(self):
+        self.window_lengths = []
+
     def _rj_only_signal_from_df(self, symbol, interval, candles):
+        self.window_lengths.append(len(candles))
         if len(candles) < 60:
             return None
         return {
@@ -170,6 +174,28 @@ class BacktestSystemTest(unittest.TestCase):
         self.assertEqual(entries[0]["time"], first_decision)
         self.assertEqual(entries[0]["price"], 101.0)
         self.assertEqual(result.used_signal_keys, {"RJ|TEST|LONG|ONE"})
+
+    def test_pretest_candles_are_context_only(self):
+        opens = [index * 1_800_000 for index in range(70)]
+        frame_30m = pd.DataFrame({
+            "ot": opens, "o": [100.0] * 70, "h": [101.0] * 70,
+            "l": [99.0] * 70, "c": [100.0] * 70, "v": [1000.0] * 70,
+        })
+        entry_start = opens[65] + 1_800_000
+        frame_1m = pd.DataFrame({
+            "ot": [entry_start], "o": [101.0], "h": [101.1],
+            "l": [100.9], "c": [101.0], "v": [100.0],
+        })
+        bot = ReplayBot()
+        engine = ReplayEngine(bot, 1000, 10, 0, 0, ExitRules(), warmup_bars=60)
+
+        engine.run_symbol(
+            "TESTUSDT", frame_30m, frame_1m,
+            lambda _: {"stage": "range", "direction": "range", "extreme_veto": False},
+            entry_start_ms=entry_start,
+        )
+
+        self.assertGreaterEqual(bot.window_lengths[0], 66)
 
 
 if __name__ == "__main__":
