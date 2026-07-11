@@ -42,6 +42,7 @@ tmp_skill_review_tech_analysis/
 # Local tooling output
 .codex_review/
 .deploy/
+.worktrees/
 __pycache__/
 *.py[cod]
 _fix2.py
