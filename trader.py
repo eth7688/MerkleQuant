@@ -27,6 +27,8 @@ import requests, urllib.parse
 import pandas as pd
 import numpy as np
 
+from btc_stage import classify_btc_stage, evaluate_btc_gate
+
 from screener import (
     fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
     scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME,
@@ -4082,6 +4084,7 @@ class SqueezeBreakoutBot:
             "rj_sr_early_bull_div", "rj_sr_early_bear_div",
             "rj_sr_last_bull_div_bar", "rj_sr_last_bear_div_bar",
             "rj_sr_pivot_left", "rj_sr_pivot_right",
+            "btc_coin_reversal_pass",
             "rj_only_stats_pass", "rj_only_stats_reason", "rj_only_hist_samples",
             "rj_only_hist_raw_triggers", "rj_only_hist_confirmed", "rj_only_hist_risk_ok",
             "rj_only_hist_filter_mode", "rj_only_hist_wins", "rj_only_hist_losses", "rj_only_hist_win_rate",
@@ -4184,7 +4187,7 @@ class SqueezeBreakoutBot:
         }
 
     def get_btc_market_regime(self, force: bool = False) -> dict:
-        """BTC多周期环境快照。第一版只记录, 不影响开仓。"""
+        """BTC multi-timeframe snapshot with a closed-candle stage decision."""
         now_ts = time.time()
         cache = getattr(self, "_btc_regime_cache", {"ts": 0, "data": {}})
         if not force and cache.get("data") and now_ts - cache.get("ts", 0) < 300:
@@ -4195,28 +4198,34 @@ class SqueezeBreakoutBot:
                 data[inv] = self._btc_interval_regime(inv)
             except Exception as e:
                 data[inv] = {"error": str(e)}
-
-        score = 0
-        weights = {"1h": 1, "4h": 2, "1d": 3, "1w": 2}
-        valid_weight = 0
-        for inv, w in weights.items():
-            row = data.get(inv, {})
-            if "error" in row:
-                continue
-            score += row.get("score", 0) * w
-            valid_weight += w
-        avg_score = score / valid_weight if valid_weight else 0
-        if avg_score >= 35:
-            regime = "btc_strong_bull"
-        elif avg_score >= 12:
-            regime = "btc_bull_bias"
-        elif avg_score <= -35:
-            regime = "btc_strong_bear"
-        elif avg_score <= -12:
-            regime = "btc_bear_bias"
-        else:
-            regime = "btc_neutral"
-        data["summary"] = {"regime": regime, "score": round(avg_score, 2)}
+        try:
+            frames = {}
+            now_ms = int(time.time() * 1000)
+            for inv in ("1h", "4h"):
+                frame = fetch_klines("BTCUSDT", inv, 220, exchange="binance")
+                if frame is None or frame.empty:
+                    raise ValueError(f"btc_{inv}_data_unavailable")
+                interval_ms = self._interval_seconds(inv) * 1000
+                ot = pd.to_numeric(frame["ot"], errors="coerce")
+                frames[inv] = frame.loc[(ot + interval_ms) <= now_ms].copy().reset_index(drop=True)
+            stage = classify_btc_stage(frames["1h"], frames["4h"])
+        except Exception as exc:
+            stage = {
+                "stage": "unknown",
+                "direction": "unknown",
+                "extreme_veto": False,
+                "evidence": [str(exc)],
+                "exhaustion_flags": [],
+                "closed_1h_at": None,
+                "closed_4h_at": None,
+                "rule_version": "btc_stage_v1",
+            }
+        data["stage"] = stage
+        data["summary"] = {
+            "regime": f"btc_{stage.get('stage', 'unknown')}",
+            "score": 0,
+            **stage,
+        }
         self._btc_regime_cache = {"ts": now_ts, "data": data}
         return data
 
@@ -4227,6 +4236,14 @@ class SqueezeBreakoutBot:
         out = {
             "btc_regime": summary.get("regime", "btc_unknown"),
             "btc_score": summary.get("score", 0),
+            "btc_stage": summary.get("stage", "unknown"),
+            "btc_direction": summary.get("direction", "unknown"),
+            "btc_extreme_veto": bool(summary.get("extreme_veto", False)),
+            "btc_stage_evidence": summary.get("evidence", []),
+            "btc_exhaustion_flags": summary.get("exhaustion_flags", []),
+            "btc_stage_rule_version": summary.get("rule_version", "btc_stage_v1"),
+            "btc_closed_1h_at": summary.get("closed_1h_at"),
+            "btc_closed_4h_at": summary.get("closed_4h_at"),
         }
         for inv in ("1h", "4h", "1d", "1w"):
             row = regime.get(inv, {})
@@ -4240,18 +4257,38 @@ class SqueezeBreakoutBot:
             out[f"{prefix}_spread"] = row.get("spread_pct", 0)
         return out
 
-    def _btc_direction_filter(self, direction: str, btc_fields: dict) -> tuple[bool, str]:
+    @staticmethod
+    def _btc_coin_reversal_pass(signal: dict, direction: str) -> bool:
+        """Use evidence already anchored to the RJ signal candle."""
+        signal = signal or {}
+        volume_ok = bool(signal.get("rj_volume_filter_pass", False))
+        if direction == "LONG":
+            location_ok = bool(signal.get("rj_sr_near_support", False))
+            divergence_ok = any(bool(signal.get(key, False)) for key in (
+                "rj_sr_bull_div", "rj_sr_bull_div_recent", "rj_sr_early_bull_div",
+            ))
+        else:
+            location_ok = bool(signal.get("rj_sr_near_resistance", False))
+            divergence_ok = any(bool(signal.get(key, False)) for key in (
+                "rj_sr_bear_div", "rj_sr_bear_div_recent", "rj_sr_early_bear_div",
+            ))
+        return bool(volume_ok and location_ok and divergence_ok)
+
+    def _btc_direction_filter(
+        self,
+        direction: str,
+        btc_fields: dict,
+        coin_reversal_pass: bool = False,
+    ) -> tuple[bool, str]:
         if not self._as_bool(getattr(self.cfg, "btc_direction_filter_enabled", True)):
             return True, "disabled"
-        h1 = str((btc_fields or {}).get("btc_1h_overall", "unknown") or "unknown")
-        h4 = str((btc_fields or {}).get("btc_4h_overall", "unknown") or "unknown")
-        bullish = {"bull_bias", "strong_bull"}
-        bearish = {"bear_bias", "strong_bear"}
-        if direction == "SHORT" and h1 in bullish and h4 in bullish:
-            return False, "btc_bull_blocks_short"
-        if direction == "LONG" and h1 in bearish and h4 in bearish:
-            return False, "btc_bear_blocks_long"
-        return True, "pass"
+        stage = {
+            "stage": (btc_fields or {}).get("btc_stage", "unknown"),
+            "direction": (btc_fields or {}).get("btc_direction", "unknown"),
+            "extreme_veto": bool((btc_fields or {}).get("btc_extreme_veto", False)),
+        }
+        allowed, reason = evaluate_btc_gate(direction, stage, coin_reversal_pass)
+        return (True, "pass") if reason == "btc_unknown_pass" else (allowed, reason)
 
     def _position_btc_fields(self, pos: Position) -> dict:
         """Return entry-time BTC regime fields carried by a position."""
@@ -5030,7 +5067,13 @@ class SqueezeBreakoutBot:
             btc_regime_fields = self._btc_regime_fields()
         except Exception:
             btc_regime_fields = {"btc_regime": "btc_unknown", "btc_score": 0}
-        btc_filter_ok, btc_filter_reason = self._btc_direction_filter(direction, btc_regime_fields)
+        coin_reversal_pass = self._btc_coin_reversal_pass(signal, direction)
+        signal["btc_coin_reversal_pass"] = coin_reversal_pass
+        btc_filter_ok, btc_filter_reason = self._btc_direction_filter(
+            direction,
+            btc_regime_fields,
+            coin_reversal_pass=coin_reversal_pass,
+        )
         if not btc_filter_ok:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "btc_direction_filter",
@@ -5041,6 +5084,7 @@ class SqueezeBreakoutBot:
                 "qty": qty,
                 "pos_usdt": pos_usdt,
                 "risk": risk,
+                "btc_coin_reversal_pass": coin_reversal_pass,
                 **btc_regime_fields,
             }))
             return None
