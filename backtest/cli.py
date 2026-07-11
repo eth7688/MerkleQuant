@@ -79,7 +79,7 @@ def run(args) -> int:
     frame30 = store.read_candles("bitget", args.symbol, "30m")
     frame1 = store.read_candles("bitget", args.symbol, "1m")
     start, end = spec.test
-    frame30 = frame30[(frame30["ot"] >= start) & (frame30["ot"] < end)].reset_index(drop=True)
+    frame30 = frame30[frame30["ot"] < end].reset_index(drop=True)
     frame1 = frame1[(frame1["ot"] >= start) & (frame1["ot"] < end)].reset_index(drop=True)
     engine = ReplayEngine(
         bot=bot,
@@ -95,7 +95,9 @@ def run(args) -> int:
         ),
         warmup_bars=int(rules.get("warmup_bars", 60)),
     )
-    result = engine.run_symbol(args.symbol.upper(), frame30, frame1, _btc_provider(store))
+    result = engine.run_symbol(
+        args.symbol.upper(), frame30, frame1, _btc_provider(store), entry_start_ms=start
+    )
     status = "READY" if result.metrics["trades"] >= spec.minimum_core_trades else "SAMPLE_NOT_READY"
     fingerprints = [
         _manifest_fingerprint(store, args.symbol, "30m"),

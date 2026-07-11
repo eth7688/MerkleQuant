@@ -43,6 +43,7 @@ class ReplayEngine:
         candles_30m: pd.DataFrame,
         candles_1m: pd.DataFrame,
         btc_stage_provider: Callable[[int], dict],
+        entry_start_ms: int | None = None,
     ) -> ReplayResult:
         frame30 = candles_30m.sort_values("ot").reset_index(drop=True)
         frame1 = candles_1m.sort_values("ot").reset_index(drop=True)
@@ -55,6 +56,7 @@ class ReplayEngine:
         decision_rows = [
             (int(frame30["ot"].iloc[index]) + 1_800_000, index)
             for index in range(self.warmup_bars - 1, len(frame30))
+            if entry_start_ms is None or int(frame30["ot"].iloc[index]) + 1_800_000 >= int(entry_start_ms)
         ]
         decision_cursor = 0
         state: PositionState | None = None
