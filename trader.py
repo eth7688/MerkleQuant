@@ -28,6 +28,7 @@ import pandas as pd
 import numpy as np
 
 from btc_stage import classify_btc_stage, evaluate_btc_gate
+from strategy_filters import evaluate_choppy_market_adaptive
 
 from screener import (
     fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
@@ -158,6 +159,7 @@ class TradeConfig:
     rj_only_setup_check_interval_sec: int = 60  # 候选池检查间隔, 控制行情请求频率
     rj_only_setup_near_pct: float = 0.15        # 距离触发价多少%内写near日志
     rj_only_setup_max_pool: int = 40            # RJ候选池最大数量
+    rj_choppy_filter_mode: str = "off"          # off / log_only / hard
 
     # 风控 — 仓位
     risk_per_trade: Any = 10.0          # 每笔风险 (USDT) 支持 "15m:10,1h:20,4h:40,1d:80"
@@ -188,10 +190,10 @@ class TradeConfig:
     hermes_confirm_enabled: bool = False
     hermes_confirm_mode: str = "log_only"      # log_only / hard_filter
     hermes_confirm_min_confidence: float = 65.0
-    hermes_confirm_timeout_sec: int = 90
+    hermes_confirm_timeout_sec: int = 240
     hermes_confirm_fail_open: bool = False
     hermes_confirm_cache_ttl_sec: int = 1800
-    hermes_confirm_queue_wait_sec: int = 120
+    hermes_confirm_queue_wait_sec: int = 300
     hermes_confirm_cmd: str = "hermes"
     hermes_confirm_skills: str = "kline-indicator"
     btc_direction_filter_enabled: bool = True
@@ -1200,16 +1202,73 @@ class SqueezeBreakoutBot:
             return []
         return out
 
+    def _build_hermes_direction_prompt(self, symbol: str, interval: str) -> str:
+        base_symbol = re.sub(r"(?:[-_/]?(?:USDT|USDC|USD))$", "", str(symbol or "").strip().upper())
+        prompt_payload = {
+            "task": "AXIOM_SYMBOL_DIRECTION_CHECK",
+            "rule": "Blind direction check. AXIOM does not disclose its planned order direction.",
+            "symbol": base_symbol,
+            "axiom_observation_interval": interval,
+            "market": str(getattr(self.cfg, "market_type", "futures") or "futures"),
+        }
+        return (
+            f"{base_symbol} 完整分析\n"
+            "请严格调用已安装的 kline-indicator 技能，以 full 模式完成宏观周期、量价因子、"
+            "衍生品三大支柱全量分析后再得出结论。不得下单，也不得询问或推测 AXIOM 的计划方向。\n"
+            "分析成功时，dominant_direction 必须给出相对占优的 LONG 或 SHORT；"
+            "tradeable 单独表示当前是否值得交易，因此证据冲突时不要用 NEUTRAL 代替结论。"
+            "只有技能、数据或调用失败时才返回非 OK 状态，禁止伪装成技术面中性。\n"
+            "Return JSON only, no markdown, no prose. Schema: "
+            "{\"analysis_status\":\"OK|NO_DATA|SKILL_ERROR\","
+            "\"dominant_direction\":\"LONG|SHORT\",\"tradeable\":true,"
+            "\"market_regime\":\"TREND|RANGE|REVERSAL|CONFLICT\","
+            "\"reason\":\"short reason\",\"risk_flags\":[],"
+            "\"skill_used\":\"kline-indicator\",\"mode_used\":\"full|quick|unknown\","
+            "\"data_source\":\"actual source\",\"pillars_checked\":[],"
+            "\"indicators_checked\":[],\"evidence\":{}}.\n"
+            "pillars_checked 必须列出技能实际完成的三大支柱；evidence 必须记录各支柱的结论。\n"
+            f"Input:\n{json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
+        )
+
     def _hermes_direction_gate(self, direction: str, parsed: dict, fail_open: bool) -> tuple[bool, str]:
-        decision = str(parsed.get("decision", "neutral") or "neutral").strip().lower()
-        ai_direction = str(parsed.get("direction", "NEUTRAL") or "NEUTRAL").strip().upper()
+        decision = str(parsed.get("decision", "") or "").strip().lower()
+        analysis_status = str(parsed.get("analysis_status", "") or "").strip().upper()
+        ai_direction = str(
+            parsed.get("dominant_direction", parsed.get("direction", "")) or ""
+        ).strip().upper()
         risk_flags = parsed.get("risk_flags", [])
         if not isinstance(risk_flags, list):
             risk_flags = [str(risk_flags)]
         flags = {str(flag or "").strip().lower() for flag in risk_flags}
+        pillars_checked = parsed.get("pillars_checked", [])
+        evidence = parsed.get("evidence", {})
+        pillar_keys = {
+            re.sub(r"[^a-z0-9]+", "_", str(x or "").strip().lower()).strip("_")
+            for x in pillars_checked
+        } if isinstance(pillars_checked, list) else set()
+        evidence_keys = {
+            re.sub(r"[^a-z0-9]+", "_", str(x or "").strip().lower()).strip("_")
+            for x in evidence
+        } if isinstance(evidence, dict) else set()
 
         failure_reason = ""
-        if decision in {"timeout", "queue_timeout", "error"}:
+        try:
+            process_returncode = int(parsed.get("_process_returncode", 0) or 0)
+        except (TypeError, ValueError):
+            process_returncode = -1
+        if process_returncode != 0:
+            failure_reason = "process_error"
+        elif not analysis_status:
+            failure_reason = "status_missing"
+        elif analysis_status in {"NO_DATA", "DATA_UNAVAILABLE"}:
+            failure_reason = "data_unavailable"
+        elif analysis_status in {"SKILL_ERROR", "SKILL_UNAVAILABLE"}:
+            failure_reason = "skill_unavailable"
+        elif analysis_status in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+            failure_reason = analysis_status.lower()
+        elif analysis_status and analysis_status != "OK":
+            failure_reason = "invalid_status"
+        elif decision in {"timeout", "queue_timeout", "error"}:
             failure_reason = decision
         elif "skill_unavailable" in flags:
             failure_reason = "skill_unavailable"
@@ -1223,14 +1282,24 @@ class SqueezeBreakoutBot:
             failure_reason = "data_unavailable"
         elif not parsed.get("indicators_checked"):
             failure_reason = "indicators_missing"
-        elif ai_direction not in {"LONG", "SHORT", "NEUTRAL"}:
+        elif not {
+            "macro_cycle", "price_volume_factors", "derivatives"
+        }.issubset(pillar_keys) or not (
+            "macro_cycle" in evidence_keys
+            and "derivatives" in evidence_keys
+            and any(key == "price_volume_factors" or key.startswith("price_volume_factors_") for key in evidence_keys)
+        ):
+            failure_reason = "pillars_incomplete"
+        elif ai_direction not in {"LONG", "SHORT"}:
             failure_reason = "invalid_direction"
+        elif "tradeable" not in parsed or not isinstance(parsed.get("tradeable"), bool):
+            failure_reason = "tradeable_missing"
 
         if failure_reason:
             suffix = ":fail_open" if fail_open else ""
             return bool(fail_open), f"operational_failure:{failure_reason}{suffix}"
-        if ai_direction == "NEUTRAL":
-            return True, "neutral_abstain"
+        if not parsed["tradeable"]:
+            return False, "market_not_tradeable"
         if ai_direction == str(direction or "").strip().upper():
             return True, "direction_match"
         return False, "direction_opposite"
@@ -1259,44 +1328,26 @@ class SqueezeBreakoutBot:
             data["cached"] = True
             return data
 
-        timeout_sec = max(3, min(120, int(getattr(self.cfg, "hermes_confirm_timeout_sec", 90) or 90)))
-        queue_wait_sec = max(0, min(300, int(getattr(self.cfg, "hermes_confirm_queue_wait_sec", 120) or 120)))
+        timeout_sec = max(3, min(300, int(getattr(self.cfg, "hermes_confirm_timeout_sec", 240) or 240)))
+        queue_wait_sec = max(0, min(300, int(getattr(self.cfg, "hermes_confirm_queue_wait_sec", 300) or 300)))
         fail_open = self._as_bool(getattr(self.cfg, "hermes_confirm_fail_open", False))
         cmd = str(getattr(self.cfg, "hermes_confirm_cmd", "hermes") or "hermes").strip()
         if cmd == "hermes" and os.path.exists("/root/.hermes/hermes-agent/venv/bin/hermes"):
             cmd = "/root/.hermes/hermes-agent/venv/bin/hermes"
         skills = str(getattr(self.cfg, "hermes_confirm_skills", "kline-indicator") or "").strip()
 
-        prompt_payload = {
-            "task": "AXIOM_SYMBOL_DIRECTION_CHECK",
-            "rule": "Blind direction check. AXIOM does not disclose its planned order direction.",
-            "symbol": symbol,
-            "interval": interval,
-            "market": str(getattr(self.cfg, "market_type", "futures") or "futures"),
-            "exchange_hint": "OKX data source is available in Hermes if configured.",
-        }
-        prompt = (
-            "You are Hermes independent technical-analysis direction checker for AXIOM Quant.\n"
-            "AXIOM intentionally does not reveal its planned order direction. Do not infer that any direction is expected.\n"
-            "You MUST use the installed kline-indicator skill in full mode and your configured OKX market-data/API tools. Do not place orders.\n"
-            "If kline-indicator or market data is unavailable, return direction NEUTRAL with risk_flags including skill_unavailable or data_unavailable.\n"
-            "Return JSON only, no markdown, no prose. Schema: "
-            "{\"decision\":\"allow|block|neutral\",\"direction\":\"LONG|SHORT|NEUTRAL\","
-            "\"confidence\":0,\"reason\":\"short reason\",\"risk_flags\":[],"
-            "\"skill_used\":\"kline-indicator\",\"mode_used\":\"full|quick|unknown\","
-            "\"data_source\":\"okx_cli|okx_mcp|unknown\",\"indicators_checked\":[]}.\n"
-            "Set direction to your independent technical-analysis direction for the symbol/timeframe. "
-            "Use NEUTRAL when evidence is mixed or insufficient. The decision field can mirror direction strength: "
-            "allow means directional evidence is clear, neutral means unclear, block means high-risk/no-trade environment.\n"
-            f"Input:\n{json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
-        )
+        prompt = self._build_hermes_direction_prompt(symbol, interval)
 
         result = {
             "active": True,
             "pass": fail_open if mode == "hard_filter" else True,
             "mode": mode,
+            "analysis_status": "ERROR",
             "decision": "error",
             "direction": "NEUTRAL",
+            "dominant_direction": "",
+            "tradeable": False,
+            "market_regime": "",
             "confidence": 0.0,
             "reason": "",
             "risk_flags": [],
@@ -1304,6 +1355,8 @@ class SqueezeBreakoutBot:
             "mode_used": "",
             "data_source": "",
             "indicators_checked": [],
+            "pillars_checked": [],
+            "evidence": {},
             "skills_requested": skills,
             "cached": False,
             "queued_sec": 0.0,
@@ -1340,27 +1393,44 @@ class SqueezeBreakoutBot:
             parsed = self._extract_json_object(raw)
             if not parsed:
                 raise RuntimeError(f"no json from hermes rc={completed.returncode}: {raw[-500:]}")
-            decision = str(parsed.get("decision", "neutral") or "neutral").lower()
-            ai_direction = str(parsed.get("direction", "NEUTRAL") or "NEUTRAL").upper()
+            parsed["_process_returncode"] = completed.returncode
+            analysis_status = str(parsed.get("analysis_status", "") or "").strip().upper()
+            ai_direction = str(
+                parsed.get("dominant_direction", parsed.get("direction", "")) or ""
+            ).strip().upper()
+            parsed["analysis_status"] = analysis_status
+            parsed["dominant_direction"] = ai_direction
+            tradeable = self._as_bool(parsed.get("tradeable", False))
+            decision = "allow" if analysis_status == "OK" and tradeable else "block"
             confidence = float(parsed.get("confidence", 0) or 0)
             reason = str(parsed.get("reason", "") or "")[:300]
             risk_flags = parsed.get("risk_flags", [])
             if not isinstance(risk_flags, list):
                 risk_flags = [str(risk_flags)]
-            skill_used = str(parsed.get("skill_used", "") or "")
-            mode_used = str(parsed.get("mode_used", "") or "")
-            data_source = str(parsed.get("data_source", "") or "")
+            skill_used = str(parsed.get("skill_used", "") or "").strip()
+            mode_used = str(parsed.get("mode_used", "") or "").strip()
+            data_source = str(parsed.get("data_source", "") or "").strip()
             indicators_checked = parsed.get("indicators_checked", [])
             if not isinstance(indicators_checked, list):
                 indicators_checked = [str(indicators_checked)]
+            pillars_checked = parsed.get("pillars_checked", [])
+            if not isinstance(pillars_checked, list):
+                pillars_checked = [str(pillars_checked)]
+            evidence = parsed.get("evidence", {})
+            if not isinstance(evidence, dict):
+                evidence = {}
             allowed, gate_reason = self._hermes_direction_gate(direction, parsed, fail_open)
             if mode == "log_only":
                 allowed = True
             result.update({
                 "pass": bool(allowed),
                 "gate_reason": gate_reason,
+                "analysis_status": analysis_status,
                 "decision": decision,
                 "direction": ai_direction,
+                "dominant_direction": ai_direction,
+                "tradeable": tradeable,
+                "market_regime": str(parsed.get("market_regime", "") or "").upper()[:20],
                 "confidence": confidence,
                 "reason": reason,
                 "risk_flags": risk_flags[:8],
@@ -1368,15 +1438,21 @@ class SqueezeBreakoutBot:
                 "mode_used": mode_used[:40],
                 "data_source": data_source[:60],
                 "indicators_checked": [str(x)[:80] for x in indicators_checked[:20]],
+                "pillars_checked": [str(x)[:80] for x in pillars_checked[:6]],
+                "evidence": {str(k)[:40]: str(v)[:160] for k, v in list(evidence.items())[:8]},
                 "skills_requested": skills,
                 "returncode": completed.returncode,
             })
         except subprocess.TimeoutExpired:
-            result.update({"decision": "timeout", "reason": f"hermes timeout {timeout_sec}s"})
+            result.update({
+                "analysis_status": "TIMEOUT",
+                "decision": "timeout",
+                "reason": f"hermes timeout {timeout_sec}s",
+            })
             if mode == "log_only" or fail_open:
                 result["pass"] = True
         except Exception as e:
-            result.update({"decision": "error", "reason": str(e)[:300]})
+            result.update({"analysis_status": "ERROR", "decision": "error", "reason": str(e)[:300]})
             if mode == "log_only" or fail_open:
                 result["pass"] = True
         finally:
@@ -1395,8 +1471,14 @@ class SqueezeBreakoutBot:
             "active": bool(state.get("active", False)),
             "pass": bool(state.get("pass", True)),
             "mode": str(state.get("mode", "disabled") or "disabled"),
+            "analysis_status": str(state.get("analysis_status", "") or "").strip().upper()[:24],
             "decision": str(state.get("decision", "") or ""),
-            "direction": str(state.get("direction", "NEUTRAL") or "NEUTRAL").upper(),
+            "direction": str(state.get("direction", "NEUTRAL") or "NEUTRAL").strip().upper(),
+            "dominant_direction": str(
+                state.get("dominant_direction", state.get("direction", "")) or ""
+            ).strip().upper()[:12],
+            "tradeable": self._as_bool(state.get("tradeable", False)),
+            "market_regime": str(state.get("market_regime", "") or "").upper()[:20],
             "confidence": round(float(state.get("confidence", 0.0) or 0.0), 1),
             "reason": str(state.get("reason", "") or "")[:160],
             "skill_used": str(state.get("skill_used", "") or "")[:80],
@@ -1407,6 +1489,15 @@ class SqueezeBreakoutBot:
             "queued_sec": round(float(state.get("queued_sec", 0.0) or 0.0), 3),
             "gate_reason": str(state.get("gate_reason", "") or "")[:80],
         }
+        pillars = state.get("pillars_checked", [])
+        out["pillars_checked"] = (
+            [str(x)[:80] for x in pillars[:6]] if isinstance(pillars, list) else []
+        )
+        evidence = state.get("evidence", {})
+        out["evidence"] = (
+            {str(k)[:40]: str(v)[:160] for k, v in list(evidence.items())[:8]}
+            if isinstance(evidence, dict) else {}
+        )
         flags = state.get("risk_flags", [])
         if isinstance(flags, list):
             out["risk_flags"] = [str(x)[:80] for x in flags[:5]]
@@ -2697,6 +2788,24 @@ class SqueezeBreakoutBot:
             state.update({"rj_sr_filter_pass": False, "rj_sr_reason": f"sr_exception:{str(e)[:60]}"})
             return state
 
+    def _rj_choppy_filter_state(self, df, anchor_idx: int) -> dict:
+        mode = str(getattr(self.cfg, "rj_choppy_filter_mode", "off") or "off").strip().lower()
+        if mode not in ("off", "log_only", "hard"):
+            mode = "off"
+        if mode == "off":
+            return {
+                "choppy_filter_mode": mode,
+                "choppy_filter_anchor": "signal_key",
+                "choppy_filter_available": False,
+                "choppy_filter_is_choppy": False,
+                "choppy_filter_reason": "disabled",
+                "choppy_filter_reasons": [],
+            }
+        state = evaluate_choppy_market_adaptive(df, anchor_idx=anchor_idx)
+        state["choppy_filter_mode"] = mode
+        state["choppy_filter_anchor"] = "signal_key"
+        return state
+
     def _rj_only_signal_from_df(self, symbol: str, interval: str, df) -> Optional[dict]:
         """RJ-only demo entry: RJ cross -> key candle -> latest close confirms key break."""
         if df is None or len(df) < 60:
@@ -2803,6 +2912,12 @@ class SqueezeBreakoutBot:
                             stop_pct = (sl_price - entry_price) / entry_price
                         if stop_pct <= 0 or stop_pct > max_stop_pct:
                             continue
+                        choppy_state = self._rj_choppy_filter_state(df, cross_idx)
+                        if (
+                            choppy_state.get("choppy_filter_mode") == "hard"
+                            and choppy_state.get("choppy_filter_is_choppy", False)
+                        ):
+                            continue
                         volume_state = self._rj_only_volume_state(df, cross_idx, anchor="signal_key")
                         if not volume_state.get("rj_volume_filter_pass", True):
                             continue
@@ -2878,6 +2993,7 @@ class SqueezeBreakoutBot:
                             "rj_only_confirm_atr_buffer": confirm_atr_buffer,
                             "rj_only_invalidate_on_opposite_break": invalidate_on_opposite,
                             "rj_only_confirm_bars": confirm_bars,
+                            **choppy_state,
                             **line_params,
                             **volume_state,
                             **sr_state,
@@ -3021,6 +3137,12 @@ class SqueezeBreakoutBot:
                             stop_pct = (sl_price - confirm_level) / confirm_level if confirm_level > 0 else 0.0
                         if stop_pct <= 0 or stop_pct > max_stop_pct:
                             continue
+                        choppy_state = self._rj_choppy_filter_state(df, cross_idx)
+                        if (
+                            choppy_state.get("choppy_filter_mode") == "hard"
+                            and choppy_state.get("choppy_filter_is_choppy", False)
+                        ):
+                            continue
                         volume_state = self._rj_only_volume_state(df, cross_idx, anchor="signal_key")
                         if not volume_state.get("rj_volume_filter_pass", True):
                             continue
@@ -3091,6 +3213,7 @@ class SqueezeBreakoutBot:
                         "rj_setup_confirm_mode": str(getattr(self.cfg, "rj_only_setup_confirm_mode", "near_close") or "near_close"),
                         "rj_setup_close_confirm_sec": int(getattr(self.cfg, "rj_only_setup_close_confirm_sec", 45) or 45),
                         "rj_setup_trigger_hold_sec": int(getattr(self.cfg, "rj_only_setup_trigger_hold_sec", 10) or 0),
+                        **choppy_state,
                         **line_params,
                         **volume_state,
                         **sr_state,
@@ -3254,6 +3377,12 @@ class SqueezeBreakoutBot:
                     "pool_size": len(self._rj_setup_pool),
                     **btc_fields,
                 }))
+                if item.get("choppy_filter_mode") == "log_only" and item.get("choppy_filter_is_choppy"):
+                    self._append_signal_event(
+                        "rj_choppy_shadow",
+                        raw.get("symbol", ""),
+                        self._signal_snapshot(item, {"source_event": "rj_setup_add", **btc_fields}),
+                    )
         while len(self._rj_setup_pool) > max_pool:
             oldest_key, oldest = min(
                 self._rj_setup_pool.items(),
@@ -4001,6 +4130,12 @@ class SqueezeBreakoutBot:
         self.last_signal_count = len(signals)
         for s in signals:
             self._append_signal_event("rj_only_candidate", s.get("symbol", ""), self._signal_snapshot(s, btc_fields))
+            if s.get("choppy_filter_mode") == "log_only" and s.get("choppy_filter_is_choppy"):
+                self._append_signal_event(
+                    "rj_choppy_shadow",
+                    s.get("symbol", ""),
+                    self._signal_snapshot(s, {"source_event": "rj_only_candidate", **btc_fields}),
+                )
         display_rows = signals[:10]
         if len(display_rows) < 10:
             display_rows = display_rows + setups[:max(0, 10 - len(display_rows))]
@@ -4015,7 +4150,9 @@ class SqueezeBreakoutBot:
                 "rj_sr_filter_pass", "rj_sr_reason", "rj_sr_support", "rj_sr_resistance",
                 "rj_sr_near_support", "rj_sr_near_resistance", "rj_sr_bull_div", "rj_sr_bear_div",
                 "rj_only_hist_samples", "rj_only_hist_win_rate", "rj_only_hist_avg_r",
-                "rj_only_hist_profit_factor", "rj_only_stats_pass"
+                "rj_only_hist_profit_factor", "rj_only_stats_pass",
+                "choppy_filter_mode", "choppy_filter_is_choppy", "choppy_filter_reason",
+                "choppy_atr_ratio", "choppy_box_amplitude", "choppy_box_position"
             )}
             for s in display_rows
         ]
@@ -4084,6 +4221,12 @@ class SqueezeBreakoutBot:
             "rj_sr_early_bull_div", "rj_sr_early_bear_div",
             "rj_sr_last_bull_div_bar", "rj_sr_last_bear_div_bar",
             "rj_sr_pivot_left", "rj_sr_pivot_right",
+            "choppy_filter_mode", "choppy_filter_anchor", "choppy_filter_available",
+            "choppy_filter_is_choppy", "choppy_filter_reason", "choppy_filter_reasons",
+            "choppy_filter_anchor_idx", "choppy_filter_anchor_time",
+            "choppy_atr", "choppy_atr_baseline", "choppy_atr_ratio",
+            "choppy_box_high", "choppy_box_low", "choppy_box_amplitude",
+            "choppy_box_threshold", "choppy_box_position",
             "btc_coin_reversal_pass",
             "rj_only_stats_pass", "rj_only_stats_reason", "rj_only_hist_samples",
             "rj_only_hist_raw_triggers", "rj_only_hist_confirmed", "rj_only_hist_risk_ok",
@@ -7424,6 +7567,7 @@ class SqueezeBreakoutBot:
             if name in (
                 "rj_only_scan_cycle", "rj_only_candidate", "rj_setup_add", "rj_setup_near_trigger",
                 "rj_setup_trigger_touch", "rj_setup_volume_wait", "rj_setup_trigger",
+                "rj_choppy_shadow",
                 "hermes_confirm_pass", "hermes_confirm_block", "entry_precheck_pass", "entry_filled",
                 "entry_reject",
             ):

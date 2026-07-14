@@ -8,7 +8,7 @@ import pandas as pd
 from backtest.data_store import HistoricalStore
 from backtest.bitget_history import BitgetHistorySource
 from backtest.execution import SimBroker
-from backtest.engine import ReplayEngine
+from backtest.engine import PortfolioReplayEngine, ReplayEngine
 from backtest.experiment import ExperimentSpec
 from backtest.cli import build_run_id
 from backtest.metrics import summarize_positions
@@ -37,6 +37,20 @@ class ReplayBot:
         }
 
 
+class PortfolioBot:
+    def _rj_only_signal_from_df(self, symbol, interval, candles):
+        del interval
+        if len(candles) < 60:
+            return None
+        score = 90.0 if symbol == "HIGHUSDT" else 70.0
+        return {
+            "direction": "LONG", "price": 100.0, "rj_only_stop_price": 98.0,
+            "signal_key": f"RJ|{symbol}|LONG|ONE", "score": score,
+            "rj_volume_filter_pass": True, "rj_sr_near_support": True,
+            "rj_sr_bull_div": True,
+        }
+
+
 class FakeResponse:
     def __init__(self, data):
         self.data = data
@@ -60,6 +74,34 @@ class FakeHistorySession:
 
 
 class BacktestSystemTest(unittest.TestCase):
+    def test_portfolio_enforces_slots_by_score(self):
+        opens = [index * 1_800_000 for index in range(61)]
+        frame30 = pd.DataFrame({
+            "ot": opens, "o": [100.0] * 61, "h": [101.0] * 61,
+            "l": [99.0] * 61, "c": [100.0] * 61, "v": [1000.0] * 61,
+        })
+        decision_time = opens[59] + 1_800_000
+        frame1 = pd.DataFrame({
+            "ot": [decision_time, decision_time + 60_000],
+            "o": [100.0, 100.0], "h": [100.5, 100.5],
+            "l": [99.5, 99.5], "c": [100.0, 100.0], "v": [10.0, 10.0],
+        })
+        engine = PortfolioReplayEngine(
+            PortfolioBot(), initial_equity=1000, risk_usdt=10, fee_rate=0,
+            slippage_bps=0, exit_rules=ExitRules(), max_positions=1, warmup_bars=60,
+        )
+
+        result = engine.run(
+            {"LOWUSDT": frame30, "HIGHUSDT": frame30},
+            {"LOWUSDT": frame1, "HIGHUSDT": frame1},
+            lambda _: {"stage": "range", "direction": "range", "extreme_veto": False},
+            entry_start_ms=decision_time,
+        )
+
+        entries = [event for event in result.events if event["type"] == "entry_fill"]
+        capacity = [event for event in result.events if event.get("reason") == "capacity_full"]
+        self.assertEqual([event["symbol"] for event in entries], ["HIGHUSDT"])
+        self.assertEqual([event["symbol"] for event in capacity], ["LOWUSDT"])
     def test_run_id_changes_with_symbol_or_data(self):
         base = build_run_id("manifest", "BTCUSDT", ["a", "b"])
 

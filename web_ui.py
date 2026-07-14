@@ -1859,8 +1859,8 @@ function initTraderPanel(){
     h+='<div class="t-field"><label>Hermes AI确认</label><select id="cfg_hermes_on"><option value="0"'+(cfg.hermes_confirm_enabled?'':' selected')+'>关闭</option><option value="1"'+(cfg.hermes_confirm_enabled?' selected':'')+'>启用</option></select></div>';
     h+='<div class="t-field"><label>Hermes模式</label><select id="cfg_hermes_mode"><option value="log_only"'+((cfg.hermes_confirm_mode||'log_only')==='log_only'?' selected':'')+'>仅记录</option><option value="hard_filter"'+((cfg.hermes_confirm_mode||'log_only')==='hard_filter'?' selected':'')+'>拦截冲突</option></select></div>';
     h+='<div class="t-field"><label>Hermes最低置信度</label><input type="number" id="cfg_hermes_conf" value="'+(cfg.hermes_confirm_min_confidence||65)+'" min="0" max="100" step="1"></div>';
-    h+='<div class="t-field"><label>Hermes超时秒</label><input type="number" id="cfg_hermes_timeout" value="'+(cfg.hermes_confirm_timeout_sec||90)+'" min="3" max="120" step="1"></div>';
-    h+='<div class="t-field"><label>Hermes排队秒</label><input type="number" id="cfg_hermes_queue_wait" value="'+(cfg.hermes_confirm_queue_wait_sec||120)+'" min="0" max="300" step="5"></div>';
+        h+='<div class="t-field"><label>Hermes超时秒</label><input type="number" id="cfg_hermes_timeout" value="'+(cfg.hermes_confirm_timeout_sec||240)+'" min="3" max="300" step="1"></div>';
+        h+='<div class="t-field"><label>Hermes排队秒</label><input type="number" id="cfg_hermes_queue_wait" value="'+(cfg.hermes_confirm_queue_wait_sec||300)+'" min="0" max="300" step="5"></div>';
     h+='<div class="t-field"><label>Hermes异常放行</label><select id="cfg_hermes_fail_open"><option value="0"'+(cfg.hermes_confirm_fail_open?'':' selected')+'>否</option><option value="1"'+(cfg.hermes_confirm_fail_open?' selected':'')+'>是</option></select></div>';
     h+='</div></div>';
 
@@ -1911,16 +1911,28 @@ function tradePnlValue(t){
 }
 function hermesText(h){
   if(!h || !h.active) return 'Hermes 未启用';
-  var dir=(h.direction||'NEUTRAL').toUpperCase();
-  var cn=dir==='LONG'?'看多':(dir==='SHORT'?'看空':'中性');
-  var conf=Number(h.confidence||0).toFixed(0);
+  if(!h.analysis_status) {
+    var legacyDir=(h.direction||'NEUTRAL').toUpperCase();
+    var legacyCn=legacyDir==='LONG'?'看多':(legacyDir==='SHORT'?'看空':'中性');
+    return 'Hermes '+legacyCn+' · 旧版记录';
+  }
+  var status=(h.analysis_status||'').toUpperCase();
+  if(status && status!=='OK') return 'Hermes 异常 · '+status;
+  var dir=(h.dominant_direction||h.direction||'').toUpperCase();
+  var cn=dir==='LONG'?'看多':(dir==='SHORT'?'看空':'无方向');
+  var quality=h.tradeable?'可交易':'回避';
   var mode=h.mode==='hard_filter'?'拦截':'记录';
-  return 'Hermes '+cn+' '+conf+'% · '+mode;
+  return 'Hermes '+cn+' · '+quality+' · '+mode;
 }
 function hermesClass(h, axiomDir){
   if(!h || !h.active) return 'neu';
-  var dir=(h.direction||'NEUTRAL').toUpperCase();
-  if(dir==='NEUTRAL') return 'neu';
+  if(!h.analysis_status) {
+    var legacyDir=(h.direction||'NEUTRAL').toUpperCase();
+    return legacyDir==='NEUTRAL'?'neu':(legacyDir===axiomDir?'g':'r');
+  }
+  if((h.analysis_status||'').toUpperCase()!=='OK' || !h.tradeable) return 'r';
+  var dir=(h.dominant_direction||h.direction||'').toUpperCase();
+  if(!dir) return 'neu';
   return dir===axiomDir?'g':'r';
 }
 function hermesLine(h, axiomDir){
@@ -2483,8 +2495,8 @@ function saveConfig(){
     hermes_confirm_enabled: document.getElementById('cfg_hermes_on').value==='1',
     hermes_confirm_mode: document.getElementById('cfg_hermes_mode').value,
     hermes_confirm_min_confidence: parseFloat(document.getElementById('cfg_hermes_conf').value)||65,
-    hermes_confirm_timeout_sec: parseInt(document.getElementById('cfg_hermes_timeout').value)||90,
-    hermes_confirm_queue_wait_sec: parseInt(document.getElementById('cfg_hermes_queue_wait').value)||120,
+    hermes_confirm_timeout_sec: parseInt(document.getElementById('cfg_hermes_timeout').value)||240,
+    hermes_confirm_queue_wait_sec: parseInt(document.getElementById('cfg_hermes_queue_wait').value)||300,
     hermes_confirm_fail_open: document.getElementById('cfg_hermes_fail_open').value==='1',
   };
   // 始终带上所有API字段, 防止切换交易所时覆盖丢失
