@@ -1,12 +1,15 @@
 import logging
+import tempfile
 import time
 import unittest
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from strategy_filters import evaluate_choppy_market_adaptive, is_choppy_market_adaptive
-from trader import SqueezeBreakoutBot, TradeConfig
+from trader import Position, SqueezeBreakoutBot, TradeConfig
 
 
 def _frame(closes, half_range=1.0):
@@ -130,6 +133,77 @@ class ChoppyFilterRjIntegrationTest(unittest.TestCase):
 
         self.assertIn("rj_setup_add", events)
         self.assertIn("rj_choppy_shadow", events)
+
+
+class ChoppyFilterPositionAuditTest(unittest.TestCase):
+    def _position(self):
+        return Position(
+            symbol="TESTUSDT",
+            direction="LONG",
+            entry_price=100.0,
+            entry_time=datetime(2026, 7, 14, 20, 0),
+            quantity=1.0,
+            sl_price=98.0,
+            current_sl=98.0,
+            risk_usdt=2.0,
+            signal_score=75.0,
+            initial_band_hi=100.0,
+            initial_band_lo=100.0,
+            choppy_filter={
+                "available": True,
+                "is_choppy": True,
+                "reason": "middle_chop",
+                "reasons": ["middle_chop"],
+                "atr_ratio": 0.82,
+                "box_position": 0.51,
+                "box_amplitude": 0.03,
+            },
+        )
+
+    def test_position_audit_is_saved_and_restored(self):
+        bot = SqueezeBreakoutBot(TradeConfig(mode="paper", enabled=False, exchange="bitget"))
+        with tempfile.TemporaryDirectory() as tmp:
+            bot._positions_path = str(Path(tmp) / "positions.json")
+            bot.positions = [self._position()]
+
+            bot._save_positions()
+            restored = bot._load_positions()
+
+        self.assertEqual(len(restored), 1)
+        self.assertTrue(restored[0].choppy_filter["is_choppy"])
+        self.assertEqual(restored[0].choppy_filter["reason"], "middle_chop")
+        self.assertAlmostEqual(restored[0].choppy_filter["atr_ratio"], 0.82)
+
+    def test_position_audit_uses_entry_signal_snapshot(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        audit = bot._position_choppy_filter({
+            "choppy_filter_mode": "log_only",
+            "choppy_filter_available": True,
+            "choppy_filter_is_choppy": False,
+            "choppy_filter_reason": "pass",
+            "choppy_filter_reasons": [],
+            "choppy_filter_anchor": "signal_key",
+            "choppy_atr_ratio": 1.12,
+            "choppy_box_position": 0.74,
+            "choppy_box_amplitude": 0.04,
+        })
+
+        self.assertTrue(audit["recorded"])
+        self.assertEqual(audit["mode"], "log_only")
+        self.assertEqual(audit["anchor"], "signal_key")
+        self.assertFalse(audit["is_choppy"])
+        self.assertAlmostEqual(audit["box_position"], 0.74)
+
+    def test_explicit_unrecorded_audit_stays_unrecorded(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        first = bot._position_choppy_filter({})
+        second = bot._position_choppy_filter(first)
+        migrated = bot._position_choppy_filter({**first, "recorded": True})
+
+        self.assertFalse(first["recorded"])
+        self.assertFalse(second["recorded"])
+        self.assertFalse(migrated["recorded"])
+        self.assertEqual(second["reason"], "not_recorded")
 
 
 if __name__ == "__main__":

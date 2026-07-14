@@ -1049,6 +1049,7 @@ class Position:
     target_distance_pct: float = 0.0    # 入场到目标区距离百分比
     target_zone_bars_ago: int = 0       # 目标区距离当前多少根K线
     hermes_confirm: dict = field(default_factory=dict)
+    choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
 
 
 # ============================================================
@@ -1513,6 +1514,92 @@ class SqueezeBreakoutBot:
         else:
             out["indicators_checked"] = []
         return out
+
+    def _position_choppy_filter(self, state: Optional[dict]) -> dict:
+        """压缩入场时震荡判定，供持仓、交易记录和前端复盘共用。"""
+        state = state or {}
+        source_reason = str(state.get("reason", state.get("choppy_filter_reason", "")) or "")
+        if source_reason == "not_recorded":
+            recorded = False
+        elif "recorded" in state:
+            recorded = bool(state.get("recorded"))
+        else:
+            recorded = bool(
+                "choppy_filter_available" in state
+                or "choppy_filter_is_choppy" in state
+                or "choppy_filter_mode" in state
+                or "available" in state
+                or "is_choppy" in state
+            )
+        if not recorded:
+            return {
+                "recorded": False,
+                "mode": "",
+                "anchor": "",
+                "available": False,
+                "is_choppy": False,
+                "reason": "not_recorded",
+                "reasons": [],
+                "atr_ratio": None,
+                "box_position": None,
+                "box_amplitude": None,
+            }
+
+        reasons = state.get("reasons", state.get("choppy_filter_reasons", []))
+        if not isinstance(reasons, list):
+            reasons = [reasons] if reasons else []
+
+        def optional_float(name, source_name):
+            value = state.get(name, state.get(source_name))
+            try:
+                return round(float(value), 6) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "recorded": True,
+            "mode": str(state.get("mode", state.get("choppy_filter_mode", "")) or "")[:16],
+            "anchor": str(state.get("anchor", state.get("choppy_filter_anchor", "")) or "")[:24],
+            "available": bool(state.get("available", state.get("choppy_filter_available", False))),
+            "is_choppy": bool(state.get("is_choppy", state.get("choppy_filter_is_choppy", False))),
+            "reason": str(state.get("reason", state.get("choppy_filter_reason", "")) or "")[:40],
+            "reasons": [str(reason)[:40] for reason in reasons[:3]],
+            "atr_ratio": optional_float("atr_ratio", "choppy_atr_ratio"),
+            "box_position": optional_float("box_position", "choppy_box_position"),
+            "box_amplitude": optional_float("box_amplitude", "choppy_box_amplitude"),
+        }
+
+    def _entry_choppy_audit_map(self) -> dict:
+        """从成交事件恢复旧持仓缺失的入场快照，不用当前行情补算。"""
+        audits = {}
+        path = Path(getattr(self, "_signal_log_path", SIGNAL_LOG_PATH))
+        if not path.exists():
+            return audits
+        try:
+            lines = deque(maxlen=5000)
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    lines.append(line)
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("event") != "entry_filled":
+                    continue
+                audit = self._position_choppy_filter(event)
+                if not audit.get("recorded"):
+                    continue
+                symbol = str(event.get("symbol", "") or "")
+                signal_key = str(event.get("signal_key", "") or "")
+                if symbol:
+                    audits[(symbol, "")] = audit
+                    if signal_key:
+                        audits[(symbol, signal_key)] = audit
+        except Exception as exc:
+            if getattr(self, "_log_ready", False):
+                self._log.warning(f"恢复持仓震荡快照失败: {exc}")
+        return audits
 
     def _bar_marker(self, df, idx):
         try:
@@ -4494,6 +4581,7 @@ class SqueezeBreakoutBot:
                     "target_distance_pct": getattr(p, "target_distance_pct", 0.0),
                     "target_zone_bars_ago": getattr(p, "target_zone_bars_ago", 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
                     "active_stop_id": stop_ids.get(p.symbol, ""),
                 }
                 data.append(entry)
@@ -4524,6 +4612,7 @@ class SqueezeBreakoutBot:
             with open(getattr(self, '_positions_path', 'positions.json')) as f:
                 data = json.load(f)
             loaded = []
+            entry_choppy_audits = self._entry_choppy_audit_map()
             for d in data:
                 pos = Position(
                     symbol=d["symbol"], direction=d["direction"],
@@ -4556,6 +4645,12 @@ class SqueezeBreakoutBot:
                 pos.target_distance_pct = float(d.get('target_distance_pct', 0.0) or 0.0)
                 pos.target_zone_bars_ago = int(d.get('target_zone_bars_ago', 0) or 0)
                 pos.hermes_confirm = self._public_hermes_confirm(d.get('hermes_confirm', {}))
+                pos.choppy_filter = self._position_choppy_filter(d.get('choppy_filter', {}))
+                if not pos.choppy_filter.get("recorded"):
+                    pos.choppy_filter = entry_choppy_audits.get(
+                        (pos.symbol, pos.signal_key),
+                        entry_choppy_audits.get((pos.symbol, ""), pos.choppy_filter),
+                    )
                 raw_armed_at = d.get('time_stop_armed_at', '')
                 pos.time_stop_armed_at = datetime.fromisoformat(raw_armed_at) if raw_armed_at else None
                 pos.time_stop_armed = True
@@ -5361,6 +5456,7 @@ class SqueezeBreakoutBot:
             target_distance_pct=float(target_zone.get("target_distance_pct", 0.0) or 0.0),
             target_zone_bars_ago=int(target_zone.get("target_zone_bars_ago", 0) or 0),
             hermes_confirm=self._public_hermes_confirm(hermes_state),
+            choppy_filter=self._position_choppy_filter(signal),
         )
         pos.time_stop_armed = True
         pos.time_stop_armed_at = pos.entry_time
@@ -6834,6 +6930,7 @@ class SqueezeBreakoutBot:
             'target_distance_pct': round(float(getattr(pos, 'target_distance_pct', 0.0) or 0.0), 4),
             'target_zone_bars_ago': int(getattr(pos, 'target_zone_bars_ago', 0) or 0),
             'hermes_confirm': self._public_hermes_confirm(getattr(pos, 'hermes_confirm', {})),
+            'choppy_filter': self._position_choppy_filter(getattr(pos, 'choppy_filter', {})),
             **self._position_btc_fields(pos),
         }
         if raw_exit_reason != reason:
@@ -7781,6 +7878,7 @@ class SqueezeBreakoutBot:
                     "target_zone_price": round(float(getattr(p, "target_zone_price", 0.0) or 0.0), 6),
                     "target_r": round(float(getattr(p, "target_r", 0.0) or 0.0), 4),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
                 }
                 for p in self.positions
             ],
@@ -7967,6 +8065,7 @@ class SqueezeBreakoutBot:
                     "target_distance_pct": round(float(getattr(p, "target_distance_pct", 0.0) or 0.0), 4),
                     "target_zone_bars_ago": int(getattr(p, "target_zone_bars_ago", 0) or 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
                 }
                 for p in self.positions
             ],

@@ -1942,6 +1942,38 @@ function hermesLine(h, axiomDir){
   var title=reason?(' title="'+reason+'"'):'';
   return '<div class="pc-data"><span class="pc-label">Hermes</span><span class="pc-val '+cls+'"'+title+'>'+hermesText(h)+'</span></div>';
 }
+function choppyReasonText(a){
+  var labels={atr_contraction:'波动衰减',box_squeeze:'箱体收缩',middle_chop:'中轴泥潭',pass:'活跃通过',insufficient_data:'数据不足',not_recorded:'未记录'};
+  var reasons=(a&&Array.isArray(a.reasons)&&a.reasons.length?a.reasons:[a&&a.reason]).filter(Boolean);
+  return reasons.map(function(x){return labels[x]||'状态未知';}).join(' + ')||'状态未知';
+}
+function choppyAuditMeta(a){
+  if(!a||!a.recorded) return '';
+  var parts=[];
+  if(a.atr_ratio!==null&&a.atr_ratio!==undefined) parts.push('ATR比率 '+Number(a.atr_ratio).toFixed(2));
+  if(a.box_position!==null&&a.box_position!==undefined) parts.push('箱体位置 '+(Number(a.box_position)*100).toFixed(1)+'%');
+  if(a.box_amplitude!==null&&a.box_amplitude!==undefined) parts.push('箱体振幅 '+(Number(a.box_amplitude)*100).toFixed(2)+'%');
+  return parts.join(' · ');
+}
+function choppyAuditClass(a){
+  if(!a||!a.recorded||!a.available) return 'neu';
+  return a.is_choppy?'y':'g';
+}
+function choppyAuditText(a){
+  if(!a||!a.recorded) return '入场未记录';
+  if(!a.available) return '数据不足';
+  return (a.is_choppy?'震荡 · ':'活跃 · ')+choppyReasonText(a);
+}
+function choppyLine(a){
+  var meta=choppyAuditMeta(a);
+  var title=meta?' title="'+meta+'"':'';
+  return '<div class="pc-data"><span class="pc-label">震荡过滤</span><span class="pc-val '+choppyAuditClass(a)+'"'+title+'>'+choppyAuditText(a)+'</span></div>';
+}
+function choppyTradeTag(a){
+  var meta=choppyAuditMeta(a);
+  var title=meta?' title="'+meta+'"':'';
+  return '<span class="'+choppyAuditClass(a)+'"'+title+'>'+choppyAuditText(a)+'</span>';
+}
 function setEqValue(id, value, signed){
   var el=document.getElementById(id);
   if(!el) return;
@@ -2307,6 +2339,7 @@ function refreshTraderData(){
         if(pTargetR>0){
           posHTML+='<div class="pc-data"><span class="pc-label">目标区</span><span class="pc-val">'+fmtTargetType(p.target_zone_type)+' '+Number(p.target_zone_price||0).toFixed(6)+' / '+pTargetR.toFixed(2)+'R</span></div>';
         }
+        posHTML+=choppyLine(p.choppy_filter);
         posHTML+=hermesLine(p.hermes_confirm,p.direction);
         posHTML+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+(p.value||0).toFixed(2)+'</span></div>';
         posHTML+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(isProfit?'+':'')+p.pnl.toFixed(2)+' USDT</div><button class="pc-btn" onclick="closeOne(\''+p.symbol+'\')">平仓</button></div>';
@@ -2358,7 +2391,7 @@ function refreshTraderData(){
         logHTML+='<div class=\"tl-item '+(isWin?'tl-win':'tl-loss')+'\" onclick=\"this.classList.toggle(\'expanded\')\">';
         logHTML+='<div class=\"tl-time\">'+dt+'</div>';
         logHTML+='<div class=\"tl-body\"><div class=\"tl-head\"><span class=\"tl-sym\">'+t.symbol.replace('USDT','')+'</span><span class=\"tl-dir '+(t.direction==='LONG'?'g':'r')+'\">'+(t.direction==='LONG'?'多':'空')+'</span><span class=\"tl-reason\">'+t.reason+'</span></div>';
-        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span><span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
+        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+'<span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
         logHTML+='<div class=\"tl-pnl\"><span class=\"tl-pnl-val '+(isWin?'g':'r')+'\">'+(isWin?'+':'')+pnlVal.toFixed(2)+'</span><span class=\"tl-pnl-pct '+(isWin?'g':'r')+'\">'+(t.pnl_pct>=0?'+':'')+(t.pnl_pct||0).toFixed(2)+'%</span></div>';
         logHTML+='</div>';
       }
@@ -3003,6 +3036,7 @@ function fetchDemoData(){
         h+='<div class="pc-data"><span class="pc-label">入场价</span><span class="pc-val">'+p.entry+'</span></div>';
         h+='<div class="pc-data"><span class="pc-label">当前价</span><span class="pc-val">'+(p.current_price||p.entry).toFixed(6)+'</span></div>';
         h+='<div class="pc-data"><span class="pc-label">止损价</span><span class="pc-val">'+p.sl+'</span></div>';
+        h+=choppyLine(p.choppy_filter);
         h+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+(p.value||0).toFixed(2)+'</span></div>';
         h+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(ip?'+':'')+p.pnl.toFixed(2)+' USDT</div></div>';
         if(p.breakeven) h+='<div class="pc-trail-shimmer">✦ 追踪止盈已开启</div>';
@@ -3048,6 +3082,7 @@ function renderDemoPositionCards(d){
     h+='<div class="pc-data"><span class="pc-label">当前价</span><span class="pc-val">'+Number(p.current_price||p.entry||0).toFixed(6)+'</span></div>';
     h+='<div class="pc-data"><span class="pc-label">止损价</span><span class="pc-val">'+p.sl+'</span></div>';
     h+='<div class="pc-data"><span class="pc-label">MFE</span><span class="pc-val">'+Number(p.max_favorable_r||0).toFixed(2)+'R</span></div>';
+    h+=choppyLine(p.choppy_filter);
     h+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+Number(p.value||0).toFixed(2)+'</span></div>';
     h+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(ip?'+':'')+Number(p.pnl||0).toFixed(2)+' USDT</div></div>';
     if(p.breakeven) h+='<div class="pc-trail-shimmer">保护止损已启动</div>';
@@ -3084,7 +3119,7 @@ function renderDemoTradeList(d){
       var targetR=Number(t.target_r||0);
       var targetText=targetR>0?('目标 '+targetR.toFixed(2)+'R'):'目标 --';
       h+='<div class="tl-item '+(tw?'tl-win':'tl-loss')+'"><div class="tl-time">'+String(t.time||'').slice(5,16).replace('T',' ')+'</div><div class="tl-body"><div class="tl-head"><span class="tl-sym">'+String(t.symbol||'').replace('USDT','')+'</span><span class="tl-dir '+(t.direction==='LONG'?'g':'r')+'">'+(t.direction==='LONG'?'多':'空')+'</span><span class="tl-reason">'+(t.reason||'')+'</span></div>';
-      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span></div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
+      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+'</div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
     }
     h+='</div>';
   }
