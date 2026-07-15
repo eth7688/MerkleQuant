@@ -69,8 +69,8 @@ tier2LockR = input.float(1.0, "二阶减仓后锁定R", minval=0.0, step=0.1, gr
 chandelierMult = input.float(3.5, "30分钟ATR吊灯倍数", minval=0.1, step=0.1, group=groupRisk)
 
 groupBacktest = "回测范围与显示"
-startTime = input.time(timestamp(2024, 1, 1, 0, 0), "开始时间", group=groupBacktest)
-endTime = input.time(timestamp(2030, 12, 31, 23, 59), "结束时间", group=groupBacktest)
+startTime = input.time(1704067200000, "开始时间", group=groupBacktest)
+endTime = input.time(1924991940000, "结束时间", group=groupBacktest)
 showBackground = input.bool(true, "显示RJ背景", group=groupBacktest)
 showKeyBoxes = input.bool(true, "显示关键K盒子", group=groupBacktest)
 showStatus = input.bool(true, "显示状态表", group=groupBacktest)

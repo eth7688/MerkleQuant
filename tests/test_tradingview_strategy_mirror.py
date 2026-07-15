@@ -64,6 +64,11 @@ class TradingViewStrategyMirrorTest(unittest.TestCase):
         self.assertNotIn("lookahead_on", self.source)
         self.assertNotRegex(self.source, r"offset\s*=\s*-\d")
 
+    def test_time_inputs_use_const_unix_milliseconds(self):
+        self.assertIn("startTime = input.time(1704067200000", self.source)
+        self.assertIn("endTime = input.time(1924991940000", self.source)
+        self.assertNotRegex(self.source, r"input\.time\(timestamp\(")
+
 
 if __name__ == "__main__":
     unittest.main()
