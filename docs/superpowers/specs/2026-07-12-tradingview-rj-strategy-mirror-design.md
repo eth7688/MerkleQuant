@@ -21,9 +21,10 @@ Build a single-symbol TradingView strategy that cross-checks AXIOM's production 
 - Confirmation window is 6 closed 30-minute bars.
 - Confirmation buffer is 0.08 ATR; maximum chase is 2%.
 - Stop is outside the signal key candle by 0.5 ATR, bounded to 0.3%-8% risk.
-- Signal-key volume filter uses 20 bars and a 2.0 multiplier.
+- Signal-key volume filter uses 20 bars and a 1.1 multiplier.
 - Support/resistance and divergence filters are anchored to the signal key candle.
-- Historical gate requires at least 8 samples, 55% win rate, and non-negative average R.
+- Adaptive choppy filtering uses ATR(14), its 100-bar baseline, and the prior 48-bar box, all frozen on the signal key candle.
+- Historical gate requires at least 8 samples, 52% win rate, and non-negative average R.
 - Early protection at 0.8R locks 0.25R.
 - Tier 1 at 1.2R upgrades the defensive stop to +0.2R and enables the 30-minute ATR chandelier.
 - Tier 2 at 2.0R exits 50% of the original position and upgrades the stop to +1.0R.
@@ -39,13 +40,24 @@ Build a single-symbol TradingView strategy that cross-checks AXIOM's production 
 5. Track the setup for at most 6 subsequent closed bars.
 6. Invalidate it if price closes through the opposite side or if a prior bar already confirmed it.
 7. Require the current close to break the key level plus/minus 0.08 ATR without exceeding 2% chase.
-8. Apply the rolling historical sample gate.
-9. Apply the BTC stage gate using closed BTC 1h and 4h data from `request.security()`.
+8. Apply the signal-key adaptive choppy gate.
+9. Apply the causal rolling historical sample gate.
 10. Submit the strategy order after the confirming close; TradingView fills it at the next bar open under default processing.
 
-## BTC Stage Gate
+## Adaptive Choppy Gate
 
-The Pine implementation mirrors the production stage categories using closed 1h/4h EMA alignment, ADX, ATR distance, volume, momentum, and exhaustion evidence. Only explicit extreme early/mid trends hard-veto opposite signals. Late, decay, range, mixed, and unknown states do not hard-block.
+- ATR contraction: ATR(14) is below 70% of its 100-bar moving baseline.
+- Box squeeze: the prior 48 closed bars span less than 2.5 current ATR.
+- Middle chop: the signal key close lies strictly between 40% and 60% of the prior 48-bar box.
+- Any one condition marks the signal key as choppy. Modes are off, log-only, and hard filter.
+
+## Recent Win-Rate Gate
+
+- Every risk-valid raw RJ confirmation becomes a sample whether or not non-risk entry filters allow an order.
+- Each sample starts evaluation on the bar after confirmation and is observed for 12 bars.
+- Stop and 1R target are evaluated with stop-first ordering on ambiguous bars; unresolved samples close at horizon using current R.
+- Long and short samples are kept separate over the most recent 1000 bars.
+- The current signal never contributes to the statistics used to decide itself.
 
 ## Exit Pipeline
 
@@ -63,14 +75,13 @@ The Pine implementation mirrors the production stage categories using closed 1h/
 - Mark primary versus fallback key candles distinctly.
 - Mark confirmation and next-bar entry.
 - Plot initial and active stops without changing chart scale unexpectedly.
-- Show BTC stage and gate result.
-- Show a compact table with closed trades, win rate, net profit, profit factor, maximum drawdown, average R, and long/short counts.
+- Show choppy reason, ATR ratio, box position, recent win rate/sample count/average R, trade count, and net profit.
 - Keep all labels in clear Chinese and use restrained AXIOM colors.
 
 ## Known Fidelity Boundaries
 
 - TradingView cannot model 192 symbols competing for six shared slots.
-- Hermes and exchange API decisions are outside Pine.
+- BTC stage, Hermes, and exchange API decisions remain outside this single-symbol script.
 - Bar Magnifier improves intrabar fills but cannot guarantee exact equivalence to Python's one-minute adverse-first replay on every ambiguous bar.
 - Exchange feed differences can shift levels and fills.
 - The Pine historical gate will be validated against fixed chart cases; any irreducible platform difference must be shown in the table rather than hidden.
@@ -78,7 +89,7 @@ The Pine implementation mirrors the production stage categories using closed 1h/
 ## Verification
 
 - Pine compiles without warnings that affect behavior.
-- No repaint: all entry decisions use confirmed data and `request.security(..., lookahead_off)`.
+- No repaint: all entry decisions use confirmed chart data and no future plot offset.
 - Default parameter values match the frozen production experiment manifest.
 - At least three fixed symbol/time cases are compared against AXIOM events for trigger source, key time, confirmation time, direction, and stop.
 - Strategy Tester reports are treated as single-symbol evidence only.
