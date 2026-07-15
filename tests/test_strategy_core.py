@@ -14,6 +14,7 @@ from strategy_core import (
     PositionState,
     StrategySnapshot,
     advance_position,
+    evaluate_entry,
     evaluate_rj_entry,
 )
 
@@ -40,6 +41,26 @@ def candles():
 
 
 class StrategyCoreTest(unittest.TestCase):
+    def test_entry_router_uses_predicta_source_without_rj_gates(self):
+        signal = {
+            "symbol": "TESTUSDT", "direction": "LONG", "price": 103.0,
+            "predicta_stop_price": 99.0, "predicta_key_time": 1_800_000,
+            "predicta_confirm_time": 3_600_000, "predicta_entry_path": "wait",
+            "signal_key": "PREDICTA|TESTUSDT|LONG|30m|1800000",
+        }
+        bot = FakeBot()
+        bot.cfg = SimpleNamespace(entry_signal_source="predicta_ewo")
+        bot._entry_signal_source = lambda: "predicta_ewo"
+        bot._predicta_signal_from_df = lambda symbol, interval, frame: signal
+        snapshot = StrategySnapshot("TESTUSDT", "30m", 5_400_000, candles(), {})
+
+        decision = evaluate_entry(bot, snapshot)
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.stop, 99.0)
+        self.assertEqual(decision.trigger_source, "wait")
+        self.assertEqual(decision.signal_key, signal["signal_key"])
+
     def test_entry_adapter_reuses_live_rj_decision(self):
         signal = {
             "direction": "LONG",

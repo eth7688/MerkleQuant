@@ -152,6 +152,47 @@ def evaluate_rj_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
     )
 
 
+def evaluate_predicta_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
+    frame = snapshot.candles_30m
+    if frame is None or frame.empty:
+        return EntryDecision(False, "no_candles")
+    last_open = int(float(frame["ot"].iloc[-1]))
+    if last_open + _interval_ms(snapshot.interval) > int(snapshot.decision_time):
+        raise ValueError("strategy_snapshot_lookahead")
+    decision_frame = frame.tail(160).copy().reset_index(drop=True)
+    signal = bot._predicta_signal_from_df(snapshot.symbol, snapshot.interval, decision_frame)
+    if not signal:
+        return EntryDecision(False, "no_predicta_signal")
+    direction = str(signal.get("direction", "")).upper()
+    allowed, reason = evaluate_btc_gate(direction, snapshot.btc_stage or {}, False)
+    evidence = dict(signal)
+    evidence["btc_gate_reason"] = reason
+    return EntryDecision(
+        allowed=bool(allowed),
+        reason="pass" if allowed else reason,
+        direction=direction,
+        reference_entry=float(signal.get("price", 0.0) or 0.0),
+        stop=float(signal.get("predicta_stop_price", 0.0) or 0.0),
+        signal_key=str(signal.get("signal_key", "") or ""),
+        key_time=signal.get("predicta_key_time"),
+        confirm_time=signal.get("predicta_confirm_time") or signal.get("predicta_key_time"),
+        trigger_source=str(signal.get("predicta_entry_path", "") or ""),
+        evidence=evidence,
+        rule_version="predicta_ewo_v1",
+    )
+
+
+def evaluate_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
+    source = (
+        bot._entry_signal_source()
+        if callable(getattr(bot, "_entry_signal_source", None))
+        else str(getattr(getattr(bot, "cfg", None), "entry_signal_source", "rj_only"))
+    )
+    if source == "predicta_ewo":
+        return evaluate_predicta_entry(bot, snapshot)
+    return evaluate_rj_entry(bot, snapshot)
+
+
 def advance_position(
     position: PositionState,
     bar: dict[str, Any],

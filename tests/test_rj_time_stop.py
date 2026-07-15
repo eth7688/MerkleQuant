@@ -69,6 +69,14 @@ class RjTimeStopTest(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("未起爆", reason)
 
+    def test_predicta_position_is_exempt_from_all_time_stops(self):
+        bot = self.make_bot()
+        pos = make_position("predicta_ewo")
+
+        reason = bot._time_stop_exit_decision(pos, "30m", 100, -5.0, 0.6, "unit")
+
+        self.assertIsNone(reason)
+
 
 if __name__ == "__main__":
     unittest.main()

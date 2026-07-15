@@ -1,5 +1,11 @@
 # RJ Event-Driven Backtest V1
 
+The replay router also supports `entry_signal_source: predicta_ewo` in the
+frozen experiment rules. Predicta replay uses the same closed-candle label,
+EWO fast/wait paths, six-bar confirmation window, adaptive choppy filter,
+signal-key stop anchor, BTC direction gate, and next-available 1-minute open
+fill contract as the live engine. Predicta positions do not use time stops.
+
 V1 reuses the live engine's `_rj_only_signal_from_df` decision for each closed
 30-minute window. Entries fill at the next available 1-minute open. Position
 management then replays 1-minute OHLCV bars through the shared deterministic

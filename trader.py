@@ -29,6 +29,12 @@ import numpy as np
 
 from btc_stage import classify_btc_stage, evaluate_btc_gate
 from strategy_filters import evaluate_choppy_market_adaptive
+from predicta_indicator import (
+    PredictaParams,
+    compute_predicta,
+    evaluate_predicta_setup,
+    make_predicta_setup,
+)
 
 from screener import (
     fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
@@ -170,6 +176,11 @@ class TradeConfig:
     predicta_stop_atr_mult: float = 0.5
     predicta_min_stop_pct: float = 0.003
     predicta_max_stop_pct: float = 0.08
+    predicta_max_symbols: int = 500
+    predicta_min_volume_usdt: float = 3_000_000.0
+    predicta_scan_workers: int = 4
+    predicta_scan_interval_sec: int = 1800
+    predicta_setup_max_pool: int = 40
 
     # 风控 — 仓位
     risk_per_trade: Any = 10.0          # 每笔风险 (USDT) 支持 "15m:10,1h:20,4h:40,1d:80"
@@ -1088,6 +1099,8 @@ class SqueezeBreakoutBot:
         self._pending_signals: dict = {}   # {symbol: {first_seen, direction}} 跨扫描追踪
         self._rj_setup_pool: dict = {}      # RJ-only候选池: 关键K候选 -> 实时突破触发
         self._rj_only_latest_setups: List[dict] = []
+        self._predicta_setup_pool: dict = {}
+        self._predicta_latest_setups: List[dict] = []
         self._rj_watchlist: dict = {"updated_ts": 0.0, "rows": [], "symbols": []}
         self._rj_watchlist_path: str = "rj_watchlist.json"
         self._last_rj_setup_check_ts: float = 0.0
@@ -2886,8 +2899,8 @@ class SqueezeBreakoutBot:
             state.update({"rj_sr_filter_pass": False, "rj_sr_reason": f"sr_exception:{str(e)[:60]}"})
             return state
 
-    def _rj_choppy_filter_state(self, df, anchor_idx: int) -> dict:
-        mode = str(getattr(self.cfg, "rj_choppy_filter_mode", "off") or "off").strip().lower()
+    def _choppy_filter_state(self, df, anchor_idx: int, mode: str) -> dict:
+        mode = str(mode or "off").strip().lower()
         if mode not in ("off", "log_only", "hard"):
             mode = "off"
         if mode == "off":
@@ -2903,6 +2916,217 @@ class SqueezeBreakoutBot:
         state["choppy_filter_mode"] = mode
         state["choppy_filter_anchor"] = "signal_key"
         return state
+
+    def _rj_choppy_filter_state(self, df, anchor_idx: int) -> dict:
+        return self._choppy_filter_state(
+            df, anchor_idx, getattr(self.cfg, "rj_choppy_filter_mode", "off")
+        )
+
+    def _predicta_choppy_filter_state(self, df, anchor_idx: int) -> dict:
+        return self._choppy_filter_state(
+            df, anchor_idx, getattr(self.cfg, "predicta_choppy_filter_mode", "hard")
+        )
+
+    def _predicta_params(self) -> PredictaParams:
+        return PredictaParams(
+            ewo_fast=max(1, int(getattr(self.cfg, "predicta_ewo_fast", 5) or 5)),
+            ewo_slow=max(1, int(getattr(self.cfg, "predicta_ewo_slow", 35) or 35)),
+            confirm_bars=max(1, int(getattr(self.cfg, "predicta_confirm_bars", 6) or 6)),
+            confirm_atr_buffer=max(0.0, float(getattr(self.cfg, "predicta_confirm_atr_buffer", 0.08) or 0.0)),
+            stop_atr_mult=max(0.0, float(getattr(self.cfg, "predicta_stop_atr_mult", 0.5) or 0.0)),
+        )
+
+    def _predicta_normalize_stop(self, direction: str, entry_price: float, raw_stop: float) -> Optional[float]:
+        entry_price = float(entry_price or 0.0)
+        raw_stop = float(raw_stop or 0.0)
+        if entry_price <= 0:
+            return None
+        min_pct = max(0.0, float(getattr(self.cfg, "predicta_min_stop_pct", 0.003) or 0.0))
+        max_pct = max(min_pct, float(getattr(self.cfg, "predicta_max_stop_pct", 0.08) or 0.08))
+        if direction == "LONG":
+            stop = min(raw_stop, entry_price * (1.0 - min_pct))
+            distance = entry_price - stop
+        else:
+            stop = max(raw_stop, entry_price * (1.0 + min_pct))
+            distance = stop - entry_price
+        stop_pct = distance / entry_price
+        if stop <= 0 or stop_pct <= 0 or stop_pct > max_pct:
+            return None
+        return float(stop)
+
+    def _predicta_candidates_from_df(
+        self, symbol: str, interval: str, df,
+        signal_idx: Optional[int] = None, lines=None,
+    ) -> tuple[list, list]:
+        """Build a fast signal or waiting setup from the latest closed candle."""
+        if df is None or len(df) < 40:
+            return [], []
+        frame = df.reset_index(drop=True)
+        params = self._predicta_params()
+        lines = compute_predicta(frame, params) if lines is None else lines
+        signal_idx = len(lines) - 1 if signal_idx is None else int(signal_idx)
+        direction = ""
+        if bool(lines["bull_signal"].iloc[signal_idx]):
+            direction = "LONG"
+        elif bool(lines["bear_signal"].iloc[signal_idx]):
+            direction = "SHORT"
+        if not direction:
+            return [], []
+        choppy = self._predicta_choppy_filter_state(frame, signal_idx)
+        if choppy.get("choppy_filter_mode") == "hard" and choppy.get("choppy_filter_is_choppy"):
+            return [], []
+        raw_ewo = lines["ewo"].iloc[signal_idx]
+        signal_ewo = float(raw_ewo) if pd.notna(raw_ewo) else 0.0
+        setup = make_predicta_setup(
+            symbol, direction, interval, frame, signal_idx, signal_ewo, choppy, params
+        )
+        setup["price"] = float(frame["c"].iloc[signal_idx])
+        setup["score"] = 100.0
+        setup["retest"] = (
+            "Predicta信号K EWO同向"
+            if setup["predicta_entry_path"] == "fast"
+            else "Predicta等待突破+EWO"
+        )
+        if setup["predicta_entry_path"] != "fast":
+            return [], [setup]
+        atr_value = float(self._calc_atr(frame.iloc[:signal_idx + 1], 14) or 0.0)
+        raw_stop = (
+            float(setup["predicta_key_low"]) - atr_value * params.stop_atr_mult
+            if direction == "LONG"
+            else float(setup["predicta_key_high"]) + atr_value * params.stop_atr_mult
+        )
+        stop = self._predicta_normalize_stop(direction, setup["price"], raw_stop)
+        if stop is None:
+            return [], []
+        setup.update({
+            "predicta_atr": atr_value,
+            "predicta_stop_price": round(stop, 8),
+            "predicta_stop_anchor": "signal_key",
+            "fractal_sl": float(
+                setup["predicta_key_low"] if direction == "LONG" else setup["predicta_key_high"]
+            ),
+            "band_sl": round(stop, 8),
+        })
+        return [setup], []
+
+    def _predicta_confirmed_signal(self, setup: dict, df) -> Optional[dict]:
+        """Evaluate one waiting setup against the latest closed candle."""
+        if df is None or len(df) < 40:
+            return None
+        frame = df.reset_index(drop=True)
+        params = self._predicta_params()
+        atr_value = float(self._calc_atr(frame, 14) or 0.0)
+        decision = evaluate_predicta_setup(setup, frame, params, atr_value)
+        if decision.status != "confirmed":
+            return None
+        stop = self._predicta_normalize_stop(
+            str(setup.get("direction", "")), decision.confirm_price, decision.stop_price
+        )
+        if stop is None:
+            return None
+        signal = dict(setup)
+        signal.update({
+            "price": float(decision.confirm_price),
+            "score": 100.0,
+            "source_strategy": "predicta_ewo",
+            "predicta_entry_path": "wait",
+            "predicta_confirm_time": int(decision.confirm_time or 0),
+            "predicta_confirm_ewo": float(decision.ewo),
+            "predicta_confirm_reason": decision.reason,
+            "predicta_confirm_age_bars": int(decision.age_bars),
+            "predicta_atr": atr_value,
+            "predicta_stop_price": round(stop, 8),
+            "predicta_stop_anchor": "signal_key",
+            "fractal_sl": float(
+                setup.get("predicta_key_low", 0.0)
+                if setup.get("direction") == "LONG"
+                else setup.get("predicta_key_high", 0.0)
+            ),
+            "band_sl": round(stop, 8),
+            "retest": "Predicta关键K突破 + EWO确认",
+        })
+        return signal
+
+    def _predicta_signal_from_df(self, symbol: str, interval: str, df) -> Optional[dict]:
+        """Stateless adapter used by replay and live restart recovery."""
+        if df is None or len(df) < 40:
+            return None
+        frame = df.reset_index(drop=True)
+        current_idx = len(frame) - 1
+        confirm_bars = max(1, int(getattr(self.cfg, "predicta_confirm_bars", 6) or 6))
+        lines = compute_predicta(frame, self._predicta_params())
+        for signal_idx in range(current_idx, max(-1, current_idx - confirm_bars - 1), -1):
+            fast, waiting = self._predicta_candidates_from_df(
+                symbol, interval, frame, signal_idx=signal_idx, lines=lines
+            )
+            if fast:
+                if signal_idx == current_idx:
+                    return fast[0]
+                continue
+            if waiting:
+                confirmed = self._predicta_confirmed_signal(waiting[0], frame)
+                if confirmed is not None:
+                    return confirmed
+        return None
+
+    def _sync_predicta_setup_pool(self, setups: list) -> None:
+        now_ts = time.time()
+        max_pool = max(1, int(getattr(self.cfg, "predicta_setup_max_pool", 40) or 40))
+        for raw in setups or []:
+            key = str(raw.get("signal_key", "") or "")
+            symbol = str(raw.get("symbol", "") or "")
+            if not key or not symbol or self._any_signal_key_used([key]):
+                continue
+            if any(position.symbol == symbol for position in self.positions):
+                continue
+            existing = self._predicta_setup_pool.get(key, {})
+            item = dict(existing)
+            item.update(raw)
+            item["predicta_setup_first_seen_ts"] = float(
+                existing.get("predicta_setup_first_seen_ts", now_ts) or now_ts
+            )
+            self._predicta_setup_pool[key] = item
+        while len(self._predicta_setup_pool) > max_pool:
+            oldest_key = min(
+                self._predicta_setup_pool,
+                key=lambda key: float(
+                    self._predicta_setup_pool[key].get("predicta_setup_first_seen_ts", now_ts) or now_ts
+                ),
+            )
+            self._predicta_setup_pool.pop(oldest_key, None)
+
+    def _check_predicta_setup_pool(self) -> list:
+        """Return newly confirmed signals and remove terminal waiting setups."""
+        if self._entry_signal_source() != "predicta_ewo" or not self._predicta_setup_pool:
+            return []
+        confirmed = []
+        params = self._predicta_params()
+        for key, setup in list(self._predicta_setup_pool.items()):
+            symbol = str(setup.get("symbol", "") or "")
+            interval = str(setup.get("source_interval", self.cfg.scan_interval) or self.cfg.scan_interval)
+            if not symbol or any(position.symbol == symbol for position in self.positions):
+                self._predicta_setup_pool.pop(key, None)
+                continue
+            try:
+                frame = fetch_klines(
+                    symbol, interval, 160,
+                    exchange=self.cfg.exchange,
+                    closed_only=True,
+                )
+                if frame is None or len(frame) < 40:
+                    continue
+                atr_value = float(self._calc_atr(frame, 14) or 0.0)
+                decision = evaluate_predicta_setup(setup, frame, params, atr_value)
+                if decision.status == "confirmed":
+                    signal = self._predicta_confirmed_signal(setup, frame)
+                    self._predicta_setup_pool.pop(key, None)
+                    if signal is not None:
+                        confirmed.append(signal)
+                elif decision.status in ("invalidated", "timeout"):
+                    self._predicta_setup_pool.pop(key, None)
+            except Exception as exc:
+                self._log.warning(f"Predicta候选池检查异常 {symbol} {interval}: {exc}")
+        return confirmed
 
     def _rj_only_signal_from_df(self, symbol: str, interval: str, df) -> Optional[dict]:
         """RJ-only demo entry: RJ cross -> key candle -> latest close confirms key break."""
@@ -4091,6 +4315,73 @@ class SqueezeBreakoutBot:
             f"top={','.join(self._rj_watchlist.get('symbols', [])[:5]) or '-'}"
         )
 
+    def _scan_predicta_signals(self, intervals: list, btc_fields: dict) -> list:
+        """Scan the liquid universe for closed-candle Predicta labels."""
+        try:
+            symbols, vols = fetch_pairs(exchange=self.cfg.exchange)
+        except Exception as exc:
+            self._log.warning(f"Predicta扫描读取交易对失败: {exc}")
+            return []
+        min_volume = max(0.0, float(getattr(self.cfg, "predicta_min_volume_usdt", MIN_VOLUME) or 0.0))
+        max_symbols = max(5, int(getattr(self.cfg, "predicta_max_symbols", 500) or 500))
+        ranked = sorted(
+            [
+                symbol for symbol in symbols
+                if symbol and symbol.endswith("USDT") and symbol != "USDCUSDT"
+                and not is_tradfi_or_junk(symbol)
+                and float(vols.get(symbol, 0.0) or 0.0) >= min_volume
+            ],
+            key=lambda symbol: float(vols.get(symbol, 0.0) or 0.0),
+            reverse=True,
+        )
+        candidates = self._filter_live_trade_symbols(ranked)[:max_symbols]
+        fast_signals = []
+        waiting_setups = []
+        lookback = 160
+
+        def worker(symbol: str, interval: str):
+            frame = fetch_klines(
+                symbol, interval, lookback,
+                exchange=self.cfg.exchange,
+                closed_only=True,
+            )
+            if frame is None or len(frame) < 40:
+                return [], []
+            fast, waiting = self._predicta_candidates_from_df(symbol, interval, frame)
+            if not fast:
+                recovered = self._predicta_signal_from_df(symbol, interval, frame)
+                if recovered is not None:
+                    fast = [recovered]
+            return fast, waiting
+
+        worker_cap = max(1, int(getattr(self.cfg, "predicta_scan_workers", 4) or 4))
+        with ThreadPoolExecutor(max_workers=min(worker_cap, max(1, len(candidates)))) as pool:
+            futures = {
+                pool.submit(worker, symbol, interval): (symbol, interval)
+                for interval in intervals
+                for symbol in candidates
+                if not any(position.symbol == symbol for position in self.positions)
+            }
+            for future in as_completed(futures):
+                try:
+                    fast, waiting = future.result()
+                    volume = round(float(vols.get(futures[future][0], 0.0) or 0.0), 2)
+                    for item in fast + waiting:
+                        item["volume_usdt"] = volume
+                    fast_signals.extend(fast)
+                    waiting_setups.extend(waiting)
+                except Exception as exc:
+                    symbol, interval = futures[future]
+                    self._log.warning(f"Predicta扫描异常 {symbol} {interval}: {exc}")
+        fast_unique = {item["signal_key"]: item for item in fast_signals}
+        waiting_unique = {item["signal_key"]: item for item in waiting_setups}
+        self._predicta_latest_setups = sorted(
+            waiting_unique.values(), key=lambda item: item.get("volume_usdt", 0.0), reverse=True
+        )
+        return sorted(
+            fast_unique.values(), key=lambda item: item.get("volume_usdt", 0.0), reverse=True
+        )
+
     def _scan_rj_only_signals(self, intervals: list, btc_fields: dict) -> list:
         try:
             symbols, vols = fetch_pairs(exchange=self.cfg.exchange)
@@ -4220,6 +4511,49 @@ class SqueezeBreakoutBot:
         })
         return signals
 
+    def _run_predicta_cycle(self, now, btc_fields: dict, intervals: list):
+        confirmed = self._check_predicta_setup_pool()
+        fast_signals = self._scan_predicta_signals(intervals, btc_fields)
+        waiting_setups = list(self._predicta_latest_setups)
+        self._sync_predicta_setup_pool(waiting_setups)
+        signals_by_key = {
+            str(signal.get("signal_key", "")): signal
+            for signal in confirmed + fast_signals
+            if signal.get("signal_key")
+        }
+        signals = list(signals_by_key.values())
+        self.last_scan_time = now
+        self.last_signal_count = len(signals)
+        self._append_signal_event("predicta_scan_cycle", payload={
+            "intervals": ",".join(intervals),
+            "fast_signals": len(fast_signals),
+            "confirmed_signals": len(confirmed),
+            "waiting_setups": len(waiting_setups),
+            "setup_pool_size": len(self._predicta_setup_pool),
+            "positions": len(self.positions),
+            **btc_fields,
+        })
+        for signal in signals:
+            self._append_signal_event(
+                "predicta_candidate", signal.get("symbol", ""),
+                self._signal_snapshot(signal, btc_fields),
+            )
+        for setup in waiting_setups:
+            self._append_signal_event(
+                "predicta_setup_wait", setup.get("symbol", ""),
+                self._signal_snapshot(setup, btc_fields),
+            )
+        display = signals[:10]
+        if len(display) < 10:
+            display += waiting_setups[:10 - len(display)]
+        self.last_signals_data = [dict(item) for item in display]
+        for signal in signals:
+            if len(self.positions) >= self.cfg.max_positions:
+                break
+            if any(position.symbol == signal.get("symbol") for position in self.positions):
+                continue
+            self.enter_predicta_position(signal)
+
     def _run_rj_only_cycle(self, now, btc_fields: dict, intervals: list):
         signals = self._scan_rj_only_signals(intervals, btc_fields)
         setups = list(getattr(self, "_rj_only_latest_setups", []) or [])
@@ -4288,6 +4622,10 @@ class SqueezeBreakoutBot:
             "squeeze_start", "squeeze_end", "first_fractal_bar", "confirm_fractal_bar",
             "target_zone_type", "target_zone_price", "target_zone_low", "target_zone_high",
             "target_r", "target_distance_pct", "target_zone_bars_ago",
+            "predicta_entry_path", "predicta_key_time", "predicta_key_high", "predicta_key_low",
+            "predicta_signal_ewo", "predicta_confirm_time", "predicta_confirm_ewo",
+            "predicta_confirm_reason", "predicta_confirm_age_bars", "predicta_confirm_bars",
+            "predicta_atr", "predicta_stop_price", "predicta_stop_anchor",
             "rj_filter_mode", "rj_filter_pass", "rj_rule_pass", "rj_filter_reason",
             "rj_available", "rj_reason", "rj_j", "rj_r", "rj_spread", "rj_bg",
             "rj_current_ok", "rj_recent_cross", "rj_cross_type", "rj_cross_bars_ago",
@@ -5183,9 +5521,13 @@ class SqueezeBreakoutBot:
 
         return True
 
-    def enter_rj_position(self, signal: dict) -> Optional[Position]:
-        """RJ-only demo entry: bypass structure-chain checks, keep shared sizing/exit/risk engine."""
-        signal["source_strategy"] = "rj_only"
+    def _enter_key_candle_position(self, signal: dict, source_strategy: str) -> Optional[Position]:
+        """Shared key-candle entry path for RJ-only and Predicta/EWO."""
+        source_strategy = str(source_strategy or "").strip().lower()
+        if source_strategy not in ("rj_only", "predicta_ewo"):
+            return None
+        strategy_label = "RJ-only" if source_strategy == "rj_only" else "Predicta/EWO"
+        signal["source_strategy"] = source_strategy
         symbol = signal.get("symbol", "")
         direction = signal.get("direction", "")
         signal_interval = str(signal.get("source_interval") or getattr(self.cfg, "scan_interval", "30m")).split(",")[0].strip() or "30m"
@@ -5199,7 +5541,7 @@ class SqueezeBreakoutBot:
                 "consecutive_losses": self.consecutive_losses,
             }))
             return None
-        if not signal.get("rj_only_stats_pass", True):
+        if source_strategy == "rj_only" and not signal.get("rj_only_stats_pass", True):
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "rj_only_stats_failed",
                 "stats_reason": signal.get("rj_only_stats_reason", ""),
@@ -5212,7 +5554,7 @@ class SqueezeBreakoutBot:
             }))
             return None
         if self.client is None and self.cfg.mode != "paper":
-            self._log.warning("RJ-only未配置测试网API, 无法真实模拟下单")
+            self._log.warning(f"{strategy_label}未配置测试网API, 无法真实模拟下单")
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "api_not_configured",
                 "mode": self.cfg.mode,
@@ -5236,15 +5578,22 @@ class SqueezeBreakoutBot:
             }))
             return None
 
-        lookback = max(220, min(1000, int(getattr(self.cfg, "rj_only_stats_lookback_bars", 1000) or 1000)))
-        df = fetch_klines(symbol, signal_interval, lookback, exchange=self.cfg.exchange)
-        if df is None or len(df) < 60:
+        lookback = (
+            max(220, min(1000, int(getattr(self.cfg, "rj_only_stats_lookback_bars", 1000) or 1000)))
+            if source_strategy == "rj_only" else 160
+        )
+        df = fetch_klines(
+            symbol, signal_interval, lookback,
+            exchange=self.cfg.exchange,
+            closed_only=True,
+        )
+        if df is None or len(df) < 40:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "kline_fetch_failed",
                 "kline_len": len(df) if df is not None else 0,
             }))
             return None
-        if bool(getattr(self.cfg, "rj_only_volume_filter", True)):
+        if source_strategy == "rj_only" and bool(getattr(self.cfg, "rj_only_volume_filter", True)):
             if not signal.get("rj_volume_filter_pass", True):
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                     "reason": "rj_volume_filter_failed",
@@ -5252,11 +5601,12 @@ class SqueezeBreakoutBot:
                 }))
                 return None
         entry_price = float(signal.get("price") or df["c"].iloc[-1])
-        rj_stop_raw = signal.get("rj_only_stop_price")
-        sl_price = float(rj_stop_raw or 0.0)
+        stop_field = "rj_only_stop_price" if source_strategy == "rj_only" else "predicta_stop_price"
+        stop_raw = signal.get(stop_field)
+        sl_price = float(stop_raw or 0.0)
         if entry_price <= 0 or sl_price <= 0:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
-                "reason": "missing_rj_only_stop_price" if not rj_stop_raw else "invalid_rj_sl",
+                "reason": f"missing_{stop_field}" if not stop_raw else "invalid_key_candle_sl",
                 "entry": entry_price,
                 "sl": sl_price,
             }))
@@ -5290,12 +5640,22 @@ class SqueezeBreakoutBot:
                 "rj_setup_key": setup_key,
             }))
             return None
+        failed_key = self._failed_signal_key(signal_keys)
+        if failed_key:
+            self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                "reason": "order_failed_cooldown",
+                "interval": signal_interval,
+                "signal_key": signal_key,
+                "failed_key": failed_key,
+            }))
+            return None
 
-        rj_min_stop_pct = max(0.0, float(getattr(self.cfg, "rj_only_min_stop_pct", 0.003) or 0.0))
+        min_stop_field = "rj_only_min_stop_pct" if source_strategy == "rj_only" else "predicta_min_stop_pct"
+        key_min_stop_pct = max(0.0, float(getattr(self.cfg, min_stop_field, 0.003) or 0.0))
         qty, pos_usdt, risk = self.calc_position_size(
             symbol, direction, entry_price, sl_price,
             source_interval=signal_interval,
-            min_stop_pct=rj_min_stop_pct,
+            min_stop_pct=key_min_stop_pct,
         )
         if qty <= 0:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
@@ -5358,7 +5718,10 @@ class SqueezeBreakoutBot:
             if self.cfg.market_type == "futures":
                 self.client.set_leverage(symbol, self.cfg.leverage)
 
-        hermes_state = self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
+        hermes_state = (
+            self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
+            if source_strategy == "rj_only" else {"active": False, "pass": True}
+        )
         if hermes_state.get("active"):
             event_type = "hermes_confirm_pass" if hermes_state.get("pass") else "hermes_confirm_block"
             hermes_public = self._public_hermes_confirm(hermes_state)
@@ -5407,7 +5770,7 @@ class SqueezeBreakoutBot:
             side = "BUY" if direction == "LONG" else "SELL"
             order = self.client.market_order(symbol, side, qty if self.cfg.market_type == "futures" else pos_usdt)
             if order is None or ("orderId" not in str(order) and "trackingNo" not in str(order)):
-                self._log.error(f"RJ-only下单失败({symbol} {direction} qty={qty:.4f} pos=${pos_usdt:.0f}): {order}")
+                self._log.error(f"{strategy_label}下单失败({symbol} {direction} qty={qty:.4f} pos=${pos_usdt:.0f}): {order}")
                 for k in signal_keys:
                     self._mark_signal_failed(k, symbol, direction, signal_interval, signal, response=order)
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
@@ -5435,11 +5798,11 @@ class SqueezeBreakoutBot:
             try:
                 sl_result = self.client.stop_order(symbol, sl_side, round(sl_price, 8), round(qty, 8), tracking_no=tracking_no)
                 if sl_result:
-                    self._log.info(f"RJ-only交易所止损单已挂: {symbol} {sl_price:.4f}")
+                    self._log.info(f"{strategy_label}交易所止损单已挂: {symbol} {sl_price:.4f}")
                 else:
-                    self._log.warning(f"RJ-only交易所止损单未挂出, bot内部兜底: {symbol} SL={sl_price:.4f}")
+                    self._log.warning(f"{strategy_label}交易所止损单未挂出, bot内部兜底: {symbol} SL={sl_price:.4f}")
             except Exception as e:
-                self._log.error(f"RJ-only[{symbol}] 止损单挂单异常: {e}, 该单目前无交易所止损保护!")
+                self._log.error(f"{strategy_label}[{symbol}] 止损单挂单异常: {e}, 该单目前无交易所止损保护!")
 
         pos = Position(
             symbol=symbol,
@@ -5456,7 +5819,7 @@ class SqueezeBreakoutBot:
             initial_band_lo=initial_band_lo,
             tracking_no=tracking_no,
             source_interval=signal_interval,
-            source_strategy="rj_only",
+            source_strategy=source_strategy,
             btc_regime_fields=btc_regime_fields,
             signal_key=signal_key,
             target_zone_type=target_zone.get("target_zone_type", "none"),
@@ -5493,15 +5856,21 @@ class SqueezeBreakoutBot:
         }))
         mode_label = "测试网真实模拟" if self.client is not None else "纸笔模拟"
         self._log.info(
-            f"RJ-only{mode_label}开{direction}: {symbol} {signal_interval} "
+            f"{strategy_label}{mode_label}开{direction}: {symbol} {signal_interval} "
             f"entry={fill_price:.6f} SL={sl_price:.6f} "
             f"score={float(signal.get('score', 0.0) or 0.0):.1f} "
             f"hist={signal.get('rj_only_hist_win_rate', 0)}%/{signal.get('rj_only_hist_samples', 0)}样本"
         )
-        self.status_text = f"RJ模拟开仓 {symbol} {direction}"
+        self.status_text = f"{strategy_label}开仓 {symbol} {direction}"
         return pos
 
     # ========== 入场 ==========
+    def enter_rj_position(self, signal: dict) -> Optional[Position]:
+        return self._enter_key_candle_position(signal, "rj_only")
+
+    def enter_predicta_position(self, signal: dict) -> Optional[Position]:
+        return self._enter_key_candle_position(signal, "predicta_ewo")
+
     def enter_position(self, signal: dict) -> Optional[Position]:
         """根据起爆点信号开仓"""
         if not self._check_risk_limits():
@@ -6121,9 +6490,17 @@ class SqueezeBreakoutBot:
         sig_upper = str(getattr(pos, 'signal_key', '') or '').upper()
         return strategy == 'rj_only' or sig_upper.startswith('RJ') or 'RJSETUP' in sig_upper
 
+    @staticmethod
+    def _is_time_stop_exempt_position(pos: Position) -> bool:
+        strategy = str(getattr(pos, 'source_strategy', '') or '').strip().lower()
+        signal_key = str(getattr(pos, 'signal_key', '') or '').upper()
+        return strategy == 'predicta_ewo' or signal_key.startswith('PREDICTA|')
+
     def _time_stop_exit_decision(self, pos: Position, inv: str, elapsed_bars: int,
                                  current_r: Optional[float], min_progress_r: float,
                                  source_label: str) -> Optional[str]:
+        if self._is_time_stop_exempt_position(pos):
+            return None
         if not getattr(self.cfg, 'enable_time_stop', True):
             return None
         if pos.breakeven_triggered or pos.partial_tp_triggered:
@@ -7089,6 +7466,14 @@ class SqueezeBreakoutBot:
                 btc_fields = self._btc_regime_fields()
             except Exception:
                 btc_fields = {"btc_regime": "btc_unknown", "btc_score": 0}
+            if self._entry_signal_source() == "predicta_ewo":
+                self._run_predicta_cycle(now, btc_fields, intervals)
+                self.status_text = "Predicta/EWO | 持仓%s | 候选%s | 日亏$%.0f" % (
+                    len(self.positions),
+                    len(self._predicta_setup_pool),
+                    self.daily_loss,
+                )
+                return
             if self._entry_signal_source() == "rj_only":
                 self._run_rj_only_cycle(now, btc_fields, intervals)
                 rj_mode_label = "RJ测试网" if self.cfg.mode != "paper" else "RJ纸笔"
@@ -7394,7 +7779,9 @@ class SqueezeBreakoutBot:
     def run_loop(self):
         """主循环 (在后台线程运行)"""
         self.running = True
-        if self._entry_signal_source() == "rj_only":
+        if self._entry_signal_source() == "predicta_ewo":
+            scan_interval_sec = max(300, int(getattr(self.cfg, "predicta_scan_interval_sec", 1800) or 1800))
+        elif self._entry_signal_source() == "rj_only":
             scan_interval_sec = max(300, int(getattr(self.cfg, "rj_only_scan_interval_sec", 1800) or 1800))
         else:
             scan_interval_sec = max(30, int(getattr(self.cfg, "engine_scan_interval_sec", 60) or 60))
@@ -7633,6 +8020,28 @@ class SqueezeBreakoutBot:
             seen_pairs.add(pair)
             collapsed.append(row)
         return collapsed[:max(0, int(limit or 40))]
+
+    def _predicta_setup_pool_rows(self, limit: int = 40) -> List[dict]:
+        rows = []
+        for key, item in (getattr(self, "_predicta_setup_pool", {}) or {}).items():
+            rows.append({
+                "key": key,
+                "symbol": str(item.get("symbol", "") or ""),
+                "direction": str(item.get("direction", "") or ""),
+                "source_interval": str(item.get("source_interval", "") or ""),
+                "source_strategy": "predicta_ewo",
+                "stage": "wait_ewo_break",
+                "stage_label": "WAIT",
+                "stage_text": "等待关键K突破 + EWO同向",
+                "price": float(item.get("price", 0.0) or 0.0),
+                "key_high": float(item.get("predicta_key_high", 0.0) or 0.0),
+                "key_low": float(item.get("predicta_key_low", 0.0) or 0.0),
+                "signal_ewo": float(item.get("predicta_signal_ewo", 0.0) or 0.0),
+                "confirm_bars": int(item.get("predicta_confirm_bars", 6) or 6),
+                "choppy_filter_is_choppy": bool(item.get("choppy_filter_is_choppy", False)),
+            })
+        rows.sort(key=lambda item: (item["symbol"], item["direction"]))
+        return rows[:max(0, int(limit or 40))]
 
     def _recent_signal_event_stats(self, limit: int = 800, ttl_sec: int = 8) -> dict:
         """Small cached event digest for the frontend pipeline HUD."""
@@ -7919,6 +8328,8 @@ class SqueezeBreakoutBot:
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
+            "predicta_setup_pool_size": len(getattr(self, "_predicta_setup_pool", {}) or {}),
+            "predicta_setup_pool": self._predicta_setup_pool_rows(limit=40),
             "rj_pipeline": rj_pipeline,
             "rj_watchlist_enabled": bool(getattr(self.cfg, "rj_only_watchlist_enabled", True)),
             "rj_watchlist_size": len(rj_watchlist.get("symbols", []) or []),
@@ -8106,6 +8517,8 @@ class SqueezeBreakoutBot:
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
+            "predicta_setup_pool_size": len(getattr(self, "_predicta_setup_pool", {}) or {}),
+            "predicta_setup_pool": self._predicta_setup_pool_rows(limit=40),
             "rj_pipeline": rj_pipeline,
             "rj_watchlist_enabled": bool(getattr(self.cfg, "rj_only_watchlist_enabled", True)),
             "rj_watchlist_size": len(rj_watchlist.get("symbols", []) or []),

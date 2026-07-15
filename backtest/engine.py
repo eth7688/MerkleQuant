@@ -7,7 +7,7 @@ import pandas as pd
 
 from backtest.execution import SimBroker
 from backtest.metrics import summarize_positions
-from strategy_core import ExitRules, PositionState, StrategySnapshot, advance_position, evaluate_rj_entry
+from strategy_core import ExitRules, PositionState, StrategySnapshot, advance_position, evaluate_entry
 
 
 @dataclass
@@ -102,7 +102,7 @@ class ReplayEngine:
                     candles_30m=window,
                     btc_stage=btc_stage_provider(decision_time),
                 )
-                decision = evaluate_rj_entry(self.bot, snapshot)
+                decision = evaluate_entry(self.bot, snapshot)
                 if not decision.allowed:
                     events.append({
                         "type": "signal_reject", "symbol": symbol, "time": decision_time,
@@ -265,12 +265,12 @@ class PortfolioReplayEngine:
                     if decision is None:
                         continue
                 else:
-                    decision = evaluate_rj_entry(
+                    decision = evaluate_entry(
                         self.bot,
                         StrategySnapshot(symbol, "30m", decision_time, closed, stage),
                     )
                 if not decision.allowed:
-                    if decision.reason != "no_rj_signal":
+                    if decision.reason not in ("no_rj_signal", "no_predicta_signal"):
                         events.append({
                             "type": "signal_reject", "symbol": symbol, "time": decision_time,
                             "reason": decision.reason, "signal_key": decision.signal_key,

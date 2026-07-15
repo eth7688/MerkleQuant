@@ -19,6 +19,8 @@ class PredictaConfigTest(unittest.TestCase):
         self.assertEqual(cfg.predicta_stop_atr_mult, 0.5)
         self.assertEqual(cfg.predicta_min_stop_pct, 0.003)
         self.assertEqual(cfg.predicta_max_stop_pct, 0.08)
+        self.assertEqual(cfg.predicta_max_symbols, 500)
+        self.assertEqual(cfg.predicta_scan_workers, 4)
 
     def test_signal_source_normalizes_predicta_aliases(self):
         bot = object.__new__(SqueezeBreakoutBot)

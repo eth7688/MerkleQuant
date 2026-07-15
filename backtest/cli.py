@@ -13,7 +13,7 @@ from backtest.engine import PortfolioReplayEngine, ReplayEngine
 from backtest.experiment import ExperimentSpec
 from btc_stage import classify_btc_stage
 from strategy_core import ExitRules
-from strategy_core import StrategySnapshot, evaluate_rj_entry
+from strategy_core import StrategySnapshot, evaluate_entry
 
 
 def build_run_id(manifest_hash: str, symbol: str, data_fingerprints: list[str]) -> str:
@@ -82,28 +82,31 @@ def _precompute_worker(payload):
     from trader import SqueezeBreakoutBot, TradeConfig
 
     symbol, frame, btc1, btc4, rules, start, end = payload
-    cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget", entry_signal_source="rj_only", scan_interval="30m")
+    signal_source = str(rules.get("entry_signal_source", "rj_only") or "rj_only")
+    cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget", entry_signal_source=signal_source, scan_interval="30m")
     for key, value in rules.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
     bot = SqueezeBreakoutBot(cfg)
-    lines = bot._compute_rj_lines(frame)
-    j_line, r_line = lines["j"], lines["r"]
-    cross = ((j_line.shift(1) <= r_line.shift(1)) & (j_line > r_line)) | ((j_line.shift(1) >= r_line.shift(1)) & (j_line < r_line))
-    level_up, level_down = bot._rj_original_level_triggers(j_line)
-    trigger = (cross | level_up | level_down).fillna(False).to_numpy()
+    trigger = None
+    if bot._entry_signal_source() == "rj_only":
+        lines = bot._compute_rj_lines(frame)
+        j_line, r_line = lines["j"], lines["r"]
+        cross = ((j_line.shift(1) <= r_line.shift(1)) & (j_line > r_line)) | ((j_line.shift(1) >= r_line.shift(1)) & (j_line < r_line))
+        level_up, level_down = bot._rj_original_level_triggers(j_line)
+        trigger = (cross | level_up | level_down).fillna(False).to_numpy()
     confirm_bars = max(1, int(getattr(cfg, "rj_only_confirm_bars", 6) or 6))
     decisions = {}
     for index in range(max(59, int(rules.get("warmup_bars", 60)) - 1), len(frame)):
         decision_time = int(frame["ot"].iloc[index]) + 1_800_000
         if decision_time < start or decision_time >= end:
             continue
-        if not trigger[max(1, index - confirm_bars):index].any():
+        if trigger is not None and not trigger[max(1, index - confirm_bars):index].any():
             continue
         one = btc1[(btc1["ot"] + 3_600_000) <= decision_time].tail(220)
         four = btc4[(btc4["ot"] + 14_400_000) <= decision_time].tail(220)
         stage = classify_btc_stage(one, four)
-        decisions[decision_time] = evaluate_rj_entry(
+        decisions[decision_time] = evaluate_entry(
             bot, StrategySnapshot(symbol, "30m", decision_time, frame.iloc[:index + 1], stage)
         )
     return symbol, decisions
@@ -128,7 +131,11 @@ def run(args) -> int:
     store = HistoricalStore(args.root)
     spec, manifest = _load_experiment(Path(args.experiment))
     rules = dict(spec.rules)
-    cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget", entry_signal_source="rj_only", scan_interval="30m")
+    cfg = TradeConfig(
+        mode="paper", enabled=False, exchange="bitget",
+        entry_signal_source=str(rules.get("entry_signal_source", "rj_only") or "rj_only"),
+        scan_interval="30m",
+    )
     for key, value in rules.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -207,7 +214,11 @@ def run_portfolio(args) -> int:
                if line.strip() and not line.lstrip().startswith("#")]
     if len(symbols) != len(set(symbols)):
         raise ValueError("duplicate_symbols")
-    cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget", entry_signal_source="rj_only", scan_interval="30m")
+    cfg = TradeConfig(
+        mode="paper", enabled=False, exchange="bitget",
+        entry_signal_source=str(rules.get("entry_signal_source", "rj_only") or "rj_only"),
+        scan_interval="30m",
+    )
     for key, value in rules.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
