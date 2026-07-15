@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an independent `predicta_ewo` signal source that creates a key-candle setup from the original Predicta BUY/SELL label, hard-rejects choppy signal candles, confirms within six closed bars using price breakout plus EWO direction, and reuses existing risk and non-time-based exits.
+**Goal:** Add an independent `predicta_ewo` signal source that hard-rejects choppy Predicta BUY/SELL signal candles, enters immediately after the signal close when EWO is already aligned, otherwise confirms within six closed bars using price breakout plus an EWO turn, and reuses existing risk and non-time-based exits.
 
 **Architecture:** Put Pine-compatible indicator math and the deterministic six-bar setup state machine in a new pure module. Keep exchange scanning, candidate persistence, order placement, status events, and source routing in `trader.py`; adapt the shared replay contract so live and historical decisions call the same pure functions. Preserve RJ through wrappers and source-specific routing rather than renaming or overwriting it.
 
@@ -16,6 +16,10 @@
 - Default confirmation is six bars, EWO SMA 5/35, ATR breakout buffer 0.08, hard choppy filtering, stop buffer 0.5 ATR, minimum stop 0.3%, maximum stop 8%.
 - Do not use Perfect Time, Prediction percentage, eight-point confluence, near-close, touch, or hold confirmation.
 - A breakout with wrong-sign EWO remains pending through bar six; bar seven cannot confirm.
+- Same-sign signal-bar EWO uses the fast path and never enters the candidate pool; opposite-sign or zero EWO uses the six-bar path.
+- Fast-path live orders are submitted only after the signal bar closes; replay fills at the next available 1m open, never the signal-bar close.
+- Fast-path rejection does not fall back into the candidate pool.
+- Fast-path stop and breakout-free decision use signal-bar ATR; waiting-path breakout buffer and stop use confirmation-bar ATR.
 - `predicta_ewo` positions skip every time-stop branch but retain initial stop, 0.8R protection, 1.2R defense, partial exit, EMA/ATR trailing, stop-order persistence, and real-PnL reconciliation.
 - Preserve the existing BTC direction gate, risk limits, maximum positions, signal deduplication, and failed-order cooldown.
 - No new frontend framework or npm dependency; do not change existing IDs except by adding new Predicta-specific controls.
@@ -49,7 +53,7 @@
 - Create: `tests/test_predicta_indicator.py`
 
 **Interfaces:**
-- Produces: `PredictaParams`, `PredictaSetupDecision`, `compute_predicta(df, params)`, `make_predicta_setup(symbol, direction, interval, frame, signal_index, choppy_state, params)`, and `evaluate_predicta_setup(setup, df, params, atr_value)`.
+- Produces: `PredictaParams`, `PredictaSetupDecision`, `compute_predicta(df, params)`, `make_predicta_setup(symbol, direction, interval, frame, signal_index, signal_ewo, choppy_state, params)`, and `evaluate_predicta_setup(setup, df, params, atr_value)`.
 - Consumes: DataFrames with `o`, `h`, `l`, `c`, `v`, and `ot` columns.
 
 - [ ] **Step 1: Write failing tests for exact signal formulas**
@@ -201,7 +205,7 @@ from predicta_indicator import evaluate_predicta_setup, make_predicta_setup
 
 def test_breakout_with_wrong_ewo_waits_then_confirms_before_expiry():
     df = frame(np.linspace(90, 110, 45))
-    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 37, {}, PredictaParams())
+    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 37, -1.0, {}, PredictaParams())
     waiting = evaluate_predicta_setup(setup, df.iloc[:43], PredictaParams(), atr_value=1.0)
     confirmed = evaluate_predicta_setup(setup, df.iloc[:44], PredictaParams(), atr_value=1.0)
     assert waiting.status == "waiting"
@@ -210,14 +214,14 @@ def test_breakout_with_wrong_ewo_waits_then_confirms_before_expiry():
 
 def test_seventh_bar_cannot_confirm():
     df = frame(np.linspace(90, 110, 50))
-    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 40, {}, PredictaParams())
+    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 40, -1.0, {}, PredictaParams())
     decision = evaluate_predicta_setup(setup, df.iloc[:48], PredictaParams(), atr_value=1.0)
     assert decision.status == "timeout"
 
 
 def test_opposite_close_invalidates_before_confirmation():
     df = frame(np.linspace(90, 110, 45))
-    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 40, {}, PredictaParams())
+    setup = make_predicta_setup("BTCUSDT", "LONG", "30m", df, 40, -1.0, {}, PredictaParams())
     df.loc[41, "c"] = setup["predicta_key_low"] - 0.01
     decision = evaluate_predicta_setup(setup, df.iloc[:42], PredictaParams(), atr_value=1.0)
     assert decision.status == "invalidated"
@@ -234,6 +238,7 @@ def make_predicta_setup(
     interval: str,
     frame: pd.DataFrame,
     signal_index: int,
+    signal_ewo: float,
     choppy_state: dict,
     params: PredictaParams,
 ) -> dict:
@@ -250,6 +255,11 @@ def make_predicta_setup(
         "predicta_key_time": key_time,
         "predicta_key_high": key_high,
         "predicta_key_low": key_low,
+        "predicta_signal_ewo": float(signal_ewo),
+        "predicta_entry_path": "fast" if (
+            (direction == "LONG" and float(signal_ewo) > 0)
+            or (direction == "SHORT" and float(signal_ewo) < 0)
+        ) else "wait",
         "predicta_confirm_bars": params.confirm_bars,
         **dict(choppy_state or {}),
     }
@@ -298,6 +308,8 @@ Replace the final comment body with direct code; do not introduce wall-clock tim
 Run: `python -m pytest tests/test_predicta_indicator.py -v`
 
 Expected: PASS, including bar 1, bar 6, bar 7, EWO zero, wrong EWO waiting, and mirrored SHORT cases.
+
+Add assertions that `make_predicta_setup` tags LONG with positive signal EWO and SHORT with negative signal EWO as `fast`, while opposite or zero EWO is tagged `wait`.
 
 - [ ] **Step 8: Commit the pure core**
 
@@ -434,7 +446,7 @@ git commit -m "feat: configure Predicta EWO signal source"
 
 **Interfaces:**
 - Consumes: Task 1 pure functions and `evaluate_choppy_market_adaptive` from `strategy_filters.py`.
-- Produces: `_predicta_setup_from_df`, `_predicta_signal_from_df`, `_scan_predicta_setups`, `_sync_predicta_setup_pool`, `_check_predicta_setup_pool`, and `_run_predicta_cycle`.
+- Produces: `_predicta_setup_from_df`, `_predicta_signal_from_df`, `_scan_predicta_setups`, `_run_predicta_fast_signals`, `_sync_predicta_setup_pool`, `_check_predicta_setup_pool`, and `_run_predicta_cycle`.
 
 - [ ] **Step 1: Write failing hard-choppy and setup creation tests**
 
@@ -533,9 +545,10 @@ Keep `_rj_choppy_filter_state` as a wrapper passing `self.cfg.rj_choppy_filter_m
 3. Inspect only the latest row for `bull_signal` or `bear_signal`.
 4. Run hard choppy filtering anchored to that row.
 5. Emit `predicta_choppy_reject` on hard rejection.
-6. Return `make_predicta_setup` on acceptance.
+6. Calculate ATR from data available at the signal close. For a fast setup, set `predicta_stop_price` from the signal K low/high plus 0.5 ATR.
+7. Return `make_predicta_setup` on acceptance, tagged `predicta_entry_path=fast` for same-sign signal-bar EWO and `wait` otherwise.
 
-Add `_predicta_signal_from_df(symbol, interval, df)` as the confirmed-signal adapter. It scans Predicta label indices in the previous six closed bars, applies the same signal-anchored hard choppy filter, calls `evaluate_predicta_setup` for each candidate, rejects candidates with any intervening opposite-key close, and returns only a `confirmed` result whose confirmation bar is the latest row. This is the live/replay parity function used by Task 5; it must not create or mutate the live pool.
+Add `_predicta_signal_from_df(symbol, interval, df)` as the executable-signal adapter. It first checks whether the latest row is a non-choppy Predicta label with same-sign EWO and returns a `predicta_fast_ewo` decision using signal-bar ATR. If not, it scans label indices in the previous six closed bars, applies the same signal-anchored hard choppy filter, calls `evaluate_predicta_setup` for each waiting candidate, rejects candidates with any intervening opposite-key close, and returns only a `confirmed` result whose confirmation bar is the latest row. This is the live/replay parity function used by Task 5; it must not create or mutate the live pool.
 
 - [ ] **Step 5: Write failing pool boundary tests**
 
@@ -550,6 +563,8 @@ self.assertEqual(entries[0]["source_strategy"], "predicta_ewo")  # valid confirm
 
 Also assert that the seventh bar emits `predicta_timeout` and never calls `enter_predicta_position`.
 
+Add a fast-path test whose signal K has aligned EWO. Assert `enter_predicta_position` is called immediately, `predicta_fast_confirm` is emitted, and `_predicta_setup_pool` remains empty. Add the inverse test proving zero/opposite EWO enters the pool instead.
+
 - [ ] **Step 6: Implement the independent pool**
 
 Initialize:
@@ -563,9 +578,11 @@ Implement `_sync_predicta_setup_pool` and `_check_predicta_setup_pool` using Pre
 
 - [ ] **Step 7: Implement scan-cycle routing**
 
-`_scan_predicta_setups` should use `fetch_pairs`, existing tradable-symbol filtering, `MIN_VOLUME` as the universe liquidity floor, the top 500 eligible USDT contracts, four workers, and at least 80 closed bars per symbol. It must not call RJ watchlist, RJ history stats, RJ divergence, RJ support/resistance, or RJ volume-surge filters.
+`_scan_predicta_setups` should use `fetch_pairs`, existing tradable-symbol filtering, `MIN_VOLUME` as the universe liquidity floor, the top 500 eligible USDT contracts, four workers, and at least 80 closed bars per symbol. It returns separate `fast_signals` and `waiting_setups`. It must not call RJ watchlist, RJ history stats, RJ divergence, RJ support/resistance, or RJ volume-surge filters.
 
-`_run_predicta_cycle` syncs returned setups, updates `last_scan_time`, `last_signal_count`, `last_signals_data`, and emits `predicta_scan_cycle`.
+`_run_predicta_fast_signals(fast_signals, btc_fields)` executes accepted fast signals through `enter_predicta_position`. A signal rejected by BTC, risk, capacity, dedupe, tradability, or order failure emits `predicta_fast_reject` and is never passed to `_sync_predicta_setup_pool`.
+
+`_run_predicta_cycle` calls the fast helper first, then syncs waiting setups into the pool. It updates `last_scan_time`, `last_signal_count`, `last_signals_data`, and emits `predicta_scan_cycle`.
 
 - [ ] **Step 8: Run live-pipeline and RJ regression tests**
 
@@ -615,6 +632,20 @@ def test_predicta_entry_wrapper_preserves_source(monkeypatch):
     assert bot.enter_predicta_position(signal) == "position"
     assert captured["source_strategy"] == "predicta_ewo"
     assert captured["payload"]["signal_key"].startswith("PREDICTA|")
+
+
+def test_fast_rejection_does_not_fall_back_to_pool(monkeypatch):
+    bot = self.make_bot()
+    bot._predicta_setup_pool = {}
+    fast = {
+        "symbol": "BTCUSDT", "direction": "LONG", "source_interval": "30m",
+        "source_strategy": "predicta_ewo", "predicta_entry_path": "fast",
+        "predicta_signal_ewo": 1.0,
+        "signal_key": "PREDICTA|BTCUSDT|LONG|30m|1|101|99",
+    }
+    monkeypatch.setattr(bot, "enter_predicta_position", lambda signal: None)
+    bot._run_predicta_fast_signals([fast], {})
+    assert bot._predicta_setup_pool == {}
 
 
 def test_predicta_position_skips_time_stop_even_when_globally_enabled():
@@ -740,6 +771,23 @@ def test_predicta_entry_adapter_reuses_live_decision(self):
     self.assertEqual(decision.trigger_source, "predicta_key_break_ewo")
 
 
+def test_predicta_fast_entry_uses_signal_close_decision_time(self):
+    frame = candles()
+    bot = FakeBot(source="predicta_ewo", signal={
+        "symbol": "BTCUSDT", "direction": "LONG", "price": 101.0,
+        "predicta_stop_price": 99.0,
+        "signal_key": "PREDICTA|BTCUSDT|LONG|30m|1|101|99",
+        "predicta_key_time": int(frame["ot"].iloc[-1]),
+        "predicta_confirm_time": int(frame["ot"].iloc[-1]),
+        "predicta_entry_path": "fast",
+        "trigger_source": "predicta_fast_ewo",
+    })
+    closed_at = int(frame["ot"].iloc[-1]) + 1_800_000
+    decision = evaluate_entry(bot, StrategySnapshot("BTCUSDT", "30m", closed_at, frame, {}))
+    self.assertTrue(decision.allowed)
+    self.assertEqual(decision.trigger_source, "predicta_fast_ewo")
+
+
 def test_predicta_entry_rejects_unclosed_candle(self):
     frame = candles()
     too_early = int(frame["ot"].iloc[-1]) + 1_799_999
@@ -763,7 +811,7 @@ def evaluate_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
     return evaluate_rj_entry(bot, snapshot)
 ```
 
-`evaluate_predicta_entry` must enforce the same closed-candle guard, call the same Predicta decision path used live, apply the existing BTC gate, and map `predicta_stop_price`, key/confirm times, signal key, and evidence into `EntryDecision`.
+`evaluate_predicta_entry` must enforce the same closed-candle guard, call the same Predicta decision path used live, apply the existing BTC gate, and map `predicta_stop_price`, key/confirm times, signal key, generic `trigger_source`, and evidence into `EntryDecision`. Use `predicta_fast_ewo` for the fast path and `predicta_key_break_ewo` for the waiting path.
 
 - [ ] **Step 4: Route both replay engines through `evaluate_entry`**
 
@@ -779,6 +827,8 @@ Extend `tests/test_backtest_system.py` so a precomputed Predicta decision:
 - uses a `PREDICTA|`-prefixed dedupe key,
 - cannot exceed `max_positions`,
 - records `trigger_source=predicta_key_break_ewo`.
+
+Add a separate fast-path replay case proving the fill is the first 1m open at or after the signal-bar decision time and is not the 30m signal close.
 
 - [ ] **Step 6: Create the frozen experiment declaration**
 
@@ -859,6 +909,7 @@ def test_predicta_status_exposes_pool_and_event_counts():
     assert rows[0]["source_strategy"] == "predicta_ewo"
     assert status["setup_pool_size"] == 1
     assert "counts" in status
+    assert "fast_confirm_count" in status
 ```
 
 - [ ] **Step 2: Run and verify missing status methods**
@@ -869,7 +920,7 @@ Expected: FAIL with missing status methods.
 
 - [ ] **Step 3: Implement source-specific status output**
 
-Expose only public diagnostic fields: symbol, direction, interval, signal time, key high/low, confirmation line, age bars, expiry, EWO state, choppy reason, and stage. Add `predicta_setup_pool_size`, `predicta_setup_pool`, and `predicta_pipeline` to fast and full summaries without renaming RJ keys.
+Expose only public diagnostic fields: symbol, direction, interval, signal time, key high/low, entry path, signal EWO, confirmation line, age bars, expiry, EWO state, choppy reason, and stage. Add `fast_confirm_count`, `fast_reject_count`, `predicta_setup_pool_size`, `predicta_setup_pool`, and `predicta_pipeline` to fast and full summaries without renaming RJ keys.
 
 - [ ] **Step 4: Document the new engine**
 
@@ -956,6 +1007,7 @@ Expected: a new immutable run directory with `manifest.json`, `events.jsonl`, `m
 Report verbatim:
 
 - raw Predicta label count,
+- same-sign EWO fast-decision, fast-fill, and fast-reject counts,
 - `predicta_choppy_reject` count and rate,
 - setup count,
 - `predicta_wait_ewo` count,
