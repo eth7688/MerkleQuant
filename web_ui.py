@@ -1765,7 +1765,7 @@ function initTraderPanel(){
     h+='<div class="t-field"><label>多周期并发<span class="tip">!<span class="tip-text">逗号分隔多周期同步扫描<br>例: 30m 或 30m,1h</span></span></label><input type="text" id="cfg_interval" value="'+(cfg.scan_interval||'30m')+'" placeholder="30m" style="font-family:monospace;font-size:11px"></div>';
     h+='<div class="t-field"><label>最低评分</label><input type="number" id="cfg_score" value="'+(cfg.min_score||70)+'" min="30" max="90" step="5"></div>';
     h+='<div class="t-field"><label>最大持仓</label><input type="number" id="cfg_maxpos" value="'+(cfg.max_positions||3)+'" min="1" max="10"></div>';
-    h+='<div class="t-field" style="display:none"><label>信号源</label><select id="cfg_signal_source"><option value="rj_only"'+((cfg.entry_signal_source||'rj_only')==='rj_only'?' selected':'')+'>RJ独立策略</option><option value="structure"'+((cfg.entry_signal_source||'rj_only')==='structure'?' selected':'')+'>结构突破 + RJ过滤</option></select></div>';
+    h+='<div class="t-field" style="display:none"><label>信号源</label><select id="cfg_signal_source"><option value="predicta_ewo"'+((cfg.entry_signal_source||'rj_only')==='predicta_ewo'?' selected':'')+'>Predicta + EWO</option><option value="rj_only"'+((cfg.entry_signal_source||'rj_only')==='rj_only'?' selected':'')+'>RJ独立策略</option><option value="structure"'+((cfg.entry_signal_source||'rj_only')==='structure'?' selected':'')+'>结构突破 + RJ过滤</option></select></div>';
     h+='</div></div>';
 
     // -- RJ entry filter section --

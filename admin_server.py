@@ -500,7 +500,7 @@ function renderEngine(el){
     h+='<div class="t-section">';
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-blue);box-shadow:0 0 5px rgba(96,165,250,0.3)"></span><span>策略参数</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
-    h+='<div class="field"><label>信号源</label><select id="deSignalSource"><option value="rj_only"'+(sigSrc==='rj_only'?' selected':'')+'>RJ独立模拟</option><option value="structure"'+(sigSrc==='structure'?' selected':'')+'>结构突破</option></select></div>';
+    h+='<div class="field"><label>信号源</label><select id="deSignalSource"><option value="predicta_ewo"'+(sigSrc==='predicta_ewo'?' selected':'')+'>Predicta + EWO</option><option value="rj_only"'+(sigSrc==='rj_only'?' selected':'')+'>RJ独立模拟</option><option value="structure"'+(sigSrc==='structure'?' selected':'')+'>结构突破</option></select></div>';
     h+='<div class="field"><label>扫描周期</label><input type="text" id="deInt" value="'+deIntVal+'" placeholder="30m" style="font-size:11px"></div>';
     h+='<div class="field"><label>最低评分</label><input type="number" id="deScore" value="'+(cfg.min_score||70)+'"></div>';
     h+='<div class="field"><label>最大持仓</label><input type="number" id="deMaxpos" value="'+(cfg.max_positions||3)+'"></div>';

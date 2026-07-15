@@ -92,7 +92,7 @@ class TradeConfig:
     scan_interval: str = "30m"          # 扫描周期: 30m / 1h / 4h / 1d
     min_score: float = 70.0             # 最低起爆点评分
     max_positions: int = 3              # 同时最大持仓数
-    entry_signal_source: str = "rj_only"  # structure / rj_only
+    entry_signal_source: str = "rj_only"  # structure / rj_only / predicta_ewo
     rj_entry_filter: str = "off"         # off / log_only / soft / hard
     rj_cross_lookback_bars: int = 8      # RJ金叉/死叉有效窗口
     rj_min_jr_spread: float = 0.0        # J/R最小同向差值, 0=不额外要求
@@ -160,6 +160,16 @@ class TradeConfig:
     rj_only_setup_near_pct: float = 0.15        # 距离触发价多少%内写near日志
     rj_only_setup_max_pool: int = 40            # RJ候选池最大数量
     rj_choppy_filter_mode: str = "off"          # off / log_only / hard
+
+    # Predicta V4 + EWO entry path (closed candles only)
+    predicta_confirm_bars: int = 6
+    predicta_choppy_filter_mode: str = "hard"
+    predicta_ewo_fast: int = 5
+    predicta_ewo_slow: int = 35
+    predicta_confirm_atr_buffer: float = 0.08
+    predicta_stop_atr_mult: float = 0.5
+    predicta_min_stop_pct: float = 0.003
+    predicta_max_stop_pct: float = 0.08
 
     # 风控 — 仓位
     risk_per_trade: Any = 10.0          # 每笔风险 (USDT) 支持 "15m:10,1h:20,4h:40,1d:80"
@@ -2555,8 +2565,9 @@ class SqueezeBreakoutBot:
             "structure_rj": "structure",
             "squeeze": "structure",
             "breakout": "structure",
+            "predicta": "predicta_ewo",
         }
-        return aliases.get(raw, raw if raw in ("structure", "rj_only") else "structure")
+        return aliases.get(raw, raw if raw in ("structure", "rj_only", "predicta_ewo") else "structure")
 
     def _compute_rj_lines(self, df) -> Optional[dict]:
         if df is None or len(df) < 30:
