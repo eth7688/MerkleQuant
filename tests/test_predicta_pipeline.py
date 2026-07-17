@@ -76,6 +76,18 @@ class PredictaPipelineTest(unittest.TestCase):
         self.assertEqual(fast, [])
         self.assertEqual(waiting, [])
 
+    def test_off_choppy_filter_allows_same_signal_key(self):
+        frame = _frame()
+        with patch("trader.compute_predicta", return_value=_lines(frame, 1.0)), patch.object(
+            self.bot, "_predicta_choppy_filter_state", return_value={
+                "choppy_filter_mode": "off", "choppy_filter_is_choppy": True,
+            },
+        ):
+            fast, waiting = self.bot._predicta_candidates_from_df("BTCUSDT", "30m", frame)
+
+        self.assertEqual(len(fast), 1)
+        self.assertEqual(waiting, [])
+
     def test_wait_pool_confirmation_uses_confirmation_candle_atr(self):
         frame = _frame(120)
         frame[["o", "h", "l", "c"]] = [99.9, 100.5, 99.5, 100.0]
@@ -93,6 +105,33 @@ class PredictaPipelineTest(unittest.TestCase):
         self.assertEqual(signal["predicta_confirm_time"], int(frame.iloc[-1]["ot"]))
         self.assertGreater(signal["predicta_atr"], 0)
         self.assertEqual(signal["source_strategy"], "predicta_ewo")
+
+    def test_restart_recovery_rejects_signal_confirmed_on_an_earlier_bar(self):
+        frame = _frame(120)
+        frame[["o", "h", "l", "c"]] = [99.9, 100.5, 99.5, 100.0]
+        signal_index = len(frame) - 5
+        frame.loc[signal_index, ["o", "h", "l", "c"]] = [100.0, 100.5, 99.5, 100.0]
+        frame.loc[signal_index + 1:, ["o", "h", "l", "c"]] = [
+            [100.0, 103.0, 99.8, 102.5],
+            [102.5, 103.2, 102.0, 102.8],
+            [102.8, 103.4, 102.4, 103.0],
+            [103.0, 103.6, 102.6, 103.2],
+        ]
+        lines = frame.copy()
+        lines["bull_signal"] = False
+        lines["bear_signal"] = False
+        lines["ewo"] = 1.0
+        lines.loc[signal_index, "bull_signal"] = True
+        lines.loc[signal_index, "ewo"] = -1.0
+
+        with patch("trader.compute_predicta", return_value=lines), patch.object(
+            self.bot, "_predicta_choppy_filter_state", return_value={
+                "choppy_filter_mode": "hard", "choppy_filter_is_choppy": False,
+            },
+        ):
+            signal = self.bot._predicta_signal_from_df("BTCUSDT", "30m", frame)
+
+        self.assertIsNone(signal)
 
     def test_scanner_requests_closed_candles_only(self):
         self.bot.positions = []

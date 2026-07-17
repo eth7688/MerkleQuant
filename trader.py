@@ -3064,9 +3064,19 @@ class SqueezeBreakoutBot:
                     return fast[0]
                 continue
             if waiting:
-                confirmed = self._predicta_confirmed_signal(waiting[0], frame)
-                if confirmed is not None:
-                    return confirmed
+                setup = waiting[0]
+                for decision_idx in range(signal_idx + 1, current_idx + 1):
+                    decision_frame = frame.iloc[:decision_idx + 1].copy()
+                    atr_value = float(self._calc_atr(decision_frame, 14) or 0.0)
+                    decision = evaluate_predicta_setup(
+                        setup, decision_frame, self._predicta_params(), atr_value
+                    )
+                    if decision.status == "confirmed":
+                        if decision_idx != current_idx:
+                            return None
+                        return self._predicta_confirmed_signal(setup, decision_frame)
+                    if decision.status in ("invalidated", "timeout"):
+                        return None
         return None
 
     def _sync_predicta_setup_pool(self, setups: list) -> None:
