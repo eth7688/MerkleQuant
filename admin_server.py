@@ -389,6 +389,7 @@ function saveDemoFullCfg(){
     testnet_api_key: document.getElementById('deTestKey').value,
     testnet_api_secret: document.getElementById('deTestSec').value,
     entry_signal_source: document.getElementById('deSignalSource').value,
+    predicta_choppy_filter_mode: document.getElementById('dePredictaChoppy').value==='1'?'hard':'off',
     scan_interval: document.getElementById('deInt').value,
     min_score: parseInt(document.getElementById('deScore').value)||70,
     max_positions: parseInt(document.getElementById('deMaxpos').value)||3,
@@ -462,7 +463,7 @@ function saveDemoFullCfg(){
   fetch('/api/admin/demo/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(r=>r.json()).then(d=>{
     var m=document.getElementById('deMsg');
     m.style.display='block'; m.style.background='rgba(45,212,191,0.1)'; m.style.color='var(--brand)';
-    m.textContent='已保存，需重启引擎生效';
+    m.textContent='已保存并生效';
   }).catch(function(e){
     var m=document.getElementById('deMsg');
     m.style.display='block'; m.style.background='rgba(248,113,113,0.1)'; m.style.color='var(--s-red)';
@@ -501,6 +502,7 @@ function renderEngine(el){
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-blue);box-shadow:0 0 5px rgba(96,165,250,0.3)"></span><span>策略参数</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
     h+='<div class="field"><label>信号源</label><select id="deSignalSource"><option value="predicta_ewo"'+(sigSrc==='predicta_ewo'?' selected':'')+'>Predicta + EWO</option><option value="rj_only"'+(sigSrc==='rj_only'?' selected':'')+'>RJ独立模拟</option><option value="structure"'+(sigSrc==='structure'?' selected':'')+'>结构突破</option></select></div>';
+    h+='<div class="field"><label>震荡过滤拦截</label><select id="dePredictaChoppy"><option value="1"'+((cfg.predicta_choppy_filter_mode||'off')==='hard'?' selected':'')+'>开启｜震荡信号不进入开仓链路</option><option value="0"'+((cfg.predicta_choppy_filter_mode||'off')!=='hard'?' selected':'')+'>关闭｜不使用震荡过滤拦截</option></select></div>';
     h+='<div class="field"><label>扫描周期</label><input type="text" id="deInt" value="'+deIntVal+'" placeholder="30m" style="font-size:11px"></div>';
     h+='<div class="field"><label>最低评分</label><input type="number" id="deScore" value="'+(cfg.min_score||70)+'"></div>';
     h+='<div class="field"><label>最大持仓</label><input type="number" id="deMaxpos" value="'+(cfg.max_positions||3)+'"></div>';

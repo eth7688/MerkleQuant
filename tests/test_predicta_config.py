@@ -33,6 +33,15 @@ class PredictaConfigTest(unittest.TestCase):
             source = (ROOT / name).read_text(encoding="utf-8")
             self.assertIn('option value="predicta_ewo"', source)
 
+    def test_admin_offers_predicta_choppy_intercept_toggle(self):
+        source = (ROOT / "admin_server.py").read_text(encoding="utf-8")
+        self.assertIn('id="dePredictaChoppy"', source)
+        self.assertIn(
+            "predicta_choppy_filter_mode: document.getElementById('dePredictaChoppy').value==='1'?'hard':'off'",
+            source,
+        )
+        self.assertIn("(cfg.predicta_choppy_filter_mode||'off')==='hard'", source)
+
 
 if __name__ == "__main__":
     unittest.main()
