@@ -33,6 +33,39 @@ def _wilder_rma(values: pd.Series, length: int) -> pd.Series:
     return result
 
 
+def _ema_rma(values: pd.Series, length: int) -> pd.Series:
+    return values.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+
+
+def _adx_value(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float | None:
+    previous = close.shift(1)
+    true_range = pd.concat(
+        [(high - low).abs(), (high - previous).abs(), (low - previous).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = _ema_rma(true_range, period)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=high.index)
+    plus_di = 100.0 * _ema_rma(plus_dm, period) / atr.replace(0, np.nan)
+    minus_di = 100.0 * _ema_rma(minus_dm, period) / atr.replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    value = float(_ema_rma(dx, period).iloc[-1])
+    return value if np.isfinite(value) else None
+
+
+def _efficiency_ratio(close: pd.Series, period: int) -> float | None:
+    if len(close) < period + 1:
+        return None
+    window = close.iloc[-period - 1:]
+    path = float(window.diff().abs().sum())
+    if not np.isfinite(path) or path <= 0:
+        return None
+    value = abs(float(window.iloc[-1] - window.iloc[0])) / path
+    return value if np.isfinite(value) else None
+
+
 def _empty_state(reason: str, anchor_idx: int | None = None) -> dict[str, Any]:
     return {
         "choppy_filter_available": False,
@@ -139,6 +172,56 @@ def evaluate_choppy_market_adaptive(
         }
     except (KeyError, TypeError, ValueError, IndexError):
         return _empty_state("invalid_data", resolved_idx)
+
+
+def evaluate_predicta_choppy_market(
+    df: pd.DataFrame,
+    anchor_idx: int | None = None,
+    adx_period: int = 14,
+    efficiency_period: int = 20,
+    adx_threshold: float = 18.0,
+    efficiency_threshold: float = 0.20,
+) -> dict[str, Any]:
+    """Add weak-direction detection to the existing Predicta choppy state."""
+    state = dict(evaluate_choppy_market_adaptive(df, anchor_idx=anchor_idx))
+    state.update({
+        "choppy_adx_period": adx_period,
+        "choppy_adx": None,
+        "choppy_efficiency_period": efficiency_period,
+        "choppy_efficiency_ratio": None,
+    })
+    if not state.get("choppy_filter_available"):
+        return state
+
+    resolved_idx = len(df) - 1 if anchor_idx is None else int(anchor_idx)
+    if resolved_idx < 0:
+        resolved_idx += len(df)
+    try:
+        context = df.iloc[:resolved_idx + 1]
+        high = _column(context, "h", "high")
+        low = _column(context, "l", "low")
+        close = _column(context, "c", "close")
+        adx = _adx_value(high, low, close, adx_period)
+        efficiency = _efficiency_ratio(close, efficiency_period)
+    except (KeyError, TypeError, ValueError, IndexError):
+        return state
+
+    state["choppy_adx"] = adx
+    state["choppy_efficiency_ratio"] = efficiency
+    if (
+        adx is not None
+        and efficiency is not None
+        and adx < adx_threshold
+        and efficiency < efficiency_threshold
+    ):
+        reasons = list(state.get("choppy_filter_reasons") or [])
+        if "weak_directional_efficiency" not in reasons:
+            reasons.append("weak_directional_efficiency")
+        state["choppy_filter_is_choppy"] = True
+        state["choppy_filter_reasons"] = reasons
+        if state.get("choppy_filter_reason") == "pass":
+            state["choppy_filter_reason"] = "weak_directional_efficiency"
+    return state
 
 
 def is_choppy_market_adaptive(

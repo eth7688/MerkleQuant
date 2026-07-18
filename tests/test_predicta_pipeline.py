@@ -1,4 +1,6 @@
+import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -87,6 +89,27 @@ class PredictaPipelineTest(unittest.TestCase):
 
         self.assertEqual(len(fast), 1)
         self.assertEqual(waiting, [])
+
+    def test_real_dexe_weak_trend_is_blocked_only_in_hard_mode(self):
+        rows = json.loads(
+            (Path(__file__).resolve().parent / "fixtures" / "dexeusdt_30m_20260718_signal.json")
+            .read_text(encoding="utf-8")
+        )
+        frame = pd.DataFrame(rows)
+        self.bot.cfg.predicta_choppy_filter_mode = "hard"
+
+        hard_fast, hard_waiting = self.bot._predicta_candidates_from_df(
+            "DEXEUSDT", "30m", frame
+        )
+        self.bot.cfg.predicta_choppy_filter_mode = "off"
+        off_fast, off_waiting = self.bot._predicta_candidates_from_df(
+            "DEXEUSDT", "30m", frame
+        )
+
+        self.assertEqual(hard_fast, [])
+        self.assertEqual(hard_waiting, [])
+        self.assertEqual(len(off_fast), 1)
+        self.assertEqual(off_waiting, [])
 
     def test_wait_pool_confirmation_uses_confirmation_candle_atr(self):
         frame = _frame(120)

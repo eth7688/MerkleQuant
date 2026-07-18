@@ -28,7 +28,7 @@ import pandas as pd
 import numpy as np
 
 from btc_stage import classify_btc_stage, evaluate_btc_gate
-from strategy_filters import evaluate_choppy_market_adaptive
+from strategy_filters import evaluate_choppy_market_adaptive, evaluate_predicta_choppy_market
 from predicta_indicator import (
     PredictaParams,
     compute_predicta,
@@ -1566,6 +1566,10 @@ class SqueezeBreakoutBot:
                 "atr_ratio": None,
                 "box_position": None,
                 "box_amplitude": None,
+                "adx_period": None,
+                "adx": None,
+                "efficiency_period": None,
+                "efficiency_ratio": None,
             }
 
         reasons = state.get("reasons", state.get("choppy_filter_reasons", []))
@@ -1576,6 +1580,13 @@ class SqueezeBreakoutBot:
             value = state.get(name, state.get(source_name))
             try:
                 return round(float(value), 6) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def optional_int(name, source_name):
+            value = state.get(name, state.get(source_name))
+            try:
+                return int(value) if value is not None else None
             except (TypeError, ValueError):
                 return None
 
@@ -1590,6 +1601,12 @@ class SqueezeBreakoutBot:
             "atr_ratio": optional_float("atr_ratio", "choppy_atr_ratio"),
             "box_position": optional_float("box_position", "choppy_box_position"),
             "box_amplitude": optional_float("box_amplitude", "choppy_box_amplitude"),
+            "adx_period": optional_int("adx_period", "choppy_adx_period"),
+            "adx": optional_float("adx", "choppy_adx"),
+            "efficiency_period": optional_int("efficiency_period", "choppy_efficiency_period"),
+            "efficiency_ratio": optional_float(
+                "efficiency_ratio", "choppy_efficiency_ratio"
+            ),
         }
 
     def _entry_choppy_audit_map(self) -> dict:
@@ -2899,7 +2916,13 @@ class SqueezeBreakoutBot:
             state.update({"rj_sr_filter_pass": False, "rj_sr_reason": f"sr_exception:{str(e)[:60]}"})
             return state
 
-    def _choppy_filter_state(self, df, anchor_idx: int, mode: str) -> dict:
+    def _choppy_filter_state(
+        self,
+        df,
+        anchor_idx: int,
+        mode: str,
+        evaluator=evaluate_choppy_market_adaptive,
+    ) -> dict:
         mode = str(mode or "off").strip().lower()
         if mode not in ("off", "log_only", "hard"):
             mode = "off"
@@ -2912,7 +2935,7 @@ class SqueezeBreakoutBot:
                 "choppy_filter_reason": "disabled",
                 "choppy_filter_reasons": [],
             }
-        state = evaluate_choppy_market_adaptive(df, anchor_idx=anchor_idx)
+        state = evaluator(df, anchor_idx=anchor_idx)
         state["choppy_filter_mode"] = mode
         state["choppy_filter_anchor"] = "signal_key"
         return state
@@ -2924,7 +2947,10 @@ class SqueezeBreakoutBot:
 
     def _predicta_choppy_filter_state(self, df, anchor_idx: int) -> dict:
         return self._choppy_filter_state(
-            df, anchor_idx, getattr(self.cfg, "predicta_choppy_filter_mode", "hard")
+            df,
+            anchor_idx,
+            getattr(self.cfg, "predicta_choppy_filter_mode", "hard"),
+            evaluator=evaluate_predicta_choppy_market,
         )
 
     def _predicta_params(self) -> PredictaParams:
@@ -4673,6 +4699,8 @@ class SqueezeBreakoutBot:
             "choppy_atr", "choppy_atr_baseline", "choppy_atr_ratio",
             "choppy_box_high", "choppy_box_low", "choppy_box_amplitude",
             "choppy_box_threshold", "choppy_box_position",
+            "choppy_adx_period", "choppy_adx",
+            "choppy_efficiency_period", "choppy_efficiency_ratio",
             "btc_coin_reversal_pass",
             "rj_only_stats_pass", "rj_only_stats_reason", "rj_only_hist_samples",
             "rj_only_hist_raw_triggers", "rj_only_hist_confirmed", "rj_only_hist_risk_ok",

@@ -1,3 +1,4 @@
+import json
 import logging
 import tempfile
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import strategy_filters
 from strategy_filters import evaluate_choppy_market_adaptive, is_choppy_market_adaptive
 from trader import Position, SqueezeBreakoutBot, TradeConfig
 
@@ -22,6 +24,100 @@ def _frame(closes, half_range=1.0):
         "c": closes,
         "v": np.full(len(closes), 1000.0),
     })
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _dexe_frame():
+    rows = json.loads(
+        (FIXTURES / "dexeusdt_30m_20260718_signal.json").read_text(encoding="utf-8")
+    )
+    return pd.DataFrame(rows)
+
+
+class PredictaWeakTrendChoppyTest(unittest.TestCase):
+    def test_real_dexe_signal_is_weak_directional_chop(self):
+        self.assertTrue(hasattr(strategy_filters, "evaluate_predicta_choppy_market"))
+        state = strategy_filters.evaluate_predicta_choppy_market(_dexe_frame())
+
+        self.assertTrue(state["choppy_filter_is_choppy"])
+        self.assertIn("weak_directional_efficiency", state["choppy_filter_reasons"])
+        self.assertLess(state["choppy_adx"], 18.0)
+        self.assertLess(state["choppy_efficiency_ratio"], 0.20)
+
+    def test_directional_expansion_remains_allowed(self):
+        frame = _frame(100.0 + np.arange(130) * 0.5)
+
+        state = strategy_filters.evaluate_predicta_choppy_market(frame)
+
+        self.assertFalse(state["choppy_filter_is_choppy"])
+        self.assertGreaterEqual(state["choppy_efficiency_ratio"], 0.20)
+
+    def test_later_candles_do_not_change_signal_anchor_result(self):
+        frame = _dexe_frame()
+        extended = pd.concat([frame, _frame([80.0, 120.0, 70.0])], ignore_index=True)
+
+        expected = strategy_filters.evaluate_predicta_choppy_market(frame)
+        actual = strategy_filters.evaluate_predicta_choppy_market(
+            extended, anchor_idx=len(frame) - 1
+        )
+
+        self.assertEqual(actual, expected)
+
+    def test_weak_trend_requires_both_adx_and_efficiency(self):
+        frame = _dexe_frame()
+
+        adx_only = strategy_filters.evaluate_predicta_choppy_market(
+            frame, efficiency_threshold=0.01
+        )
+        efficiency_only = strategy_filters.evaluate_predicta_choppy_market(
+            frame, adx_threshold=1.0
+        )
+
+        self.assertNotIn("weak_directional_efficiency", adx_only["choppy_filter_reasons"])
+        self.assertNotIn("weak_directional_efficiency", efficiency_only["choppy_filter_reasons"])
+
+    def test_invalid_efficiency_keeps_existing_result(self):
+        frame = _frame([100.0] * 130)
+
+        state = strategy_filters.evaluate_predicta_choppy_market(frame)
+
+        self.assertTrue(state["choppy_filter_is_choppy"])
+        self.assertIsNone(state["choppy_efficiency_ratio"])
+        self.assertNotIn("weak_directional_efficiency", state["choppy_filter_reasons"])
+
+    def test_predicta_uses_enhanced_filter_while_rj_keeps_base_filter(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.cfg = TradeConfig(
+            predicta_choppy_filter_mode="hard", rj_choppy_filter_mode="hard"
+        )
+        frame = _dexe_frame()
+
+        predicta = bot._predicta_choppy_filter_state(frame, len(frame) - 1)
+        rj = bot._rj_choppy_filter_state(frame, len(frame) - 1)
+
+        self.assertTrue(predicta["choppy_filter_is_choppy"])
+        self.assertFalse(rj["choppy_filter_is_choppy"])
+
+    def test_position_audit_keeps_predicta_direction_metrics(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+
+        audit = bot._position_choppy_filter({
+            "choppy_filter_mode": "hard",
+            "choppy_filter_available": True,
+            "choppy_filter_is_choppy": False,
+            "choppy_filter_reason": "pass",
+            "choppy_adx_period": 14,
+            "choppy_adx": 24.5,
+            "choppy_efficiency_period": 20,
+            "choppy_efficiency_ratio": 0.31,
+        })
+
+        self.assertEqual(audit["adx_period"], 14)
+        self.assertAlmostEqual(audit["adx"], 24.5)
+        self.assertEqual(audit["efficiency_period"], 20)
+        self.assertAlmostEqual(audit["efficiency_ratio"], 0.31)
 
 
 class ChoppyFilterModuleTest(unittest.TestCase):
@@ -204,6 +300,8 @@ class ChoppyFilterPositionAuditTest(unittest.TestCase):
         self.assertFalse(second["recorded"])
         self.assertFalse(migrated["recorded"])
         self.assertEqual(second["reason"], "not_recorded")
+        self.assertIsNone(second["adx"])
+        self.assertIsNone(second["efficiency_ratio"])
 
 
 if __name__ == "__main__":
