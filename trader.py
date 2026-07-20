@@ -1070,6 +1070,7 @@ class Position:
     target_distance_pct: float = 0.0    # 入场到目标区距离百分比
     target_zone_bars_ago: int = 0       # 目标区距离当前多少根K线
     hermes_confirm: dict = field(default_factory=dict)
+    excursion_price_source: str = ""
     choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
 
 
@@ -4951,6 +4952,7 @@ class SqueezeBreakoutBot:
                     "source_strategy": getattr(p, "source_strategy", ""),
                     "max_favorable_r": p.max_favorable_r,
                     "max_adverse_r": p.max_adverse_r,
+                    "excursion_price_source": getattr(p, "excursion_price_source", ""),
                     "time_stop_armed": p.time_stop_armed,
                     "time_stop_armed_at": p.time_stop_armed_at.isoformat() if getattr(p, "time_stop_armed_at", None) else "",
                     "time_stop_watch": bool(getattr(p, "time_stop_watch", False)),
@@ -5019,6 +5021,7 @@ class SqueezeBreakoutBot:
                 pos.source_interval = d.get('source_interval', '15m')
                 pos.max_favorable_r = float(d.get('max_favorable_r', 0.0) or 0.0)
                 pos.max_adverse_r = float(d.get('max_adverse_r', 0.0) or 0.0)
+                pos.excursion_price_source = str(d.get('excursion_price_source', '') or '')
                 pos.btc_regime_fields = d.get('btc_regime_fields', {}) or {k: v for k, v in d.items() if str(k).startswith('btc_')}
                 pos.signal_key = d.get('signal_key', '')
                 raw_strategy = str(d.get('source_strategy', '') or '').strip().lower()
@@ -5187,6 +5190,7 @@ class SqueezeBreakoutBot:
                             pos.lowest_price = getattr(matched_local, 'lowest_price', 999999.0) if matched_local else 999999.0
                             pos.max_favorable_r = getattr(matched_local, 'max_favorable_r', 0.0) if matched_local else 0.0
                             pos.max_adverse_r = getattr(matched_local, 'max_adverse_r', 0.0) if matched_local else 0.0
+                            pos.excursion_price_source = getattr(matched_local, 'excursion_price_source', '') if matched_local else ''
                             pos.source_strategy = getattr(matched_local, 'source_strategy', '') if matched_local else ''
                             pos.signal_key = getattr(matched_local, 'signal_key', '') if matched_local else ''
                             if not pos.source_strategy:
@@ -6686,7 +6690,13 @@ class SqueezeBreakoutBot:
                     )
                     if reason:
                         return reason
-        df = fetch_klines(symbol, inv, 100, exchange=self.cfg.exchange)
+        df = fetch_klines(
+            symbol, inv, 100,
+            exchange=self.cfg.exchange,
+            market_type=self.cfg.market_type,
+            testnet=self.cfg.testnet,
+            price_type="mark",
+        )
         if df is None or len(df) < 30:
             if (getattr(self.cfg, 'enable_time_stop', True)
                     and not pos.breakeven_triggered and not pos.partial_tp_triggered):
@@ -6742,6 +6752,34 @@ class SqueezeBreakoutBot:
             r_multiple = 0.0
             favorable_r = 0.0
             adverse_r = 0.0
+        excursion_source = (
+            "mark"
+            if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
+            else ""
+        )
+        if excursion_source and getattr(pos, "excursion_price_source", "") != excursion_source and initial_risk > 0:
+            history = df
+            try:
+                entry_ms = int(pos.entry_time.timestamp() * 1000)
+                since_entry = df[df["ot"] >= entry_ms]
+                if len(since_entry) > 0:
+                    history = since_entry
+            except Exception:
+                pass
+            if pos.direction == "LONG":
+                rebased_favorable = (float(history["h"].max()) - pos.entry_price) / initial_risk
+                rebased_adverse = (pos.entry_price - float(history["l"].min())) / initial_risk
+            else:
+                rebased_favorable = (pos.entry_price - float(history["l"].min())) / initial_risk
+                rebased_adverse = (float(history["h"].max()) - pos.entry_price) / initial_risk
+            pos.max_favorable_r = max(0.0, float(r_multiple), float(rebased_favorable))
+            pos.max_adverse_r = max(0.0, float(rebased_adverse))
+            pos.excursion_price_source = excursion_source
+            self._log.info(
+                f"{symbol} MFE/MAE switched to mark-price basis: "
+                f"MFE={pos.max_favorable_r:.2f}R MAE={pos.max_adverse_r:.2f}R"
+            )
+            self._save_positions()
         old_max_r = getattr(pos, 'max_favorable_r', 0.0)
         if favorable_r > old_max_r:
             pos.max_favorable_r = favorable_r

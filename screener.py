@@ -197,11 +197,23 @@ def _closed_kline_frame(df, interval, limit=None):
     except Exception:
         return df.tail(limit).reset_index(drop=True) if limit else df
 
-def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True):
+def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True,
+                 market_type=None, testnet=None, price_type=None):
     ex = exchange if exchange is not None else _exchange
     if ex == "bitget":
         return _fetch_klines_bitget(symbol, interval, limit, closed_only=closed_only)
-    url = f"https://api.binance.com/api/v3/klines" if exchange else f"{_rest_base}/api/v3/klines"
+    if str(market_type or "spot").lower() == "futures":
+        base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+        endpoint = "markPriceKlines" if str(price_type or "").lower() == "mark" else "klines"
+        url = f"{base}/fapi/v1/{endpoint}"
+    else:
+        if testnet is True:
+            base = "https://testnet.binance.vision"
+        elif testnet is False or exchange:
+            base = "https://api.binance.com"
+        else:
+            base = _rest_base
+        url = f"{base}/api/v3/klines"
     try:
         req_limit = min(int(limit) + 1, 1000) if closed_only else int(limit)
         r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": req_limit}, timeout=5)
