@@ -69,6 +69,14 @@ def bj_now():
     # 北京时间显示 (UTC+8)
     return (datetime.now(timezone.utc) + timedelta(hours=8)).replace(microsecond=0)
 
+
+def _entry_ms_for_market_data(entry_time: datetime, latest_open_ms: int) -> int:
+    """Convert the project's Beijing display timestamp at the UTC market-data boundary."""
+    raw_ms = int(entry_time.timestamp() * 1000)
+    if raw_ms - int(latest_open_ms) >= 6 * 60 * 60 * 1000:
+        return raw_ms - 8 * 60 * 60 * 1000
+    return raw_ms
+
 POSITIONS_PATH = "positions.json"
 TRADE_LOG_PATH = "trades.jsonl"
 SIGNAL_LOG_PATH = "signal_events.jsonl"
@@ -6714,6 +6722,16 @@ class SqueezeBreakoutBot:
         current_price = closes.iloc[-1]; current_high = highs.iloc[-1]; current_low = lows.iloc[-1]
         ema_ratchet_val = ema(closes, self.cfg.ema_ratchet).iloc[-1]
 
+        post_entry_history = df.iloc[0:0]
+        try:
+            open_times = pd.to_numeric(df["ot"], errors="coerce")
+            valid_open_times = open_times.dropna()
+            if len(valid_open_times) > 0:
+                entry_ms = _entry_ms_for_market_data(pos.entry_time, int(valid_open_times.max()))
+                post_entry_history = df[open_times >= entry_ms]
+        except Exception:
+            pass
+
         # 1R锚点
         if pos.initial_sl > 0:
             initial_risk = abs(pos.entry_price - pos.initial_sl)
@@ -6738,6 +6756,13 @@ class SqueezeBreakoutBot:
             (current_price - pos.entry_price) * pos.quantity if pos.direction == "LONG"
             else (pos.entry_price - current_price) * pos.quantity)
 
+        if len(post_entry_history) > 0:
+            current_high = post_entry_history["h"].iloc[-1]
+            current_low = post_entry_history["l"].iloc[-1]
+        else:
+            current_high = current_price
+            current_low = current_price
+
         # R-Multiple (统一使用实时当前价 current_price)
         if initial_risk > 0:
             if pos.direction == "LONG":
@@ -6757,15 +6782,11 @@ class SqueezeBreakoutBot:
             if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
             else ""
         )
-        if excursion_source and getattr(pos, "excursion_price_source", "") != excursion_source and initial_risk > 0:
-            history = df
-            try:
-                entry_ms = int(pos.entry_time.timestamp() * 1000)
-                since_entry = df[df["ot"] >= entry_ms]
-                if len(since_entry) > 0:
-                    history = since_entry
-            except Exception:
-                pass
+        if (excursion_source
+                and getattr(pos, "excursion_price_source", "") != excursion_source
+                and initial_risk > 0
+                and len(post_entry_history) > 0):
+            history = post_entry_history
             if pos.direction == "LONG":
                 rebased_favorable = (float(history["h"].max()) - pos.entry_price) / initial_risk
                 rebased_adverse = (pos.entry_price - float(history["l"].min())) / initial_risk
