@@ -490,6 +490,24 @@ class BinanceClient:
             "symbol": symbol, "leverage": leverage
         }, signed=True)
 
+    def set_compatible_leverage(self, symbol, leverage):
+        """设置请求杠杆；不支持时逐级降到更低的安全档位。"""
+        requested = max(1, int(float(leverage or 1)))
+        candidates = []
+        for candidate in (requested, 20, 10, 5, 3, 2, 1):
+            candidate = min(requested, candidate)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            result = self.set_leverage(symbol, candidate)
+            if result:
+                if candidate != requested:
+                    self._log.info(
+                        f"Binance杠杆按合约兼容降档: {symbol} {requested}x -> {candidate}x"
+                    )
+                return result
+        return None
+
     def cancel_all_orders(self, symbol):
         if self.market_type == "futures":
             r1 = self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
@@ -5516,32 +5534,81 @@ class SqueezeBreakoutBot:
 
         return quantity, position_usdt, actual_risk
 
-    def _floor_qty(self, symbol, qty):
+    def _floor_qty(self, symbol, qty, market_order=True):
         """按交易对精度向下取整 (floor), 受交易所minQty/maxQty/step约束"""
         import math
         try:
             info = self.client.get_symbol_info(symbol)
             if info:
-                for f in info.get("filters", []):
-                    if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                        step = float(f["stepSize"])
-                        min_qty = float(f.get("minQty", step))
-                        max_qty = float(f.get("maxQty", 0))  # 0 = 不限
-                        decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
-                        floored = round(math.floor(qty / step) * step, decimals)
-                        if max_qty > 0 and floored > max_qty:
-                            floored = math.floor(max_qty / step) * step
-                            self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
-                        if floored < min_qty:
-                            self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
-                            return 0
-                        return floored
+                filters = {
+                    f.get("filterType"): f
+                    for f in info.get("filters", [])
+                    if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE")
+                }
+                preferred = "MARKET_LOT_SIZE" if market_order else "LOT_SIZE"
+                f = filters.get(preferred) or filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE")
+                if f:
+                    step = float(f["stepSize"])
+                    min_qty = float(f.get("minQty", step))
+                    max_qty = float(f.get("maxQty", 0))  # 0 = 不限
+                    decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
+                    floored = round(math.floor(qty / step) * step, decimals)
+                    if max_qty > 0 and floored > max_qty:
+                        floored = math.floor(max_qty / step) * step
+                        self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
+                    if floored < min_qty:
+                        self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
+                        return 0
+                    return floored
         except:
             pass
         if qty > 100: return math.floor(qty * 10) / 10
         if qty > 1: return math.floor(qty * 1000) / 1000
         if qty > 0.01: return math.floor(qty * 100000) / 100000
         return math.floor(qty * 100000000) / 100000000
+
+    def _prepare_futures_entry(self, symbol, entry_price, sl_price, qty):
+        """下市价单前应用Binance杠杆和最大名义价值约束。"""
+        entry_price = float(entry_price or 0.0)
+        sl_price = float(sl_price or 0.0)
+        qty = float(qty or 0.0)
+        pos_usdt = qty * entry_price
+        risk = qty * abs(entry_price - sl_price)
+        requested = max(1, int(float(getattr(self.cfg, "leverage", 1) or 1)))
+        meta = {
+            "requested_leverage": requested,
+            "effective_leverage": requested,
+            "max_notional_value": 0.0,
+        }
+        if self.client is None or self.cfg.market_type != "futures":
+            return qty, pos_usdt, risk, meta
+        if str(getattr(self.cfg, "exchange", "") or "").lower() != "binance":
+            self.client.set_leverage(symbol, requested)
+            return qty, pos_usdt, risk, meta
+
+        result = self.client.set_compatible_leverage(symbol, requested)
+        if not result:
+            meta["reason"] = "leverage_unavailable"
+            return 0.0, 0.0, 0.0, meta
+        if isinstance(result, dict):
+            meta["effective_leverage"] = int(float(result.get("leverage") or requested))
+            try:
+                meta["max_notional_value"] = float(result.get("maxNotionalValue") or 0.0)
+            except (TypeError, ValueError):
+                meta["max_notional_value"] = 0.0
+
+        max_notional = meta["max_notional_value"]
+        if max_notional > 0 and pos_usdt > max_notional * 0.98:
+            qty = self._floor_qty(symbol, max_notional * 0.98 / entry_price)
+            pos_usdt = qty * entry_price
+            risk = qty * abs(entry_price - sl_price)
+            meta["notional_capped"] = True
+        else:
+            meta["notional_capped"] = False
+        if qty <= 0:
+            meta["reason"] = "qty_too_small_after_leverage"
+            return 0.0, 0.0, 0.0, meta
+        return qty, pos_usdt, risk, meta
 
     # ========== 风控检查 ==========
     def _check_risk_limits(self) -> bool:
@@ -5748,6 +5815,7 @@ class SqueezeBreakoutBot:
             }))
             return None
 
+        leverage_meta = {}
         if self.client is not None:
             info = self.client.get_symbol_info(symbol)
             if info is None or (isinstance(info, dict) and info.get("status") == "BREAK"):
@@ -5758,6 +5826,18 @@ class SqueezeBreakoutBot:
                     "testnet": self.cfg.testnet,
                 }))
                 return None
+            if self.cfg.market_type == "futures":
+                qty, pos_usdt, risk, leverage_meta = self._prepare_futures_entry(
+                    symbol, entry_price, sl_price, qty
+                )
+                if qty <= 0:
+                    self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                        "reason": leverage_meta.get("reason", "leverage_unavailable"),
+                        "entry": entry_price,
+                        "sl": sl_price,
+                        **leverage_meta,
+                    }))
+                    return None
             if pos_usdt < 5.5 and self.cfg.market_type == "futures":
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                     "reason": "min_notional",
@@ -5765,8 +5845,6 @@ class SqueezeBreakoutBot:
                     "min_notional": 5.5,
                 }))
                 return None
-            if self.cfg.market_type == "futures":
-                self.client.set_leverage(symbol, self.cfg.leverage)
 
         hermes_state = (
             self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
@@ -5812,6 +5890,7 @@ class SqueezeBreakoutBot:
             "exchange": self.cfg.exchange,
             "mode": self.cfg.mode,
             "testnet": self.cfg.testnet,
+            **leverage_meta,
         }))
 
         fill_price = entry_price
@@ -5903,6 +5982,7 @@ class SqueezeBreakoutBot:
             "hermes_confirm": self._public_hermes_confirm(hermes_state),
             **target_zone,
             **btc_regime_fields,
+            **leverage_meta,
         }))
         mode_label = "测试网真实模拟" if self.client is not None else "纸笔模拟"
         self._log.info(
