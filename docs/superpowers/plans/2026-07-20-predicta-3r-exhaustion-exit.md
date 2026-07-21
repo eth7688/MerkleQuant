@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a demo-only Predicta V2 exit profile that protects at 0.8R/1.2R, partially realizes a three-factor hard exhaustion before 3R, takes 80% of the current position at 3R, and trails the remaining runner only after 3R.
+**Goal:** Add a demo-only Predicta V2 exit profile, then compare its 80/20 runner against three fixed 70/30 dual-speed runner profiles on an identical frozen entry cohort before any profile is selected for deployment.
 
-**Architecture:** Put all closed-candle exhaustion evidence and percentage math in a new side-effect-free `predicta_exit.py` module. Keep exchange execution, persistence, stop-order replacement, and legacy V1 behavior in `trader.py`; make the replay engine call the same pure evaluator at each closed 30-minute boundary so live and historical rules cannot drift.
+**Architecture:** Put all closed-candle exhaustion evidence and percentage math in a new side-effect-free `predicta_exit.py` module. Keep exchange execution, persistence, stop-order replacement, and legacy V1 behavior in `trader.py`; make the replay engine call the same pure evaluator at each closed 30-minute boundary. Isolate the 70/30 profiles in backtest-only modules, freeze the baseline entry cohort once per fold, and replay every profile over those same fills so exit duration cannot silently change the comparison population.
 
 **Tech Stack:** Python 3.12, dataclasses, pandas, NumPy, Flask trading engine, Binance/Bitget exchange adapters, JSON persistence, `unittest`, existing portfolio replay engine.
 
@@ -22,6 +22,11 @@
 - A stage flag is written only after an accepted partial order is reconciled to the exchange position; accepted but unreconciled orders are persisted as pending and are never resent blindly.
 - Existing exchange quantity formatting, stop-order ID persistence, and reduce-only semantics remain intact.
 - No admin UI controls are added in this phase.
+- The fixed replay profiles are exactly `v2_80_20`, `v2_70_30_donchian_20`, `v2_70_30_donchian_40`, and `v2_70_30_donchian_60`; no indicator may dynamically alter their fractions.
+- A 70/30 profile closes 70% of the pre-target current quantity at 3R, assigns 15% to an ATR(14) × 3.5 medium runner, and assigns 15% to a closed-candle Donchian midpoint runner with a 20, 40, or 60 bar period; both runners receive a 2R floor and favorable-only ratchets.
+- The exit comparison uses the baseline's frozen entry fills, direction, initial stop, quantity, fees, and slippage for every profile. Experimental profiles never rescan signals, consume capacity slots, write demo state, or send exchange orders.
+- A candidate cannot qualify with fewer than 100 aggregate completed frozen trades. It must beat baseline aggregate mean R and profit factor, beat baseline mean R in at least two of three non-overlapping folds, and keep relative max-drawdown worsening at or below 10%.
+- A qualifying report does not modify `demo_bot_config.json`. Deployment always requires a separate explicit user approval; a winning 70/30 profile additionally requires a separate live-order/persistence design.
 - Only local runtime source is updated before deployment; tests, docs, plans, `PROGRESS.md`, and memory files are not uploaded.
 - After deployment, update local `PROGRESS.md` with changed files, backup path, deployment actions, hashes, position continuity, and verification results.
 
@@ -609,7 +614,365 @@ git commit -m "feat: replay Predicta V2 exits"
 
 ---
 
-### Task 5: Group Live Trade Statistics by Original Position
+### Task 5: Define the Fixed Replay-Only Exit Profiles
+
+**Files:**
+- Create: `backtest/exit_profiles.py`
+- Create: `tests/test_exit_profiles.py`
+
+**Interfaces:**
+- Consumes: current quantity, closed 30-minute candles, direction, and the current stop.
+- Produces: `fixed_exit_profiles() -> tuple[ReplayExitProfile, ...]`, `allocate_target_quantities(current_qty, profile) -> TargetAllocation`, `donchian_midpoint(closed, period) -> float | None`, and `ratchet_stop(direction, current_stop, candidate) -> float`.
+
+- [ ] **Step 1: Write failing profile and Donchian tests**
+
+Create tests that assert the immutable profile names and exact fractions:
+
+```python
+profiles = {profile.name: profile for profile in fixed_exit_profiles()}
+self.assertEqual(tuple(profiles), (
+    "v2_80_20",
+    "v2_70_30_donchian_20",
+    "v2_70_30_donchian_40",
+    "v2_70_30_donchian_60",
+))
+self.assertEqual(allocate_target_quantities(10.0, profiles["v2_80_20"]), TargetAllocation(8.0, 2.0, 0.0))
+self.assertEqual(allocate_target_quantities(5.0, profiles["v2_70_30_donchian_20"]), TargetAllocation(3.5, 0.75, 0.75))
+```
+
+Build 20 closed candles with highs `101..120` and lows `81..100`; assert the midpoint is `100.5`. Assert 19 candles return `None`, LONG ratchets with `max`, SHORT ratchets with `min`, and every profile's three fractions sum to exactly `1.0` within `1e-12`.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_profiles.py -v`
+
+Expected: import failure because `backtest.exit_profiles` does not exist.
+
+- [ ] **Step 3: Implement immutable profiles and allocation math**
+
+Create the public contracts exactly as follows:
+
+```python
+from dataclasses import dataclass
+
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class ReplayExitProfile:
+    name: str
+    target_close_fraction: float
+    medium_runner_fraction: float
+    slow_runner_fraction: float
+    donchian_period: int = 0
+
+    def validate(self) -> "ReplayExitProfile":
+        values = (self.target_close_fraction, self.medium_runner_fraction, self.slow_runner_fraction)
+        if any(value < 0.0 for value in values) or abs(sum(values) - 1.0) > 1e-12:
+            raise ValueError("invalid_exit_profile_fractions")
+        if self.slow_runner_fraction > 0.0 and self.donchian_period not in (20, 40, 60):
+            raise ValueError("invalid_donchian_period")
+        if self.slow_runner_fraction == 0.0 and self.donchian_period != 0:
+            raise ValueError("unexpected_donchian_period")
+        return self
+
+
+@dataclass(frozen=True)
+class TargetAllocation:
+    close_qty: float
+    medium_qty: float
+    slow_qty: float
+
+
+def fixed_exit_profiles() -> tuple[ReplayExitProfile, ...]:
+    return tuple(profile.validate() for profile in (
+        ReplayExitProfile("v2_80_20", 0.80, 0.20, 0.00, 0),
+        ReplayExitProfile("v2_70_30_donchian_20", 0.70, 0.15, 0.15, 20),
+        ReplayExitProfile("v2_70_30_donchian_40", 0.70, 0.15, 0.15, 40),
+        ReplayExitProfile("v2_70_30_donchian_60", 0.70, 0.15, 0.15, 60),
+    ))
+
+
+def allocate_target_quantities(current_qty: float, profile: ReplayExitProfile) -> TargetAllocation:
+    profile.validate()
+    quantity = float(current_qty)
+    if quantity <= 0.0:
+        raise ValueError("invalid_current_quantity")
+    return TargetAllocation(
+        quantity * profile.target_close_fraction,
+        quantity * profile.medium_runner_fraction,
+        quantity * profile.slow_runner_fraction,
+    )
+```
+
+- [ ] **Step 4: Implement closed-candle midpoint and favorable-only ratchet**
+
+```python
+def donchian_midpoint(closed: pd.DataFrame, period: int) -> float | None:
+    if period not in (20, 40, 60):
+        raise ValueError("invalid_donchian_period")
+    if closed is None or len(closed) < period:
+        return None
+    window = closed.tail(period)
+    return (float(window["h"].max()) + float(window["l"].min())) / 2.0
+
+
+def ratchet_stop(direction: str, current_stop: float, candidate: float) -> float:
+    if direction == "LONG":
+        return max(float(current_stop), float(candidate))
+    if direction == "SHORT":
+        return min(float(current_stop), float(candidate))
+    raise ValueError("invalid_direction")
+```
+
+- [ ] **Step 5: Run focused tests and confirm GREEN**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_profiles.py -v`
+
+Expected: all profile, allocation, midpoint, and ratchet tests pass.
+
+- [ ] **Step 6: Commit the fixed replay profiles**
+
+```powershell
+git add backtest/exit_profiles.py tests/test_exit_profiles.py
+git commit -m "feat: define Predicta exit experiment profiles"
+```
+
+---
+
+### Task 6: Freeze One Entry Cohort and Replay Every Exit Counterfactual
+
+**Files:**
+- Create: `backtest/exit_cohort.py`
+- Create: `tests/test_exit_cohort.py`
+- Modify: `backtest/engine.py`
+- Modify: `tests/test_backtest_system.py`
+
+**Interfaces:**
+- Consumes: baseline `entry_fill` events, matching 1-minute/30-minute candles, `PredictaExitRules`, one `ReplayExitProfile`, fee rate, slippage, and fold end time.
+- Produces: `freeze_entry_cohort(events) -> tuple[FrozenEntry, ...]` and `replay_exit_cohort(entries, candles_1m, candles_30m, profile, rules, fee_rate, slippage_bps, fold_end_ms) -> list[dict]`; no bot, signal scan, capacity check, file write, or exchange client is allowed.
+
+- [ ] **Step 1: Write failing cohort identity and isolation tests**
+
+Use two baseline entry events and assert `freeze_entry_cohort()` preserves these exact immutable fields: `position_id`, `symbol`, `direction`, `time`, real fill `price`, `quantity`, `initial_stop`, `risk_usdt`, `signal_key`, and entry `fee`. Pass the same cohort through all four profiles and assert every result has the same ordered `position_id` set and no `entry_fill` field differs.
+
+Add exact state-machine cases:
+
+- A 10-unit normal path at 3R emits an 8-unit target exit and a 2-unit medium runner.
+- A 10-unit B path at 3R emits 7 units and creates 1.5 medium plus 1.5 slow units.
+- After a 5-unit hard-exhaustion partial, B emits 3.5 units at 3R and creates 0.75 plus 0.75 units.
+- A LONG slow runner with a 2R floor ignores a Donchian candidate below that floor; a higher candidate ratchets upward and never loosens on later candles.
+- A SHORT fixture is the exact mirror.
+- A stop touched in the same one-minute bar as 3R is processed first.
+- Replaying a cohort never calls `evaluate_entry`, `SimBroker.open_market`, or any exchange method.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_cohort.py tests/test_backtest_system.py -v`
+
+Expected: import or attribute failures because frozen-cohort replay is absent.
+
+- [ ] **Step 3: Add the immutable frozen-entry contract**
+
+```python
+@dataclass(frozen=True)
+class FrozenEntry:
+    position_id: str
+    symbol: str
+    direction: str
+    time: int
+    price: float
+    quantity: float
+    initial_stop: float
+    risk_usdt: float
+    signal_key: str
+    entry_fee: float
+
+
+def freeze_entry_cohort(events: list[dict]) -> tuple[FrozenEntry, ...]:
+    rows = []
+    for event in events:
+        if event.get("type") != "entry_fill":
+            continue
+        row = FrozenEntry(
+            position_id=str(event["position_id"]), symbol=str(event["symbol"]),
+            direction=str(event["direction"]), time=int(event["time"]),
+            price=float(event["price"]), quantity=float(event["quantity"]),
+            initial_stop=float(event["initial_stop"]), risk_usdt=float(event["risk_usdt"]),
+            signal_key=str(event.get("signal_key", "")), entry_fee=float(event.get("fee", 0.0) or 0.0),
+        )
+        if abs(row.price - row.initial_stop) <= 0.0 or row.quantity <= 0.0:
+            raise ValueError("invalid_frozen_entry")
+        rows.append(row)
+    return tuple(sorted(rows, key=lambda row: (row.time, row.position_id)))
+```
+
+- [ ] **Step 4: Implement an independent counterfactual position state**
+
+Add a private mutable `_CounterfactualPosition` containing the frozen anchors plus `remaining_qty`, `current_stop`, `mfe_r`, `mae_r`, protection flags, exhaustion flags, target flag, `medium_qty`, `slow_qty`, `medium_stop`, `slow_stop`, `highest_price`, `lowest_price`, and `last_closed_bar_time`. Its initializer must set `risk_per_unit = abs(price - initial_stop)` and reject a mismatch between `risk_per_unit * quantity` and frozen `risk_usdt` when the absolute difference exceeds `max(1e-9, abs(risk_usdt) * 1e-9)`. Entry fees are not part of the fixed R denominator.
+
+Implement the transition order exactly:
+
+1. On every one-minute bar, evaluate existing stops adverse-first.
+2. Before 3R, update MFE/MAE, apply 0.8R and 1.2R stop protection, then allocate the fixed profile at an exact 3R reference price.
+3. On each new closed 30-minute boundary before 3R, call `evaluate_hard_exhaustion()` once; if armed and all three facts pass, close 50% of original quantity once and ratchet the survivor toward 1R only when that stop is valid relative to the boundary close.
+4. After 3R, check medium and slow stops separately on one-minute bars. At each new closed boundary, calculate ATR(14) from true range for the medium runner and the fixed Donchian midpoint for the slow runner; combine each with the 2R floor and ratchet only favorably.
+5. At fold end, close every non-zero virtual tranche at the last available one-minute close with reason `end_of_fold`.
+
+Every partial/final event must carry the frozen `position_id`, `profile`, `mfe_r`, `mae_r`, `gross_pnl`, exit fee, and fee-inclusive `net_pnl`. Exit slippage uses the existing direction-aware formula from `SimBroker._fill_price`; the frozen entry fill and entry fee are reused without charging them again.
+
+- [ ] **Step 5: Add the no-rescan cohort runner**
+
+```python
+def replay_exit_cohort(
+    entries: tuple[FrozenEntry, ...],
+    candles_1m: dict[str, pd.DataFrame],
+    candles_30m: dict[str, pd.DataFrame],
+    profile: ReplayExitProfile,
+    rules: PredictaExitRules,
+    fee_rate: float,
+    slippage_bps: float,
+    fold_end_ms: int,
+) -> list[dict]:
+    events: list[dict] = []
+    for entry in entries:
+        events.append(entry.as_event(profile.name))
+        events.extend(replay_frozen_entry(
+            entry=entry,
+            candles_1m=candles_1m[entry.symbol],
+            candles_30m=candles_30m[entry.symbol],
+            profile=profile,
+            rules=rules,
+            fee_rate=fee_rate,
+            slippage_bps=slippage_bps,
+            fold_end_ms=fold_end_ms,
+        ))
+    return sorted(events, key=lambda event: (int(event["time"]), str(event["position_id"]), event["type"]))
+```
+
+`FrozenEntry.as_event()` must reproduce the original baseline entry event values, including the original entry fee. `replay_frozen_entry()` may read only rows with `entry.time <= ot < fold_end_ms`; the 30-minute frame may include earlier rows solely as indicator warmup and must exclude any candle whose close time is later than the current replay time.
+
+- [ ] **Step 6: Add baseline parity and lookahead tests**
+
+For `v2_80_20`, compare the counterfactual exit quantities/reasons/R totals with Task 4's V2 engine on a deterministic fixture. Assert equality. Append a future 30-minute candle with an extreme high/low and assert all earlier events remain byte-for-byte identical.
+
+- [ ] **Step 7: Run focused tests and confirm GREEN**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_profiles.py tests/test_exit_cohort.py tests/test_strategy_core.py tests/test_backtest_system.py -v`
+
+Expected: all tests pass; all profiles share one frozen cohort, baseline parity holds, and future candles cannot change past events.
+
+- [ ] **Step 8: Commit frozen-cohort replay**
+
+```powershell
+git add backtest/exit_cohort.py backtest/engine.py tests/test_exit_cohort.py tests/test_backtest_system.py
+git commit -m "feat: replay exit profiles on frozen entries"
+```
+
+---
+
+### Task 7: Generate the Three-Fold Qualification Report
+
+**Files:**
+- Create: `backtest/exit_comparison.py`
+- Create: `tests/test_exit_comparison.py`
+- Modify: `backtest/metrics.py`
+- Modify: `backtest/cli.py`
+- Modify: `tests/test_backtest_system.py`
+
+**Interfaces:**
+- Consumes: one `ExperimentSpec`, the four fixed profile event streams for `train`, `validation`, and `test`, and their frozen cohort hashes.
+- Produces: `compare_exit_profiles(fold_results, minimum_trades=100, max_drawdown_worsening=0.10) -> dict` plus `replay_engine.py compare-exits`; output is a report only and cannot mutate configuration.
+
+- [ ] **Step 1: Write failing metric and qualification tests**
+
+Extend grouped metrics with `gross_win_r`, `gross_loss_r`, `reach_5r`, `reach_5r_rate`, and `profit_contribution_5r`. `gross_loss_r` is the absolute sum of negative R. `profit_contribution_5r` is the percentage of positive aggregate R contributed by original positions whose lifecycle MFE reached at least 5R; return `0.0` when positive aggregate R is zero.
+
+Create table-driven qualification fixtures and assert:
+
+```python
+self.assertEqual(report["minimum_trades"], 100)
+self.assertEqual(report["max_drawdown_worsening_limit"], 0.10)
+self.assertTrue(report["profiles"]["v2_70_30_donchian_40"]["eligible"])
+self.assertEqual(report["recommended_profile"], "v2_70_30_donchian_40")
+self.assertFalse(report["auto_deploy"])
+```
+
+Add one failing case for each gate: 99 trades, mean R not strictly higher, profit factor not strictly higher, only one winning fold, and 10.01% drawdown worsening. Assert exactly 10% passes. If baseline drawdown is zero, assert only zero candidate drawdown passes. Treat `profit_factor=None` as positive infinity only when the profile has positive gross R and zero gross loss; two infinite profit factors are equal, so the candidate does not strictly beat baseline.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_comparison.py tests/test_backtest_system.py -v`
+
+Expected: failures because comparison metrics and command are absent.
+
+- [ ] **Step 3: Implement exact eligibility and tie-breaking**
+
+```python
+def relative_drawdown_worsening(baseline: float, candidate: float) -> float:
+    base = abs(float(baseline))
+    other = abs(float(candidate))
+    if base == 0.0:
+        return 0.0 if other == 0.0 else float("inf")
+    return (other - base) / base
+
+
+def profit_factor_score(metrics: dict) -> float:
+    value = metrics.get("profit_factor")
+    if value is not None:
+        return float(value)
+    gross_win = float(metrics.get("gross_win_r", 0.0) or 0.0)
+    gross_loss = float(metrics.get("gross_loss_r", 0.0) or 0.0)
+    return float("inf") if gross_win > 0.0 and gross_loss == 0.0 else 0.0
+
+
+def candidate_is_eligible(base: dict, candidate: dict, fold_wins: int) -> tuple[bool, list[str]]:
+    failures = []
+    if int(candidate["trades"]) < 100:
+        failures.append("sample_below_100")
+    if float(candidate["mean_r"]) <= float(base["mean_r"]):
+        failures.append("mean_r_not_higher")
+    if profit_factor_score(candidate) <= profit_factor_score(base):
+        failures.append("profit_factor_not_higher")
+    if int(fold_wins) < 2:
+        failures.append("fewer_than_two_winning_folds")
+    if relative_drawdown_worsening(base["max_drawdown_r"], candidate["max_drawdown_r"]) > 0.10:
+        failures.append("drawdown_worsening_above_10pct")
+    return not failures, failures
+```
+
+Select only eligible B profiles, sorting by descending aggregate `mean_r`, then ascending absolute `max_drawdown_r`, then profile name for deterministic output. Never recommend `v2_80_20` as an experimental winner; return `recommended_profile=None` when no B profile qualifies.
+
+- [ ] **Step 4: Add the read-only `compare-exits` command**
+
+The command must:
+
+1. Validate and freeze the supplied `ExperimentSpec` before reading results.
+2. Use `train`, `validation`, and `test` as three fixed non-overlapping reporting folds; profiles and periods are never tuned between folds.
+3. Run the normal V2 baseline engine once per fold and freeze its entry cohort.
+4. Hash the canonical frozen cohort JSON and pass that same cohort to all four profiles.
+5. Write `events/<fold>/<profile>.jsonl`, `metrics/<fold>/<profile>.json`, `cohorts/<fold>.json`, and one `exit_comparison.json` beneath a content-addressed run directory.
+6. Include input fingerprints, manifest hash, cohort hashes, fees, slippage, per-fold metrics, aggregate metrics, every failed gate, the deterministic recommendation, `auto_deploy=false`, and `limitations=["frozen_entry_counterfactual_does_not_model_profile_specific_capacity"]`.
+7. Refuse to run if the experiment uses fewer or more than the four fixed profiles or if any cohort hash differs across profiles in a fold.
+
+Add parser arguments matching existing portfolio replay inputs: `--root`, `--symbols`, `--experiment`, `--output`, and `--workers`. Do not add a configuration-write option.
+
+- [ ] **Step 5: Run command and metrics tests and confirm GREEN**
+
+Run: `$env:PYTHONPATH=(Get-Location).Path; python tests/test_exit_profiles.py tests/test_exit_cohort.py tests/test_exit_comparison.py tests/test_backtest_system.py -v`
+
+Expected: all tests pass; reports are deterministic, cohort hashes match inside each fold, and no configuration file changes.
+
+- [ ] **Step 6: Commit the qualification report**
+
+```powershell
+git add backtest/exit_comparison.py backtest/metrics.py backtest/cli.py tests/test_exit_comparison.py tests/test_backtest_system.py
+git commit -m "feat: report Predicta exit profile comparison"
+```
+
+---
+
+### Task 8: Group Live Trade Statistics by Original Position
 
 **Files:**
 - Create: `trade_metrics.py`
@@ -684,7 +1047,7 @@ git commit -m "fix: group partial exits as one trade"
 
 ---
 
-### Task 6: Complete Local Verification
+### Task 9: Complete Local Verification
 
 **Files:**
 - Verify: `predicta_exit.py`
@@ -703,7 +1066,7 @@ git commit -m "fix: group partial exits as one trade"
 Run:
 
 ```powershell
-python -m py_compile predicta_exit.py trade_metrics.py trader.py strategy_core.py backtest\engine.py backtest\metrics.py web_ui.py admin_server.py
+python -m py_compile predicta_exit.py trade_metrics.py trader.py strategy_core.py backtest\engine.py backtest\metrics.py backtest\exit_profiles.py backtest\exit_cohort.py backtest\exit_comparison.py backtest\cli.py web_ui.py admin_server.py
 ```
 
 Expected: exit code 0 with no output.
@@ -714,11 +1077,11 @@ Run: `$env:PYTHONPATH=(Get-Location).Path; python -m unittest discover -s tests 
 
 Expected: all tests pass with zero failures or errors.
 
-- [ ] **Step 3: Run a deterministic V1-versus-V2 portfolio replay**
+- [ ] **Step 3: Run the frozen-cohort three-fold exit comparison**
 
-Use the same frozen candles, entry decisions, initial equity, fees, slippage, and position slots for both profiles. Save or print only aggregate metrics: trades, mean/median R, 3R reach rate, hard-exhaustion count, hard-exhaustion recovery rate, profit factor, max drawdown R, and mean MFE giveback R.
+Run the new `compare-exits` command with the frozen Predicta experiment manifest and symbol list. Verify that all four profiles have the same cohort hash within each fold and that `exit_comparison.json` contains aggregate/per-fold trades, mean/median R, profit factor, max drawdown R, 3R/5R reach, 5R profit contribution, hard-exhaustion recovery, MFE giveback, every qualification gate, and `auto_deploy=false`.
 
-Expected: both runs complete without lookahead errors. Report the measured values without claiming statistical advantage from an insufficient sample.
+Expected: the run completes without lookahead or reconciliation errors. If aggregate completed trades are below 100, status is `SAMPLE_NOT_READY` and no profile qualifies. Otherwise report the exact measured values and deterministic eligibility result without modifying demo configuration.
 
 - [ ] **Step 4: Check scope, whitespace, and worktree state**
 
@@ -728,36 +1091,42 @@ Expected: no whitespace errors and only intentional files/commits appear.
 
 ---
 
-### Task 7: Back Up, Deploy Demo V2, Verify, and Record Progress
+### Task 10: Decision Gate, Then Back Up and Deploy an Approved Demo Profile
 
 **Files:**
 - Deploy: `predicta_exit.py` to `<deploy-dir>/predicta_exit.py`
 - Deploy: `trade_metrics.py` to `<deploy-dir>/trade_metrics.py`
 - Deploy: `trader.py` to `<deploy-dir>/trader.py`
 - Deploy: `strategy_core.py` to `<deploy-dir>/strategy_core.py`
-- Deploy: `backtest/engine.py` to `<deploy-dir>/backtest/engine.py`
-- Deploy: `backtest/metrics.py` to `<deploy-dir>/backtest/metrics.py`
 - Preserve and merge: `<deploy-dir>/demo_bot_config.json`
 - Preserve: `<deploy-dir>/positions_<uid>.json`
 - Modify locally after deployment: `PROGRESS.md`
 
 **Interfaces:**
 - Consumes: verified local commits, SSH key `<ssh-key>`, server `root@<production-host>`, and systemd services `macd-bot`/`macd-admin`.
-- Produces: V2 enabled only for demo positions opened after deployment, unchanged existing positions, active services, matching hashes, and recorded deployment evidence.
+- Produces: either a deliberate no-deploy handoff or the explicitly approved 80/20 V2 profile enabled only for demo positions opened after deployment, with unchanged existing positions, active services, matching hashes, and recorded deployment evidence.
 
-- [ ] **Step 1: Capture a non-secret pre-deploy snapshot**
+- [ ] **Step 1: Enforce the report and approval gate**
+
+Read `exit_comparison.json` and stop before any SSH, backup, upload, config write, or service restart unless the user has explicitly approved a deployable profile after seeing the report.
+
+- If a 70/30 profile qualifies and the user selects it, stop this plan and write a separate design for real order quantities, two protective stops/tranches, persistence, restart recovery, and exchange reconciliation. The replay-only implementation is not deployable.
+- If no 70/30 profile qualifies, the 80/20 baseline may be deployed only after the user explicitly approves that fallback.
+- If fewer than 100 completed trades exist, report `SAMPLE_NOT_READY` and do not deploy either profile.
+
+- [ ] **Step 2: Capture a non-secret pre-deploy snapshot**
 
 Record service states, demo running/source/mode, position symbols/quantities/entry times/version fields, active stop IDs, and only boolean API credential-presence flags. Do not print key or secret contents.
 
-- [ ] **Step 2: Create a timestamped server backup**
+- [ ] **Step 3: Create a timestamped server backup**
 
 Back up all runtime files being replaced plus `demo_bot_config.json` and `positions_<uid>.json` into `<deploy-dir>/backups/predicta_v2_exit_<timestamp>/`. Print the resolved backup path and file list before uploading.
 
-- [ ] **Step 3: Upload runtime files only**
+- [ ] **Step 4: Upload runtime files only**
 
-Upload the six runtime files to their matching server paths. Do not upload tests, specs, plans, `PROGRESS.md`, local configuration wholesale, or memory files.
+Upload only `predicta_exit.py`, `trade_metrics.py`, `trader.py`, and `strategy_core.py` to their matching server paths. Do not upload replay-only `backtest/exit_profiles.py`, `backtest/exit_cohort.py`, `backtest/exit_comparison.py`, tests, specs, plans, `PROGRESS.md`, local configuration wholesale, or memory files.
 
-- [ ] **Step 4: Merge only the demo version flag**
+- [ ] **Step 5: Merge only the approved baseline demo version flag**
 
 Run a server-side JSON merge that preserves every existing field and credential, changing only:
 
@@ -767,25 +1136,25 @@ Run a server-side JSON merge that preserves every existing field and credential,
 
 Re-read and print only the new version, `entry_signal_source`, `predicta_choppy_filter_mode`, and credential-presence booleans.
 
-- [ ] **Step 5: Compile and restart the trading service**
+- [ ] **Step 6: Compile and restart the trading service**
 
 Run server-side Python compilation for all deployed modules, restart `macd-bot`, and query both services.
 
 Expected: compilation succeeds and `macd-bot` plus `macd-admin` both report `active`.
 
-- [ ] **Step 6: Verify version isolation and position continuity**
+- [ ] **Step 7: Verify version isolation and position continuity**
 
 After restart, compare the pre/post position symbol, quantity, entry time, and stop ID snapshots. Existing positions must still have V1 semantics; the runtime config must report Predicta source and profile version 2. No position may be closed, resized, or migrated by deployment.
 
-- [ ] **Step 7: Run non-ordering server probes**
+- [ ] **Step 8: Run non-ordering server probes**
 
 Run a pure evaluator probe for both LONG and SHORT synthetic closed frames and a persistence reload probe. Verify EWO zero-color boundaries, 2-of-3 rejection, 3-of-3 hard exhaustion, V1 fallback, and V2 round-trip without sending exchange orders.
 
-- [ ] **Step 8: Verify hashes and stop/order health**
+- [ ] **Step 9: Verify hashes and stop/order health**
 
 Compare SHA256 for every deployed runtime file. Confirm current exchange positions have exactly one valid protective stop each or record and repair any pre-existing missing stop through the existing idempotent stop path.
 
-- [ ] **Step 9: Update and commit `PROGRESS.md`**
+- [ ] **Step 10: Update and commit `PROGRESS.md`**
 
 Record: design/plan commits, implementation commits, exact tests and totals, replay outputs, backup path, deployed files/hashes, JSON merge action, service status, non-secret credential checks, pre/post position continuity, version-isolation proof, and server probe results.
 
@@ -794,7 +1163,7 @@ git add PROGRESS.md
 git commit -m "docs: record Predicta V2 exit deployment"
 ```
 
-- [ ] **Step 10: Perform final verification**
+- [ ] **Step 11: Perform final verification**
 
 Re-run the complete local suite and compilation, `git diff --check`, `git status --short`, service status, runtime source/profile, position/stop continuity, and deployed hashes.
 
