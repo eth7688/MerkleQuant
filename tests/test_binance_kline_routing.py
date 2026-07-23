@@ -147,6 +147,7 @@ class BinanceKlineRoutingTest(unittest.TestCase):
             market_type="futures",
             testnet=True,
             enable_time_stop=False,
+            half_risk_trigger_r=0.5,
             enable_early_protect=True,
             early_protect_r=0.8,
             early_protect_lock_r=0.0,
@@ -185,6 +186,8 @@ class BinanceKlineRoutingTest(unittest.TestCase):
 
         self.assertIsNone(reason)
         self.assertFalse(position.breakeven_triggered)
+        self.assertFalse(position.half_risk_protected)
+        self.assertEqual(position.current_sl, position.initial_sl)
         self.assertEqual(position.excursion_price_source, "")
         self.assertLess(position.max_favorable_r, cfg.early_protect_r)
 

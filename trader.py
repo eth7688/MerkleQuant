@@ -198,6 +198,7 @@ class TradeConfig:
     # 风控 — 止损/止盈
     atr_mult_sl: float = 0.5           # SL额外偏移(ATR倍数), 0=纯均线边缘
     # 三阶止盈参数
+    half_risk_trigger_r: float = 0.0   # >0启用: 达阈值后把初始1R风险收窄到0.5R
     enable_early_protect: bool = True  # 提前保护: 未到1.2R前先保本
     early_protect_r: float = 0.8       # 提前保护触发R
     early_protect_lock_r: float = 0.0  # 提前保护锁定R, 0=SL推到入场价
@@ -1065,6 +1066,7 @@ class Position:
     signal_score: float     # 入场时评分
     initial_band_hi: float  # 入场时均线上轨
     initial_band_lo: float  # 入场时均线下轨
+    half_risk_protected: bool = False
     breakeven_triggered: bool = False
     breakeven_cooldown: int = 0  # 保本后冷却计数, 防秒碰止损
     partial_tp_triggered: bool = False  # 2.0R减仓50%已执行
@@ -4967,6 +4969,7 @@ class SqueezeBreakoutBot:
                     "sl_price": p.sl_price, "current_sl": p.current_sl,
                     "risk_usdt": p.risk_usdt, "signal_score": p.signal_score,
                     "entry_time": p.entry_time.isoformat() if p.entry_time else "",
+                    "half_risk_protected": bool(getattr(p, "half_risk_protected", False)),
                     "breakeven_triggered": p.breakeven_triggered,
                     "breakeven_cooldown": p.breakeven_cooldown,
                     "partial_tp_triggered": p.partial_tp_triggered,
@@ -5037,6 +5040,7 @@ class SqueezeBreakoutBot:
                     initial_band_hi=d.get("initial_band_hi", d["entry_price"]*1.02),
                     initial_band_lo=d.get("initial_band_lo", d["entry_price"]*0.98),
                 )
+                pos.half_risk_protected = bool(d.get("half_risk_protected", False))
                 pos.breakeven_triggered = d.get("breakeven_triggered", False)
                 pos.breakeven_cooldown = d.get("breakeven_cooldown", 0)
                 pos.partial_tp_triggered = d.get("partial_tp_triggered", False)
@@ -5209,6 +5213,9 @@ class SqueezeBreakoutBot:
                                 initial_band_hi=entry_price*1.02, initial_band_lo=entry_price*0.98,
                                 source_interval=restore_interval,
                             )
+                            pos.half_risk_protected = bool(
+                                getattr(matched_local, "half_risk_protected", False)
+                            ) if matched_local else False
                             pos.breakeven_triggered = breached
                             pos.breakeven_cooldown = matched_local.breakeven_cooldown if (breached and matched_local) else 0
                             pos.partial_tp_triggered = getattr(matched_local, 'partial_tp_triggered', False) if matched_local else False
@@ -6771,8 +6778,11 @@ class SqueezeBreakoutBot:
                     )
                     if reason:
                         return reason
-                early_protect_on = bool(getattr(self.cfg, 'enable_early_protect', True))
-                if quick_r is None and not early_protect_on:
+                protection_on = (
+                    bool(getattr(self.cfg, "enable_early_protect", True))
+                    or float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0) > 0
+                )
+                if quick_r is None and not protection_on:
                     reason = self._time_stop_exit_decision(
                         pos, inv, elapsed_bars, None, min_progress_r, "local_timer"
                     )
@@ -6893,14 +6903,126 @@ class SqueezeBreakoutBot:
             if adverse_r - old_adverse_r >= 0.05:
                 self._save_positions()
 
+        half_trigger_r = max(
+            0.0,
+            float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+        )
+        early_trigger_r = max(
+            0.1,
+            float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
+        )
+        protect_r = max(
+            float(r_multiple),
+            float(favorable_r),
+            float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+        )
+
+        if (
+            half_trigger_r > 0
+            and not pos.partial_tp_triggered
+            and initial_risk > 0
+            and pos.quantity > 0
+            and protect_r >= half_trigger_r
+            and protect_r < early_trigger_r
+        ):
+            desired_sl = (
+                pos.entry_price - initial_risk * 0.5
+                if pos.direction == "LONG"
+                else pos.entry_price + initial_risk * 0.5
+            )
+            should_move = (
+                (pos.direction == "LONG" and desired_sl > pos.current_sl)
+                or (pos.direction == "SHORT" and desired_sl < pos.current_sl)
+            )
+            already_tighter = (
+                (pos.direction == "LONG" and pos.current_sl >= desired_sl)
+                or (pos.direction == "SHORT" and pos.current_sl <= desired_sl)
+            )
+            valid_price_side = (
+                (pos.direction == "LONG" and desired_sl < current_price)
+                or (pos.direction == "SHORT" and desired_sl > current_price)
+            )
+            if should_move and not valid_price_side:
+                self._log.warning(
+                    f"半损保护跳过: {symbol} action=invalid_price_side "
+                    f"current={current_price:.4f} target={desired_sl:.4f}"
+                )
+            elif should_move:
+                old_sl = pos.current_sl
+                applied = self.client is None
+                stop_result = None
+                if self.client is not None:
+                    self.client.cancel_all_orders(symbol)
+                    sl_side = "SELL" if pos.direction == "LONG" else "BUY"
+                    stop_result = self.client.stop_order(
+                        symbol,
+                        sl_side,
+                        round(desired_sl, 8),
+                        round(pos.quantity, 8),
+                        tracking_no=pos.tracking_no,
+                    )
+                    if bool(getattr(self.cfg, "testnet", False)):
+                        applied = True
+                    elif str(getattr(self.cfg, "exchange", "")).lower() == "bitget":
+                        if pos.tracking_no:
+                            applied = stop_result is not None
+                        else:
+                            applied = (
+                                isinstance(stop_result, dict)
+                                and (
+                                    stop_result.get("code") == "00000"
+                                    or bool(stop_result.get("orderId"))
+                                )
+                            )
+                    else:
+                        applied = bool(stop_result)
+                if applied:
+                    pos.current_sl = desired_sl
+                    pos.half_risk_protected = True
+                    self._log.info(
+                        f"半损保护: {symbol} ({inv}) MFE={protect_r:.2f}R>={half_trigger_r:.2f}R "
+                        f"SL {old_sl:.4f}->{pos.current_sl:.4f} 最大亏损收窄至0.50R"
+                    )
+                    self._append_signal_event("position_protect", symbol, {
+                        "symbol": symbol,
+                        "direction": pos.direction,
+                        "interval": inv,
+                        "reason": "half_risk_protect",
+                        "entry": round(float(pos.entry_price), 8),
+                        "initial_sl": round(float(pos.initial_sl), 8),
+                        "current_price": round(float(current_price), 8),
+                        "old_sl": round(float(old_sl), 8),
+                        "new_sl": round(float(pos.current_sl), 8),
+                        "r": round(float(r_multiple), 4),
+                        "protect_r": round(float(protect_r), 4),
+                        "mfe_r": round(float(getattr(pos, "max_favorable_r", 0.0)), 4),
+                        "mae_r": round(float(getattr(pos, "max_adverse_r", 0.0)), 4),
+                        "trigger_r": half_trigger_r,
+                        "lock_r": -0.5,
+                        "action": "half_risk_applied",
+                        "quantity": round(float(pos.quantity), 8),
+                        "signal_key": getattr(pos, "signal_key", ""),
+                    })
+                    self._save_positions()
+                else:
+                    self._log.error(
+                        f"半损保护待重试: {symbol} action=retry_pending SL保持{old_sl:.4f}, "
+                        f"目标{desired_sl:.4f}, stop_result={stop_result}"
+                    )
+            elif already_tighter and not pos.half_risk_protected:
+                pos.half_risk_protected = True
+                self._log.info(
+                    f"半损保护状态恢复: {symbol} action=already_tighter "
+                    f"current_sl={pos.current_sl:.4f} target={desired_sl:.4f}"
+                )
+                self._save_positions()
+
         # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
         if (getattr(self.cfg, 'enable_early_protect', True)
                 and not pos.partial_tp_triggered
                 and initial_risk > 0
                 and pos.quantity > 0):
-            early_trigger_r = max(0.1, float(getattr(self.cfg, 'early_protect_r', 0.8) or 0.8))
             early_lock_r = max(0.0, float(getattr(self.cfg, 'early_protect_lock_r', 0.0) or 0.0))
-            protect_r = max(float(r_multiple), float(favorable_r), float(getattr(pos, 'max_favorable_r', 0.0) or 0.0))
             if protect_r >= early_trigger_r:
                 desired_sl = (
                     pos.entry_price + initial_risk * early_lock_r
@@ -6914,6 +7036,7 @@ class SqueezeBreakoutBot:
                 if should_move:
                     old_sl = pos.current_sl
                     pos.current_sl = desired_sl
+                    pos.half_risk_protected = True
                     pos.breakeven_triggered = True
                     pos.breakeven_cooldown = 3
                     self._log.info(
@@ -6950,6 +7073,7 @@ class SqueezeBreakoutBot:
                     (pos.direction == 'LONG' and pos.current_sl >= desired_sl) or
                     (pos.direction == 'SHORT' and pos.current_sl <= desired_sl)
                 ):
+                    pos.half_risk_protected = True
                     pos.breakeven_triggered = True
                     pos.breakeven_cooldown = 3
                     self._save_positions()
