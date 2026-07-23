@@ -58,6 +58,9 @@ def make_position(direction):
 
 
 class FailedStopClient:
+    def __init__(self):
+        self.stop_calls = []
+
     def get_positions(self):
         return []
 
@@ -65,12 +68,34 @@ class FailedStopClient:
         return {}
 
     def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
+        self.stop_calls.append((symbol, side, stop_price, quantity, tracking_no))
         return None
 
 
 class SuccessfulTrackingStopClient(FailedStopClient):
     def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
         return {}
+
+
+class RestartSyncClient:
+    def __init__(self, direction):
+        self.direction = direction
+        self.stop_calls = []
+        self._active_stop_ids = {}
+
+    def get_positions(self):
+        return [{
+            "symbol": f"{self.direction}USDT",
+            "positionAmt": 1.0 if self.direction == "LONG" else -1.0,
+            "entryPrice": 100.0,
+            "markPrice": 101.0,
+            "unRealizedProfit": 1.0,
+            "openTime": "",
+        }]
+
+    def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
+        self.stop_calls.append((symbol, side, stop_price, quantity, tracking_no))
+        return {"orderId": f"stop-{len(self.stop_calls)}"}
 
 
 class HalfRiskProtectionTest(unittest.TestCase):
@@ -113,6 +138,18 @@ class HalfRiskProtectionTest(unittest.TestCase):
             self.assertEqual(position.current_sl, 90.0)
             self.assertFalse(position.half_risk_protected)
 
+    def test_disabled_early_protection_does_not_suppress_half_risk_stage(self):
+        bot = self.make_bot()
+        bot.cfg.enable_early_protect = False
+        position = make_position("LONG")
+
+        with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.9)):
+            bot.check_exit(position)
+
+        self.assertEqual(position.current_sl, 95.0)
+        self.assertTrue(position.half_risk_protected)
+        self.assertFalse(position.breakeven_triggered)
+
     def test_existing_tighter_stop_never_moves_back(self):
         bot = self.make_bot()
         position = make_position("LONG")
@@ -134,6 +171,19 @@ class HalfRiskProtectionTest(unittest.TestCase):
 
         self.assertEqual(position.current_sl, 90.0)
         self.assertFalse(position.half_risk_protected)
+
+    def test_testnet_uses_internal_stop_when_exchange_returns_none(self):
+        bot = self.make_bot()
+        bot.cfg.testnet = True
+        bot.client = FailedStopClient()
+        position = make_position("LONG")
+
+        with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.5)):
+            bot.check_exit(position)
+
+        self.assertEqual(len(bot.client.stop_calls), 1)
+        self.assertEqual(position.current_sl, 95.0)
+        self.assertTrue(position.half_risk_protected)
 
     def test_bitget_tracking_stop_accepts_non_none_data_as_success(self):
         bot = self.make_bot()
@@ -185,6 +235,37 @@ class HalfRiskProtectionTest(unittest.TestCase):
 
         self.assertEqual(restored[0].current_sl, 95.0)
         self.assertTrue(restored[0].half_risk_protected)
+
+    def test_restart_sync_rebuilds_half_risk_stop_before_any_rehang(self):
+        cases = (
+            ("LONG", 90.0, 95.0),
+            ("SHORT", 110.0, 105.0),
+            ("LONG", 98.0, 98.0),
+            ("SHORT", 102.0, 102.0),
+        )
+        for direction, saved_sl, expected in cases:
+            with self.subTest(direction=direction, saved_sl=saved_sl), TemporaryDirectory() as directory:
+                path = str(Path(directory) / "positions.json")
+                writer = self.make_bot()
+                stale = make_position(direction)
+                stale.current_sl = saved_sl
+                stale.max_favorable_r = 0.6
+                writer.positions = [stale]
+                writer._positions_path = path
+                writer._save_positions()
+
+                restarted = self.make_bot()
+                restarted._positions_path = path
+                restarted.client = RestartSyncClient(direction)
+                restarted._sync_positions()
+
+                self.assertEqual(restarted.positions[0].current_sl, expected)
+                self.assertTrue(restarted.positions[0].half_risk_protected)
+                self.assertGreater(len(restarted.client.stop_calls), 0)
+                self.assertTrue(all(call[2] == expected for call in restarted.client.stop_calls))
+                reloaded = restarted._load_positions()
+                self.assertEqual(reloaded[0].current_sl, expected)
+                self.assertTrue(reloaded[0].half_risk_protected)
 
 
 if __name__ == "__main__":

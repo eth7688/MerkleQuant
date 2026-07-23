@@ -5195,6 +5195,31 @@ class SqueezeBreakoutBot:
                                     et = datetime.fromtimestamp(open_ms/1000, tz=timezone.utc) + timedelta(hours=8)
                             except:
                                 pass
+                            initial_sl_price = getattr(matched_local, 'initial_sl', 0.0) if matched_local else 0.0
+                            if not initial_sl_price:
+                                initial_sl_price = sl_price
+                            restored_half_risk = False
+                            half_trigger_r = max(
+                                0.0,
+                                float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+                            )
+                            persisted_mfe_r = float(
+                                getattr(matched_local, "max_favorable_r", 0.0) or 0.0
+                            ) if matched_local else 0.0
+                            if half_trigger_r > 0 and persisted_mfe_r >= half_trigger_r and initial_sl_price > 0:
+                                initial_risk = abs(entry_price - initial_sl_price)
+                                if initial_risk > 0:
+                                    half_risk_sl = (
+                                        entry_price - initial_risk * 0.5
+                                        if direction == "LONG"
+                                        else entry_price + initial_risk * 0.5
+                                    )
+                                    sl_price = (
+                                        max(float(sl_price), half_risk_sl)
+                                        if direction == "LONG"
+                                        else min(float(sl_price), half_risk_sl)
+                                    )
+                                    restored_half_risk = True
                             # 计算实际风险 (qty × SL距离), 超标时用配置风险做保本/锁利参考
                             actual_risk = qty * abs(entry_price - sl_price)
                             sync_risk = self.get_risk_for_interval(restore_interval)
@@ -5202,9 +5227,6 @@ class SqueezeBreakoutBot:
                             if actual_risk > sync_risk * 1.1:
                                 self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
                                                 f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
-                            initial_sl_price = getattr(matched_local, 'initial_sl', 0.0) if matched_local else 0.0
-                            if not initial_sl_price:
-                                initial_sl_price = sl_price
                             pos = Position(
                                 symbol=symbol, direction=direction, entry_price=entry_price,
                                 entry_time=et, quantity=qty,
@@ -5213,9 +5235,10 @@ class SqueezeBreakoutBot:
                                 initial_band_hi=entry_price*1.02, initial_band_lo=entry_price*0.98,
                                 source_interval=restore_interval,
                             )
-                            pos.half_risk_protected = bool(
-                                getattr(matched_local, "half_risk_protected", False)
-                            ) if matched_local else False
+                            pos.half_risk_protected = restored_half_risk or (
+                                bool(getattr(matched_local, "half_risk_protected", False))
+                                if matched_local else False
+                            )
                             pos.breakeven_triggered = breached
                             pos.breakeven_cooldown = matched_local.breakeven_cooldown if (breached and matched_local) else 0
                             pos.partial_tp_triggered = getattr(matched_local, 'partial_tp_triggered', False) if matched_local else False
@@ -6911,6 +6934,7 @@ class SqueezeBreakoutBot:
             0.1,
             float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
         )
+        early_protect_on = bool(getattr(self.cfg, "enable_early_protect", True))
         protect_r = max(
             float(r_multiple),
             float(favorable_r),
@@ -6923,7 +6947,7 @@ class SqueezeBreakoutBot:
             and initial_risk > 0
             and pos.quantity > 0
             and protect_r >= half_trigger_r
-            and protect_r < early_trigger_r
+            and (not early_protect_on or protect_r < early_trigger_r)
         ):
             desired_sl = (
                 pos.entry_price - initial_risk * 0.5
@@ -7018,7 +7042,7 @@ class SqueezeBreakoutBot:
                 self._save_positions()
 
         # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
-        if (getattr(self.cfg, 'enable_early_protect', True)
+        if (early_protect_on
                 and not pos.partial_tp_triggered
                 and initial_risk > 0
                 and pos.quantity > 0):
