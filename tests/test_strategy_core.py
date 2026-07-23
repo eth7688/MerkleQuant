@@ -121,6 +121,51 @@ class StrategyCoreTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "hist_win_rate_low")
 
+    def test_half_risk_stage_is_symmetric_and_does_not_lock_profit(self):
+        rules = ExitRules(half_risk_trigger_r=0.5)
+
+        long_pos = PositionState("LONGUSDT", "LONG", 100.0, 90.0, 1.0)
+        long_pos, long_events = advance_position(
+            long_pos,
+            {"ot": 1, "o": 100.0, "h": 105.0, "l": 100.0, "c": 104.0},
+            rules,
+        )
+        self.assertEqual([(event.reason, event.price) for event in long_events], [("half_risk_protect", 95.0)])
+        self.assertTrue(long_pos.half_risk_protected)
+        self.assertFalse(long_pos.early_protected)
+
+        short_pos = PositionState("SHORTUSDT", "SHORT", 100.0, 110.0, 1.0)
+        short_pos, short_events = advance_position(
+            short_pos,
+            {"ot": 2, "o": 100.0, "h": 100.0, "l": 95.0, "c": 96.0},
+            rules,
+        )
+        self.assertEqual([(event.reason, event.price) for event in short_events], [("half_risk_protect", 105.0)])
+        self.assertTrue(short_pos.half_risk_protected)
+        self.assertFalse(short_pos.early_protected)
+
+    def test_half_risk_stage_is_disabled_below_or_at_zero(self):
+        for trigger in (0.0, -0.5):
+            position = PositionState("TESTUSDT", "LONG", 100.0, 90.0, 1.0)
+            position, events = advance_position(
+                position,
+                {"ot": 1, "o": 100.0, "h": 106.0, "l": 100.0, "c": 105.0},
+                ExitRules(half_risk_trigger_r=trigger),
+            )
+            self.assertEqual(events, [])
+            self.assertEqual(position.current_stop, 90.0)
+
+    def test_breakeven_stage_wins_when_one_bar_crosses_both_thresholds(self):
+        position = PositionState("TESTUSDT", "LONG", 100.0, 90.0, 1.0)
+        position, events = advance_position(
+            position,
+            {"ot": 1, "o": 100.0, "h": 108.0, "l": 100.0, "c": 107.0},
+            ExitRules(half_risk_trigger_r=0.5, early_protect_r=0.8, early_lock_r=0.0),
+        )
+        self.assertEqual([(event.reason, event.price) for event in events], [("early_protect", 100.0)])
+        self.assertTrue(position.half_risk_protected)
+        self.assertTrue(position.early_protected)
+
     def test_exit_state_machine_protects_then_partially_exits(self):
         position = PositionState("TESTUSDT", "LONG", 100.0, 98.0, 1.0)
         rules = ExitRules(early_protect_r=0.8, early_lock_r=0.0, tier1_r=1.2, tier2_r=1.7)
