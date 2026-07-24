@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -116,6 +117,23 @@ class SequencedStopClient(FailedStopClient):
         return self.results.pop(0)
 
 
+class BitgetRollbackClient(FailedStopClient):
+    def __init__(self):
+        super().__init__()
+        self._active_stop_ids = {"LONGUSDT": "old-id"}
+
+    def cancel_all_orders(self, symbol):
+        self._active_stop_ids.pop(symbol, None)
+        return {"code": "00000"}
+
+    def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
+        self.stop_calls.append((symbol, side, stop_price, quantity, tracking_no))
+        if len(self.stop_calls) == 1:
+            return None
+        self._active_stop_ids[symbol] = "rollback-id"
+        return {"orderId": "rollback-id"}
+
+
 class HalfRiskProtectionTest(unittest.TestCase):
     def make_bot(self, trigger=0.5):
         return SqueezeBreakoutBot(TradeConfig(
@@ -201,6 +219,29 @@ class HalfRiskProtectionTest(unittest.TestCase):
         self.assertEqual([call[2] for call in bot.client.stop_calls], [95.0, 90.0])
         self.assertEqual(position.current_sl, 90.0)
         self.assertFalse(position.half_risk_protected)
+
+    def test_bitget_rollback_persists_and_restores_new_active_stop_id(self):
+        bot = self.make_bot()
+        bot.cfg.exchange = "bitget"
+        bot.client = BitgetRollbackClient()
+        position = make_position("LONG")
+        bot.positions = [position]
+
+        with TemporaryDirectory() as directory:
+            bot._positions_path = str(Path(directory) / "positions.json")
+            with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.5)):
+                bot.check_exit(position)
+
+            with open(bot._positions_path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            bot.client._active_stop_ids = {}
+            bot._restore_stop_ids()
+
+        self.assertEqual([call[2] for call in bot.client.stop_calls], [95.0, 90.0])
+        self.assertEqual(position.current_sl, 90.0)
+        self.assertFalse(position.half_risk_protected)
+        self.assertEqual(saved[0]["active_stop_id"], "rollback-id")
+        self.assertEqual(bot.client._active_stop_ids["LONGUSDT"], "rollback-id")
 
     def test_failed_new_and_rollback_stops_log_critical_retry(self):
         bot = self.make_bot()

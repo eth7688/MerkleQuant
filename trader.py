@@ -7017,6 +7017,7 @@ class SqueezeBreakoutBot:
                             tracking_no=pos.tracking_no,
                         )
                         if stop_applied(rollback_result):
+                            self._save_positions()
                             self._log.error(
                                 f"半损保护待重试: {symbol} action=retry_pending rollback=restored "
                                 f"SL保持{old_sl:.4f}, 目标{desired_sl:.4f}, stop_result={stop_result}"
