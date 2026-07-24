@@ -724,10 +724,13 @@ git commit -m "feat: expose half-risk trigger setting"
 Run:
 
 ```powershell
-python -m unittest tests.test_strategy_core tests.test_half_risk_protection tests.test_binance_kline_routing tests.test_predicta_config -v
+python -m unittest discover -s tests -p test_strategy_core.py -v
+python -m unittest discover -s tests -p test_half_risk_protection.py -v
+python -m unittest discover -s tests -p test_binance_kline_routing.py -v
+python -m unittest discover -s tests -p test_predicta_config.py -v
 ```
 
-Expected: all focused tests PASS.
+Expected: all 34 focused tests PASS.
 
 - [ ] **Step 2: Run the full automated test suite**
 
