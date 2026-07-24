@@ -5220,10 +5220,16 @@ class SqueezeBreakoutBot:
                                         else min(float(sl_price), half_risk_sl)
                                     )
                                     restored_half_risk = True
-                            # 计算实际风险 (qty × SL距离), 超标时用配置风险做保本/锁利参考
-                            actual_risk = qty * abs(entry_price - sl_price)
+                            # 原始R永久锚定 initial_sl；保护/追踪后的 current_sl 不得缩小R基准
+                            actual_risk = qty * abs(entry_price - initial_sl_price)
                             sync_risk = self.get_risk_for_interval(restore_interval)
-                            ref_risk = round(min(actual_risk, sync_risk), 2)
+                            persisted_risk = float(
+                                getattr(matched_local, "risk_usdt", 0.0) or 0.0
+                            ) if matched_local else 0.0
+                            ref_risk = round(
+                                persisted_risk if persisted_risk > 0 else min(actual_risk, sync_risk),
+                                2,
+                            )
                             if actual_risk > sync_risk * 1.1:
                                 self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
                                                 f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
@@ -6976,6 +6982,22 @@ class SqueezeBreakoutBot:
                 applied = self.client is None
                 stop_result = None
                 if self.client is not None:
+                    def stop_applied(result):
+                        if bool(getattr(self.cfg, "testnet", False)):
+                            return True
+                        if str(getattr(self.cfg, "exchange", "")).lower() == "bitget":
+                            if pos.tracking_no:
+                                return result is not None
+                            return (
+                                isinstance(result, dict)
+                                and (
+                                    result.get("code") == "00000"
+                                    or bool(result.get("orderId"))
+                                )
+                            )
+                        return bool(result)
+
+                    self._save_positions()
                     self.client.cancel_all_orders(symbol)
                     sl_side = "SELL" if pos.direction == "LONG" else "BUY"
                     stop_result = self.client.stop_order(
@@ -6985,21 +7007,26 @@ class SqueezeBreakoutBot:
                         round(pos.quantity, 8),
                         tracking_no=pos.tracking_no,
                     )
-                    if bool(getattr(self.cfg, "testnet", False)):
-                        applied = True
-                    elif str(getattr(self.cfg, "exchange", "")).lower() == "bitget":
-                        if pos.tracking_no:
-                            applied = stop_result is not None
-                        else:
-                            applied = (
-                                isinstance(stop_result, dict)
-                                and (
-                                    stop_result.get("code") == "00000"
-                                    or bool(stop_result.get("orderId"))
-                                )
+                    applied = stop_applied(stop_result)
+                    if not applied:
+                        rollback_result = self.client.stop_order(
+                            symbol,
+                            sl_side,
+                            round(old_sl, 8),
+                            round(pos.quantity, 8),
+                            tracking_no=pos.tracking_no,
+                        )
+                        if stop_applied(rollback_result):
+                            self._log.error(
+                                f"半损保护待重试: {symbol} action=retry_pending rollback=restored "
+                                f"SL保持{old_sl:.4f}, 目标{desired_sl:.4f}, stop_result={stop_result}"
                             )
-                    else:
-                        applied = bool(stop_result)
+                        else:
+                            self._log.critical(
+                                f"半损保护换单严重失败: {symbol} action=critical_retry_pending "
+                                f"new_sl={desired_sl:.4f} rollback_sl={old_sl:.4f} "
+                                f"stop_result={stop_result} rollback_result={rollback_result}"
+                            )
                 if applied:
                     pos.current_sl = desired_sl
                     pos.half_risk_protected = True
@@ -7028,11 +7055,6 @@ class SqueezeBreakoutBot:
                         "signal_key": getattr(pos, "signal_key", ""),
                     })
                     self._save_positions()
-                else:
-                    self._log.error(
-                        f"半损保护待重试: {symbol} action=retry_pending SL保持{old_sl:.4f}, "
-                        f"目标{desired_sl:.4f}, stop_result={stop_result}"
-                    )
             elif already_tighter and not pos.half_risk_protected:
                 pos.half_risk_protected = True
                 self._log.info(

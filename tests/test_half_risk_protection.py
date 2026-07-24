@@ -98,6 +98,24 @@ class RestartSyncClient:
         return {"orderId": f"stop-{len(self.stop_calls)}"}
 
 
+class SequencedStopClient(FailedStopClient):
+    def __init__(self, results, events=None):
+        super().__init__()
+        self.results = list(results)
+        self.events = events
+
+    def cancel_all_orders(self, symbol):
+        if self.events is not None:
+            self.events.append(("cancel", symbol))
+        return {}
+
+    def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
+        self.stop_calls.append((symbol, side, stop_price, quantity, tracking_no))
+        if self.events is not None:
+            self.events.append(("stop", stop_price))
+        return self.results.pop(0)
+
+
 class HalfRiskProtectionTest(unittest.TestCase):
     def make_bot(self, trigger=0.5):
         return SqueezeBreakoutBot(TradeConfig(
@@ -172,6 +190,50 @@ class HalfRiskProtectionTest(unittest.TestCase):
         self.assertEqual(position.current_sl, 90.0)
         self.assertFalse(position.half_risk_protected)
 
+    def test_failed_new_stop_restores_old_exchange_stop(self):
+        bot = self.make_bot()
+        bot.client = SequencedStopClient([None, {"orderId": "rollback-1"}])
+        position = make_position("LONG")
+
+        with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.5)):
+            bot.check_exit(position)
+
+        self.assertEqual([call[2] for call in bot.client.stop_calls], [95.0, 90.0])
+        self.assertEqual(position.current_sl, 90.0)
+        self.assertFalse(position.half_risk_protected)
+
+    def test_failed_new_and_rollback_stops_log_critical_retry(self):
+        bot = self.make_bot()
+        bot.client = SequencedStopClient([None, None])
+        position = make_position("LONG")
+
+        with self.assertLogs(bot._log, level="CRITICAL") as captured:
+            with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.5)):
+                bot.check_exit(position)
+
+        self.assertEqual([call[2] for call in bot.client.stop_calls], [95.0, 90.0])
+        self.assertEqual(position.current_sl, 90.0)
+        self.assertFalse(position.half_risk_protected)
+        self.assertIn("critical", captured.output[0].lower())
+        self.assertIn("retry_pending", captured.output[0])
+
+    def test_small_positive_trigger_saves_mfe_before_cancel_replace(self):
+        events = []
+        bot = self.make_bot(trigger=0.01)
+        bot.client = SequencedStopClient([{"orderId": "new-1"}], events)
+        position = make_position("LONG")
+
+        def record_save():
+            events.append(("save", position.max_favorable_r))
+
+        bot._save_positions = record_save
+        with patch("trader.fetch_klines", return_value=make_frame(position.entry_time, "LONG", 0.02)):
+            bot.check_exit(position)
+
+        self.assertEqual(events[0][0], "save")
+        self.assertGreaterEqual(events[0][1], 0.01)
+        self.assertEqual(events[1:], [("cancel", "LONGUSDT"), ("stop", 95.0), ("save", position.max_favorable_r)])
+
     def test_testnet_uses_internal_stop_when_exchange_returns_none(self):
         bot = self.make_bot()
         bot.cfg.testnet = True
@@ -238,17 +300,18 @@ class HalfRiskProtectionTest(unittest.TestCase):
 
     def test_restart_sync_rebuilds_half_risk_stop_before_any_rehang(self):
         cases = (
-            ("LONG", 90.0, 95.0),
-            ("SHORT", 110.0, 105.0),
-            ("LONG", 98.0, 98.0),
-            ("SHORT", 102.0, 102.0),
+            ("LONG", 90.0, 95.0, 10.0),
+            ("SHORT", 110.0, 105.0, 10.0),
+            ("LONG", 98.0, 98.0, 7.5),
+            ("SHORT", 102.0, 102.0, 8.5),
         )
-        for direction, saved_sl, expected in cases:
+        for direction, saved_sl, expected, persisted_risk in cases:
             with self.subTest(direction=direction, saved_sl=saved_sl), TemporaryDirectory() as directory:
                 path = str(Path(directory) / "positions.json")
                 writer = self.make_bot()
                 stale = make_position(direction)
                 stale.current_sl = saved_sl
+                stale.risk_usdt = persisted_risk
                 stale.max_favorable_r = 0.6
                 writer.positions = [stale]
                 writer._positions_path = path
@@ -260,11 +323,15 @@ class HalfRiskProtectionTest(unittest.TestCase):
                 restarted._sync_positions()
 
                 self.assertEqual(restarted.positions[0].current_sl, expected)
+                self.assertEqual(restarted.positions[0].initial_sl, stale.initial_sl)
+                self.assertEqual(restarted.positions[0].sl_price, stale.initial_sl)
+                self.assertEqual(restarted.positions[0].risk_usdt, persisted_risk)
                 self.assertTrue(restarted.positions[0].half_risk_protected)
                 self.assertGreater(len(restarted.client.stop_calls), 0)
                 self.assertTrue(all(call[2] == expected for call in restarted.client.stop_calls))
                 reloaded = restarted._load_positions()
                 self.assertEqual(reloaded[0].current_sl, expected)
+                self.assertEqual(reloaded[0].risk_usdt, persisted_risk)
                 self.assertTrue(reloaded[0].half_risk_protected)
 
 
