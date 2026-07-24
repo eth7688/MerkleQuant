@@ -59,6 +59,7 @@ class ExitDecision:
 @dataclass(frozen=True)
 class ExitRules:
     half_risk_trigger_r: float = 0.0
+    enable_early_protect: bool = True
     early_protect_r: float = 0.8
     early_lock_r: float = 0.0
     tier1_r: float = 1.2
@@ -232,7 +233,10 @@ def advance_position(
     events: list[ExitDecision] = []
 
     half_risk_enabled = rules.half_risk_trigger_r > 0
-    early_stage_reached = position.mfe_r >= rules.early_protect_r
+    early_stage_reached = (
+        rules.enable_early_protect
+        and position.mfe_r >= rules.early_protect_r
+    )
     if (
         half_risk_enabled
         and not position.half_risk_protected

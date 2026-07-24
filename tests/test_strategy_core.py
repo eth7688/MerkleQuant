@@ -1,3 +1,4 @@
+import ast
 import os
 import sys
 import unittest
@@ -165,6 +166,45 @@ class StrategyCoreTest(unittest.TestCase):
         self.assertEqual([(event.reason, event.price) for event in events], [("early_protect", 100.0)])
         self.assertTrue(position.half_risk_protected)
         self.assertTrue(position.early_protected)
+
+    def test_disabled_early_protection_keeps_replay_at_half_risk_stop(self):
+        position = PositionState("TESTUSDT", "LONG", 100.0, 90.0, 1.0)
+        rules = ExitRules(
+            half_risk_trigger_r=0.5,
+            enable_early_protect=False,
+            early_protect_r=0.8,
+            early_lock_r=0.0,
+        )
+
+        position, events = advance_position(
+            position,
+            {"ot": 1, "o": 100.0, "h": 109.0, "l": 100.0, "c": 100.0},
+            rules,
+        )
+
+        self.assertEqual(position.current_stop, 95.0)
+        self.assertEqual(
+            [(event.reason, event.price) for event in events],
+            [("half_risk_protect", 95.0)],
+        )
+        self.assertFalse(position.early_protected)
+
+    def test_both_backtest_construction_paths_forward_early_protection_switch(self):
+        source = (Path(__file__).resolve().parents[1] / "backtest" / "cli.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ExitRules"
+        ]
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn("enable_early_protect", {keyword.arg for keyword in call.keywords})
 
     def test_exit_state_machine_protects_then_partially_exits(self):
         position = PositionState("TESTUSDT", "LONG", 100.0, 98.0, 1.0)

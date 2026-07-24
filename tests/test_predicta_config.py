@@ -1,5 +1,10 @@
+import importlib
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from trader import SqueezeBreakoutBot, TradeConfig
 
@@ -60,6 +65,83 @@ class PredictaConfigTest(unittest.TestCase):
             user_source,
         )
         self.assertIn("(cfg.half_risk_trigger_r??0)", user_source)
+
+    def test_half_risk_config_round_trips_and_updates_runtime_bot(self):
+        with patch.object(SqueezeBreakoutBot, "start", return_value=None), patch(
+            "account_manager.admin_get_all_users", return_value=[]
+        ):
+            web_ui = importlib.import_module("web_ui")
+
+        runtime = SimpleNamespace(
+            cfg=TradeConfig(),
+            client=None,
+            init_calls=0,
+            restore_calls=0,
+            sync_calls=0,
+        )
+        lifecycle = []
+
+        def refresh_client():
+            runtime.init_calls += 1
+            runtime.client = object()
+            lifecycle.append("init")
+
+        def restore_stop_ids():
+            runtime.restore_calls += 1
+            lifecycle.append("restore")
+
+        def sync_positions():
+            runtime.sync_calls += 1
+            lifecycle.append("sync")
+
+        runtime._init_client = refresh_client
+        runtime._restore_stop_ids = restore_stop_ids
+        runtime._sync_positions = sync_positions
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = web_ui.UserBotManager()
+            manager._demo_bot = runtime
+            manager._configs[0] = runtime.cfg
+            with patch.object(web_ui, "_BASE_DIR", directory), patch.object(
+                web_ui, "bot_manager", manager
+            ):
+                client = web_ui.app.test_client()
+                for value in (0, 0.01):
+                    response = client.post(
+                        "/api/admin/demo/config",
+                        json={"half_risk_trigger_r": value},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertTrue(response.get_json()["ok"])
+                    self.assertEqual(runtime.cfg.half_risk_trigger_r, value)
+                    persisted = json.loads(
+                        (Path(directory) / "demo_bot_config.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(persisted["half_risk_trigger_r"], value)
+                    manager._configs.clear()
+                    self.assertEqual(
+                        client.get("/api/admin/demo/config").get_json()["half_risk_trigger_r"],
+                        value,
+                    )
+
+                legacy_path = Path(directory) / "demo_bot_config.json"
+                legacy_path.write_text(
+                    json.dumps({"enable_time_stop": False}),
+                    encoding="utf-8",
+                )
+                manager._configs.clear()
+                legacy = client.get("/api/admin/demo/config").get_json()
+
+        self.assertEqual(runtime.init_calls, 2)
+        self.assertEqual(runtime.restore_calls, 2)
+        self.assertEqual(runtime.sync_calls, 2)
+        self.assertEqual(
+            lifecycle,
+            ["init", "restore", "sync", "init", "restore", "sync"],
+        )
+        self.assertEqual(legacy["half_risk_trigger_r"], 0.0)
 
 
 if __name__ == "__main__":

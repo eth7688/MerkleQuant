@@ -193,6 +193,8 @@ class UserBotManager:
         if bot:
             bot.cfg = cfg
             bot._init_client()
+            if bot.client is not None:
+                bot._restore_stop_ids()
             if uid == 0 and bot.client is not None:
                 try:
                     bot._sync_positions()
