@@ -1838,6 +1838,7 @@ function initTraderPanel(){
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-purple);box-shadow:0 0 6px rgba(168,85,247,0.15)"></span><span>三阶止盈</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
     h+='<p style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">1阶防守 → 2阶减仓 → 3阶追踪 (EMA棘轮 / ATR吊灯)</p>';
+    h+='<div class="t-field"><label>0.5R半损保护<span class="tip">!<span class="tip-text">达到设置的R后，把最大亏损从1R降到0.5R<br>0=关闭，不锁浮盈</span></span></label><input type="number" id="cfg_half_risk_r" value="'+(cfg.half_risk_trigger_r??0)+'" min="0" max="0.79" step="0.1"></div>';
     h+='<div class="t-field"><label>提前保护<span class="tip">!<span class="tip-text">未到1.2R前先保本<br>防止0.8R附近回落成亏损</span></span></label><select id="cfg_early_protect"><option value="1"'+(cfg.enable_early_protect!==false?' selected':'')+'>启用</option><option value="0"'+(cfg.enable_early_protect===false?' selected':'')+'>关闭</option></select></div>';
     h+='<div class="t-field"><label>提前保护R</label><input type="number" id="cfg_early_r" value="'+(cfg.early_protect_r||0.8)+'" min="0.3" max="1.2" step="0.1"></div>';
     h+='<div class="t-field"><label>提前锁定R<span class="tip">!<span class="tip-text">0=止损推到入场价<br>0.05=锁0.05R小利润</span></span></label><input type="number" id="cfg_early_lock" value="'+(cfg.early_protect_lock_r||0)+'" min="0" max="0.5" step="0.05"></div>';
@@ -2513,6 +2514,7 @@ function saveConfig(){
     max_consecutive_loss: parseInt(document.getElementById('cfg_maxcl').value),
     max_position_usdt: parseFloat(document.getElementById('cfg_maxval').value),
     cooldown_minutes: parseInt(document.getElementById('cfg_cooldown').value),
+    half_risk_trigger_r: parseFloat(document.getElementById('cfg_half_risk_r').value)||0,
     enable_early_protect: document.getElementById('cfg_early_protect').value==='1',
     early_protect_r: parseFloat(document.getElementById('cfg_early_r').value)||0.8,
     early_protect_lock_r: parseFloat(document.getElementById('cfg_early_lock').value)||0,

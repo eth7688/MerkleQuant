@@ -42,6 +42,25 @@ class PredictaConfigTest(unittest.TestCase):
         )
         self.assertIn("(cfg.predicta_choppy_filter_mode||'off')==='hard'", source)
 
+    def test_half_risk_defaults_off_and_both_config_screens_expose_one_parameter(self):
+        self.assertEqual(TradeConfig().half_risk_trigger_r, 0.0)
+
+        admin_source = (ROOT / "admin_server.py").read_text(encoding="utf-8")
+        self.assertIn('id="deHalfRiskR"', admin_source)
+        self.assertIn(
+            "half_risk_trigger_r: parseFloat(document.getElementById('deHalfRiskR').value)||0",
+            admin_source,
+        )
+        self.assertIn("(cfg.half_risk_trigger_r??0)", admin_source)
+
+        user_source = (ROOT / "web_ui.py").read_text(encoding="utf-8")
+        self.assertIn('id="cfg_half_risk_r"', user_source)
+        self.assertIn(
+            "half_risk_trigger_r: parseFloat(document.getElementById('cfg_half_risk_r').value)||0",
+            user_source,
+        )
+        self.assertIn("(cfg.half_risk_trigger_r??0)", user_source)
+
 
 if __name__ == "__main__":
     unittest.main()
