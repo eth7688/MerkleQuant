@@ -37,8 +37,9 @@ from predicta_indicator import (
 )
 
 from screener import (
-    fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
-    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME,
+    fetch_klines, fetch_klines_range, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
+    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME, INTERVAL_MS,
+    INTERVAL_OPEN_PHASE_MS,
     _find_fractal_sl_in_window, _find_fractal_structure_sequence, is_tradfi_or_junk,
     get_entry_float_limit, get_breakout_confirm_window, get_squeeze_max
 )
@@ -778,11 +779,18 @@ class BitgetClient:
         data = self._req("GET", "/api/v2/mix/order/orders-plan-pending", params)
         if data is None:
             return None
-        if isinstance(data, dict):
-            return data.get("entrustedList") or []
-        if isinstance(data, list):
-            return data
-        return []
+        if not isinstance(data, dict) or "entrustedList" not in data:
+            return None
+        orders = data.get("entrustedList")
+        if not isinstance(orders, list):
+            return None
+        if any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
+            for order in orders
+        ):
+            return None
+        return orders
 
     def resolve_close_trade(self, symbol, order_response=None, direction="", quantity=0.0):
         """平仓后反查 Bitget 成交/历史仓位, 获取真实已实现PnL。"""
@@ -1096,6 +1104,7 @@ class Position:
     source_strategy: str = ""  # structure / rj_only, 用于策略差异化出场
     max_favorable_r: float = 0.0  # 入场后最大顺势推进R倍数, 用于未起爆超时退出
     max_adverse_r: float = 0.0    # 入场后最大逆势推进R倍数(MAE), 用于参数复盘
+    last_mfe_check_ms: int = 0    # 最后完整合并的已收盘K线开盘时间
     time_stop_armed: bool = True  # 兼容旧持仓文件; 实际执行统一由 enable_time_stop 控制
     time_stop_armed_at: Optional[datetime] = None  # 兼容旧持仓文件; 超时计数统一使用 entry_time
     time_stop_watch: bool = False  # RJ-only基础超时后进入观察态
@@ -1115,7 +1124,7 @@ class Position:
     hermes_confirm: dict = field(default_factory=dict)
     excursion_price_source: str = ""
     choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
-    stop_replace_state: str = ""  # placing_new_stop / rollback_restored / retry_pending_unprotected
+    stop_replace_state: str = ""  # durable protective-stop transaction state
 
     def __post_init__(self):
         if float(self.initial_entry_price or 0.0) <= 0:
@@ -5010,6 +5019,168 @@ class SqueezeBreakoutBot:
         except Exception:
             return df.iloc[0:0]
 
+    def _history_with_unobserved_excursion(
+        self,
+        pos: Position,
+        interval: str,
+        recent_df,
+        price_source: str = "",
+    ) -> tuple:
+        """Return recent data plus every closed candle not covered by the durable MFE cursor."""
+        recent_history = self._post_entry_history(pos, recent_df)
+        if recent_df is None or len(recent_df) == 0 or "ot" not in recent_df:
+            return recent_history, 0
+        try:
+            step_ms = INTERVAL_MS.get(
+                str(interval).strip(),
+                self._interval_seconds(interval) * 1000,
+            )
+            phase_ms = INTERVAL_OPEN_PHASE_MS.get(str(interval).strip(), 0)
+
+            def mergeable(history) -> bool:
+                if history is None or len(history) == 0:
+                    return True
+                if "ot" not in history or "h" not in history or "l" not in history:
+                    return False
+                open_values = pd.to_numeric(
+                    history["ot"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                high_values = pd.to_numeric(
+                    history["h"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                low_values = pd.to_numeric(
+                    history["l"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                if not (
+                    np.isfinite(open_values).all()
+                    and np.isfinite(high_values).all()
+                    and np.isfinite(low_values).all()
+                    and np.equal(open_values, np.floor(open_values)).all()
+                ):
+                    return False
+                ordered_times = sorted(int(value) for value in open_values)
+                return bool(
+                    len(set(ordered_times)) == len(ordered_times)
+                    and all(
+                        (open_time - phase_ms) % step_ms == 0
+                        for open_time in ordered_times
+                    )
+                    and all(
+                        right - left == step_ms
+                        for left, right in zip(
+                            ordered_times,
+                            ordered_times[1:],
+                        )
+                    )
+                )
+
+            raw_recent_open_times = pd.to_numeric(
+                recent_df["ot"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            if not (
+                np.isfinite(raw_recent_open_times).all()
+                and np.equal(
+                    raw_recent_open_times,
+                    np.floor(raw_recent_open_times),
+                ).all()
+            ):
+                return recent_history, 0
+            recent_open_times = (
+                pd.Series(raw_recent_open_times.astype("int64"))
+                .drop_duplicates()
+                .sort_values()
+            )
+            if len(recent_open_times) == 0:
+                return recent_history, 0
+            if any(
+                (int(open_time) - phase_ms) % step_ms != 0
+                for open_time in recent_open_times
+            ):
+                return recent_history, 0
+            end_ms = int(recent_open_times.iloc[-1])
+            entry_ms = _entry_ms_for_market_data(pos.entry_time, end_ms)
+            last_check_ms = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+            old_source = str(getattr(pos, "excursion_price_source", "") or "")
+            if price_source and old_source != price_source:
+                last_check_ms = 0
+            start_ms = (
+                max(entry_ms, last_check_ms + step_ms)
+                if last_check_ms > 0
+                else entry_ms
+            )
+            if start_ms > end_ms:
+                return recent_history, 0
+
+            relevant_times = recent_open_times[recent_open_times >= start_ms]
+            recent_covers_range = False
+            if len(relevant_times) > 0:
+                first_open = int(relevant_times.iloc[0])
+                last_open = int(relevant_times.iloc[-1])
+                expected_first = (
+                    (
+                        (start_ms - phase_ms + step_ms - 1)
+                        // step_ms
+                    )
+                    * step_ms
+                    + phase_ms
+                )
+                gaps = relevant_times.diff().dropna()
+                recent_covers_range = (
+                    first_open == expected_first
+                    and last_open == end_ms
+                    and (
+                        len(gaps) == 0
+                        or bool((gaps == step_ms).all())
+                    )
+                )
+            if recent_covers_range:
+                return (
+                    (recent_history, end_ms)
+                    if mergeable(recent_history)
+                    else (recent_history, 0)
+                )
+
+            missing_history = fetch_klines_range(
+                pos.symbol,
+                interval,
+                start_ms,
+                end_ms,
+                exchange=self.cfg.exchange,
+                market_type=self.cfg.market_type,
+                testnet=self.cfg.testnet,
+                price_type="mark",
+            )
+            if missing_history is None:
+                self._log.warning(
+                    f"{pos.symbol} MFE history pagination incomplete: "
+                    f"start={start_ms} end={end_ms}"
+                )
+                return recent_history, 0
+            missing_history = self._post_entry_history(pos, missing_history)
+            frames = [
+                frame
+                for frame in (missing_history, recent_history)
+                if frame is not None and len(frame) > 0
+            ]
+            if not frames:
+                return recent_history, end_ms
+            history = pd.concat(frames, ignore_index=True)
+            history["ot"] = pd.to_numeric(history["ot"], errors="coerce")
+            history = (
+                history.dropna(subset=["ot"])
+                .drop_duplicates(subset=["ot"], keep="last")
+                .sort_values("ot")
+                .reset_index(drop=True)
+            )
+            return (history, end_ms) if mergeable(history) else (history, 0)
+        except Exception as e:
+            self._log.warning(f"{pos.symbol} MFE history merge failed: {e}")
+            return recent_history, 0
+
     def _merge_position_excursion(
         self,
         pos: Position,
@@ -5129,14 +5300,23 @@ class SqueezeBreakoutBot:
     def _recover_uncertain_stop_tracking(self, pos: Position) -> bool:
         """Resolve a crash-window Bitget stop before any replacement is attempted."""
         state = str(getattr(pos, "stop_replace_state", "") or "")
-        if state not in ("placing_new_stop", "retry_pending_untracked_stop"):
-            return True
+        uncertain_states = (
+            "canceling_old_stop",
+            "placing_new_stop",
+            "retry_pending_untracked_stop",
+            "retry_pending_unprotected",
+        )
         if str(getattr(self.cfg, "exchange", "")).lower() != "bitget":
             return True
 
         if not hasattr(self.client, "_active_stop_ids"):
             self.client._active_stop_ids = {}
-        if self.client._active_stop_ids.get(pos.symbol):
+        tracked_stop_id = self.client._active_stop_ids.get(pos.symbol)
+        needs_untracked_reconcile = (
+            not tracked_stop_id
+            and not str(getattr(pos, "tracking_no", "") or "")
+        )
+        if state not in uncertain_states and not needs_untracked_reconcile:
             return True
 
         getter = getattr(self.client, "get_pending_plan_orders", None)
@@ -5161,12 +5341,19 @@ class SqueezeBreakoutBot:
             )
             return False
 
-        live_ids = sorted({
-            str(order.get("orderId", "") or "")
+        if not isinstance(pending, list) or any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
             for order in pending
-            if str(order.get("planStatus", "") or "").lower()
-            in ("", "live", "executing")
-            and str(order.get("orderId", "") or "")
+        ):
+            self._log.critical(
+                f"保护止损不确定状态返回畸形计划单: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+        live_ids = sorted({
+            str(order["orderId"])
+            for order in pending
         })
         if len(live_ids) > 1:
             self._log.critical(
@@ -5179,6 +5366,11 @@ class SqueezeBreakoutBot:
             self._log.warning(
                 f"保护止损恢复崩溃窗口ID: {pos.symbol} "
                 f"state={state} active_stop_id={live_ids[0]}"
+            )
+        else:
+            self.client._active_stop_ids.pop(pos.symbol, None)
+            self._log.warning(
+                f"保护止损恢复确认无活动计划单: {pos.symbol} state={state}"
             )
         return True
 
@@ -5249,8 +5441,14 @@ class SqueezeBreakoutBot:
             pos.stop_replace_state = ""
             return True
 
-        # The latest protect_r/MFE must be durable before touching the live stop.
+        if not self._recover_uncertain_stop_tracking(pos):
+            return False
+
+        # Persist both the latest MFE and the recoverable pre-cancel transaction state.
+        previous_state = str(getattr(pos, "stop_replace_state", "") or "")
+        pos.stop_replace_state = "canceling_old_stop"
         if not self._save_positions():
+            pos.stop_replace_state = previous_state
             self._log.error(
                 f"保护止损换单阻止: {pos.symbol} action=persist_failed_before_cancel"
             )
@@ -5336,6 +5534,7 @@ class SqueezeBreakoutBot:
                     "source_strategy": getattr(p, "source_strategy", ""),
                     "max_favorable_r": p.max_favorable_r,
                     "max_adverse_r": p.max_adverse_r,
+                    "last_mfe_check_ms": int(getattr(p, "last_mfe_check_ms", 0) or 0),
                     "excursion_price_source": getattr(p, "excursion_price_source", ""),
                     "time_stop_armed": p.time_stop_armed,
                     "time_stop_armed_at": p.time_stop_armed_at.isoformat() if getattr(p, "time_stop_armed_at", None) else "",
@@ -5429,6 +5628,7 @@ class SqueezeBreakoutBot:
                 pos.source_interval = d.get('source_interval', '15m')
                 pos.max_favorable_r = float(d.get('max_favorable_r', 0.0) or 0.0)
                 pos.max_adverse_r = float(d.get('max_adverse_r', 0.0) or 0.0)
+                pos.last_mfe_check_ms = int(d.get('last_mfe_check_ms', 0) or 0)
                 pos.excursion_price_source = str(d.get('excursion_price_source', '') or '')
                 pos.stop_replace_state = str(d.get('stop_replace_state', '') or '')
                 pos.btc_regime_fields = d.get('btc_regime_fields', {}) or {k: v for k, v in d.items() if str(k).startswith('btc_')}
@@ -5620,6 +5820,7 @@ class SqueezeBreakoutBot:
                             pos.lowest_price = getattr(matched_local, 'lowest_price', 999999.0) if matched_local else 999999.0
                             pos.max_favorable_r = getattr(matched_local, 'max_favorable_r', 0.0) if matched_local else 0.0
                             pos.max_adverse_r = getattr(matched_local, 'max_adverse_r', 0.0) if matched_local else 0.0
+                            pos.last_mfe_check_ms = getattr(matched_local, 'last_mfe_check_ms', 0) if matched_local else 0
                             pos.excursion_price_source = getattr(matched_local, 'excursion_price_source', '') if matched_local else ''
                             pos.stop_replace_state = getattr(matched_local, 'stop_replace_state', '') if matched_local else ''
                             pos.source_strategy = getattr(matched_local, 'source_strategy', '') if matched_local else ''
@@ -5744,7 +5945,6 @@ class SqueezeBreakoutBot:
                         testnet=self.cfg.testnet,
                         price_type="mark",
                     )
-                    history = self._post_entry_history(pos, recovery_df)
                     if recovery_df is not None and len(recovery_df) > 0:
                         recovered_price = float(recovery_df["c"].iloc[-1])
                         if float(getattr(pos, "current_price", 0.0) or 0.0) <= 0:
@@ -5755,12 +5955,26 @@ class SqueezeBreakoutBot:
                         and self.cfg.market_type == "futures"
                         else ""
                     )
+                    history, history_end_ms = self._history_with_unobserved_excursion(
+                        pos,
+                        interval,
+                        recovery_df,
+                        price_source,
+                    )
+                    old_price_source = str(
+                        getattr(pos, "excursion_price_source", "") or ""
+                    )
+                    merge_price_source = (
+                        price_source if history_end_ms > 0 else old_price_source
+                    )
                     self._merge_position_excursion(
                         pos,
                         history,
                         float(getattr(pos, "current_price", 0.0) or 0.0),
-                        price_source,
+                        merge_price_source,
                     )
+                    if history_end_ms > 0:
+                        pos.last_mfe_check_ms = history_end_ms
                 except Exception as e:
                     self._log.warning(f"{pos.symbol} 启动MFE恢复失败: {e}")
 
@@ -5781,8 +5995,6 @@ class SqueezeBreakoutBot:
                     stage = ""
 
                 if self.client is not None and self.cfg.market_type == "futures":
-                    if not self._recover_uncertain_stop_tracking(pos):
-                        continue
                     applied = self._replace_protective_stop(
                         pos,
                         target_sl,
@@ -7266,8 +7478,6 @@ class SqueezeBreakoutBot:
         current_price = closes.iloc[-1]; current_high = highs.iloc[-1]; current_low = lows.iloc[-1]
         ema_ratchet_val = ema(closes, self.cfg.ema_ratchet).iloc[-1]
 
-        post_entry_history = self._post_entry_history(pos, df)
-
         # 实时浮盈 (用收盘价算r_multiple; 用极值算二阶触发)
         exchange_pnl = None
         if self.client is not None and self.cfg.market_type == "futures":
@@ -7285,6 +7495,19 @@ class SqueezeBreakoutBot:
         unrealized_pnl = exchange_pnl if exchange_pnl is not None else (
             (current_price - pos.entry_price) * pos.quantity if pos.direction == "LONG"
             else (pos.entry_price - current_price) * pos.quantity)
+
+        excursion_source = (
+            "mark"
+            if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
+            else ""
+        )
+        previous_mfe_cursor = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+        post_entry_history, history_end_ms = self._history_with_unobserved_excursion(
+            pos,
+            inv,
+            df,
+            excursion_source,
+        )
 
         if len(post_entry_history) > 0:
             current_high = post_entry_history["h"].max()
@@ -7307,24 +7530,30 @@ class SqueezeBreakoutBot:
             r_multiple = 0.0
             favorable_r = 0.0
             adverse_r = 0.0
-        excursion_source = (
-            "mark"
-            if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
-            else ""
-        )
         old_excursion_source = str(getattr(pos, "excursion_price_source", "") or "")
-        if self._merge_position_excursion(
+        merge_excursion_source = (
+            excursion_source if history_end_ms > 0 else old_excursion_source
+        )
+        excursion_changed = self._merge_position_excursion(
             pos,
             post_entry_history,
             float(current_price),
-            excursion_source,
-        ):
-            if excursion_source and old_excursion_source != excursion_source:
+            merge_excursion_source,
+        )
+        cursor_changed = history_end_ms > previous_mfe_cursor
+        if cursor_changed:
+            pos.last_mfe_check_ms = history_end_ms
+        if excursion_changed or cursor_changed:
+            if (
+                merge_excursion_source
+                and old_excursion_source != merge_excursion_source
+            ):
                 self._log.info(
                     f"{symbol} MFE/MAE switched to mark-price basis: "
                     f"MFE={pos.max_favorable_r:.2f}R MAE={pos.max_adverse_r:.2f}R"
                 )
-            self._save_positions()
+            if not self._save_positions() and cursor_changed:
+                pos.last_mfe_check_ms = previous_mfe_cursor
 
         half_trigger_r = max(
             0.0,

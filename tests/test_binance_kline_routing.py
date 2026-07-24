@@ -118,13 +118,17 @@ class BinanceKlineRoutingTest(unittest.TestCase):
             initial_sl=0.84285714,
             initial_band_hi=0.84,
             initial_band_lo=0.83,
+            source_interval="30m",
             breakeven_triggered=True,
             partial_tp_triggered=True,
             max_favorable_r=2.76315862,
         )
         rows = 30
+        step_ms = 1_800_000
+        entry_ms = int(entry_time.timestamp() * 1000)
+        first_open_ms = ((entry_ms + step_ms - 1) // step_ms) * step_ms
         frame = pd.DataFrame({
-            "ot": [int(entry_time.timestamp() * 1000) + i * 1_800_000 for i in range(rows)],
+            "ot": [first_open_ms + i * step_ms for i in range(rows)],
             "o": [0.82] * rows,
             "h": [0.825] * rows,
             "l": [0.807] * (rows - 1) + [0.804],
@@ -132,7 +136,10 @@ class BinanceKlineRoutingTest(unittest.TestCase):
             "v": [1.0] * rows,
         })
 
-        with patch("trader.fetch_klines", return_value=frame):
+        with patch("trader.fetch_klines", return_value=frame), patch(
+            "trader.fetch_klines_range",
+            return_value=frame,
+        ):
             bot.check_exit(position)
 
         expected_mfe = (0.832 - 0.804) / (0.84285714 - 0.832)

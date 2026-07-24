@@ -73,12 +73,33 @@ def make_returned_history_frame(entry_time, direction):
     return frame
 
 
+def make_long_gap_history_frame(entry_time):
+    rows = 250
+    opens = [
+        int((entry_time + timedelta(minutes=30 * index)).timestamp() * 1000)
+        for index in range(rows)
+    ]
+    frame = pd.DataFrame({
+        "ot": opens,
+        "o": [100.0] * rows,
+        "h": [100.0] * rows,
+        "l": [100.0] * rows,
+        "c": [100.0] * rows,
+        "v": [1.0] * rows,
+    })
+    frame.loc[50, "h"] = 105.0
+    return frame
+
+
 class FailedStopClient:
     def __init__(self):
         self.stop_calls = []
         self.cancel_calls = []
 
     def get_positions(self):
+        return []
+
+    def get_pending_plan_orders(self, symbol):
         return []
 
     def cancel_all_orders(self, symbol):
@@ -119,6 +140,9 @@ class RestartSyncClient:
         self._active_stop_ids.pop(symbol, None)
         return {}
 
+    def get_pending_plan_orders(self, symbol):
+        return []
+
     def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
         self.stop_calls.append((symbol, side, stop_price, quantity, tracking_no))
         order_id = f"stop-{len(self.stop_calls)}"
@@ -155,6 +179,39 @@ class PendingStopRestartClient(RestartSyncClient):
             "orderId": result["orderId"],
             "planStatus": "live",
         }
+        return result
+
+
+class CrashWindowBitgetClient(RestartSyncClient):
+    def __init__(self, pending_stops, crash_after_cancel=False):
+        super().__init__("LONG", mark_price=100.0)
+        self.pending_stops = pending_stops
+        self.crash_after_cancel = crash_after_cancel
+
+    def get_pending_plan_orders(self, symbol):
+        return [
+            {"orderId": order_id, "planStatus": "live"}
+            for order_id in sorted(self.pending_stops)
+        ]
+
+    def cancel_all_orders(self, symbol):
+        self.cancel_calls.append(symbol)
+        order_id = self._active_stop_ids.get(symbol)
+        if not order_id:
+            return {}
+        if order_id not in self.pending_stops:
+            return None
+        self.pending_stops.remove(order_id)
+        self._active_stop_ids.pop(symbol, None)
+        if self.crash_after_cancel:
+            raise SystemExit("simulated crash after confirmed exchange cancel")
+        return {}
+
+    def stop_order(self, symbol, side, stop_price, quantity, tracking_no=""):
+        result = super().stop_order(
+            symbol, side, stop_price, quantity, tracking_no=tracking_no
+        )
+        self.pending_stops.add(result["orderId"])
         return result
 
 
@@ -296,6 +353,163 @@ class HalfRiskProtectionTest(unittest.TestCase):
                 self.assertEqual(position.max_favorable_r, 0.5)
                 self.assertEqual(position.current_sl, expected)
                 self.assertTrue(position.half_risk_protected)
+
+    def test_check_exit_recovers_mfe_trigger_older_than_recent_100_candles(self):
+        bot = self.make_bot()
+        bot.cfg.enable_early_protect = False
+        position = make_position("LONG")
+        position.entry_time = datetime(2026, 7, 15, tzinfo=timezone.utc)
+        full_history = make_long_gap_history_frame(position.entry_time)
+        recent_history = full_history.tail(100).reset_index(drop=True)
+
+        with patch("trader.fetch_klines", return_value=recent_history), patch(
+            "trader.fetch_klines_range",
+            return_value=full_history,
+            create=True,
+        ):
+            bot.check_exit(position)
+
+        self.assertEqual(position.max_favorable_r, 0.5)
+        self.assertEqual(position.current_sl, 95.0)
+        self.assertEqual(
+            position.last_mfe_check_ms,
+            int(full_history["ot"].iloc[-1]),
+        )
+
+    def test_persisted_mfe_cursor_does_not_skip_one_missing_candle(self):
+        bot = self.make_bot()
+        bot.cfg.enable_early_protect = False
+        position = make_position("LONG")
+        step_ms = 30 * 60 * 1000
+        cursor_ms = int(position.entry_time.timestamp() * 1000)
+        position.last_mfe_check_ms = cursor_ms
+        position.excursion_price_source = "mark"
+        recent = pd.DataFrame({
+            "ot": [cursor_ms + (index + 2) * step_ms for index in range(30)],
+            "o": [100.0] * 30,
+            "h": [100.0] * 30,
+            "l": [100.0] * 30,
+            "c": [100.0] * 30,
+            "v": [1.0] * 30,
+        })
+        missing = recent.copy()
+        missing.loc[len(missing)] = {
+            "ot": cursor_ms + step_ms,
+            "o": 100.0,
+            "h": 105.0,
+            "l": 100.0,
+            "c": 100.0,
+            "v": 1.0,
+        }
+        missing = missing.sort_values("ot").reset_index(drop=True)
+
+        with patch("trader.fetch_klines", return_value=recent), patch(
+            "trader.fetch_klines_range",
+            return_value=missing,
+        ) as range_fetch:
+            bot.check_exit(position)
+
+        range_fetch.assert_called_once()
+        self.assertEqual(range_fetch.call_args.args[2], cursor_ms + step_ms)
+        self.assertEqual(position.max_favorable_r, 0.5)
+        self.assertEqual(position.current_sl, 95.0)
+
+    def test_mfe_cursor_does_not_advance_over_non_finite_history(self):
+        bot = self.make_bot()
+        position = make_position("LONG")
+        frame = make_frame(position.entry_time, "LONG", 0.0)
+        frame.loc[:, ["h", "l"]] = float("nan")
+
+        with patch("trader.fetch_klines", return_value=frame):
+            bot.check_exit(position)
+
+        self.assertEqual(position.last_mfe_check_ms, 0)
+
+    def test_mfe_cursor_does_not_advance_over_one_non_finite_extreme(self):
+        bot = self.make_bot()
+        position = make_position("LONG")
+        frame = make_frame(position.entry_time, "LONG", 0.0)
+        frame.loc[frame.index[len(frame) // 2], "h"] = float("nan")
+
+        with patch("trader.fetch_klines", return_value=frame):
+            bot.check_exit(position)
+
+        self.assertEqual(position.last_mfe_check_ms, 0)
+
+    def test_mfe_cursor_does_not_advance_over_shifted_recent_timestamps(self):
+        bot = self.make_bot()
+        position = make_position("LONG")
+        step_ms = 30 * 60 * 1000
+        entry_ms = 1_784_811_615_000
+        first_open_ms = 1_784_813_399_999
+        position.entry_time = datetime.fromtimestamp(
+            entry_ms / 1000,
+            tz=timezone.utc,
+        )
+        rows = 30
+        frame = pd.DataFrame({
+            "ot": [first_open_ms + index * step_ms for index in range(rows)],
+            "o": [100.0] * rows,
+            "h": [100.0] * rows,
+            "l": [100.0] * rows,
+            "c": [100.0] * rows,
+            "v": [1.0] * rows,
+        })
+
+        with patch("trader.fetch_klines", return_value=frame), patch(
+            "trader.fetch_klines_range",
+            return_value=None,
+        ) as range_fetch:
+            bot.check_exit(position)
+
+        range_fetch.assert_not_called()
+        self.assertEqual(position.last_mfe_check_ms, 0)
+
+    def test_bitget_pending_plan_payload_must_be_explicit_and_well_formed(self):
+        client = BitgetClient(market_type="futures")
+        malformed_payloads = (
+            {},
+            {"entrustedList": "not-a-list"},
+            {"entrustedList": [None]},
+            {"entrustedList": [{}]},
+            [],
+        )
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), patch.object(
+                client,
+                "_req",
+                return_value=payload,
+            ):
+                self.assertIsNone(client.get_pending_plan_orders("BTCUSDT"))
+
+        with patch.object(
+            client,
+            "_req",
+            return_value={"entrustedList": []},
+        ):
+            self.assertEqual(client.get_pending_plan_orders("BTCUSDT"), [])
+
+    def test_incomplete_source_rebase_preserves_durable_mfe_and_retries(self):
+        bot = self.make_bot(trigger=0.0)
+        bot.cfg.exchange = "binance"
+        bot.cfg.enable_early_protect = False
+        position = make_position("LONG")
+        position.entry_time = datetime(2026, 7, 15, tzinfo=timezone.utc)
+        position.max_favorable_r = 1.2
+        position.excursion_price_source = ""
+        recent = make_long_gap_history_frame(position.entry_time).tail(100)
+        recent = recent.assign(h=100.0, l=100.0, c=100.0).reset_index(drop=True)
+
+        with patch("trader.fetch_klines", return_value=recent), patch(
+            "trader.fetch_klines_range",
+            return_value=None,
+        ):
+            bot.check_exit(position)
+
+        self.assertEqual(position.max_favorable_r, 1.2)
+        self.assertEqual(position.excursion_price_source, "")
+        self.assertEqual(position.last_mfe_check_ms, 0)
 
     def test_exchange_entry_drift_keeps_original_r_and_half_stop(self):
         bot = self.make_bot()
@@ -734,6 +948,128 @@ class HalfRiskProtectionTest(unittest.TestCase):
             [call[2] for call in restarted.client.stop_calls],
             [95.0],
         )
+
+    def test_startup_adopts_legacy_untracked_bitget_stop_before_rehang(self):
+        pending_stops = {"existing-stop"}
+        with TemporaryDirectory() as directory:
+            bot = self.make_bot(trigger=0.0)
+            bot.cfg.exchange = "bitget"
+            bot.cfg.enable_early_protect = False
+            position = make_position("LONG")
+            bot.positions = [position]
+            bot._positions_path = str(Path(directory) / "positions.json")
+            bot.client = CrashWindowBitgetClient(pending_stops)
+
+            with patch(
+                "trader.fetch_klines",
+                return_value=make_frame(position.entry_time, "LONG", 0.0),
+            ):
+                bot._sync_positions()
+
+        self.assertEqual(bot.client.cancel_calls, ["LONGUSDT"])
+        self.assertEqual([call[2] for call in bot.client.stop_calls], [90.0])
+        self.assertEqual(pending_stops, {"stop-1"})
+
+    def test_cancel_success_crash_state_recovers_and_rehangs_one_stop(self):
+        pending_stops = {"old-stop"}
+        with TemporaryDirectory() as directory:
+            path = str(Path(directory) / "positions.json")
+            writer = self.make_bot(trigger=0.0)
+            writer.cfg.exchange = "bitget"
+            writer.cfg.enable_early_protect = False
+            position = make_position("LONG")
+            writer.positions = [position]
+            writer._positions_path = path
+            writer.client = CrashWindowBitgetClient(
+                pending_stops,
+                crash_after_cancel=True,
+            )
+            writer.client._active_stop_ids[position.symbol] = "old-stop"
+            writer._save_positions()
+
+            with self.assertRaises(SystemExit):
+                writer._replace_protective_stop(position, 95.0)
+
+            crashed = json.loads(Path(path).read_text(encoding="utf-8"))[0]
+            self.assertEqual(crashed["stop_replace_state"], "canceling_old_stop")
+            self.assertEqual(crashed["active_stop_id"], "old-stop")
+            self.assertEqual(pending_stops, set())
+
+            restarted = self.make_bot(trigger=0.0)
+            restarted.cfg.exchange = "bitget"
+            restarted.cfg.enable_early_protect = False
+            restarted._positions_path = path
+            restarted.positions = restarted._load_positions()
+            restarted.client = CrashWindowBitgetClient(pending_stops)
+            restarted._restore_stop_ids()
+            with patch(
+                "trader.fetch_klines",
+                return_value=make_frame(position.entry_time, "LONG", 0.0),
+            ):
+                restarted._sync_positions()
+
+        self.assertEqual(
+            [call[2] for call in restarted.client.stop_calls],
+            [90.0],
+        )
+        self.assertEqual(len(pending_stops), 1)
+        self.assertEqual(
+            restarted.positions[0].stop_replace_state,
+            "",
+        )
+
+    def test_uncertain_double_failure_with_multiple_live_stops_fails_closed(self):
+        pending_stops = {"possibly-new", "possibly-rollback"}
+        with TemporaryDirectory() as directory:
+            bot = self.make_bot(trigger=0.0)
+            bot.cfg.exchange = "bitget"
+            position = make_position("LONG")
+            position.stop_replace_state = "retry_pending_unprotected"
+            bot.positions = [position]
+            bot._positions_path = str(Path(directory) / "positions.json")
+            bot.client = CrashWindowBitgetClient(pending_stops)
+
+            applied = bot._replace_protective_stop(position, 95.0)
+
+        self.assertFalse(applied)
+        self.assertEqual(bot.client.cancel_calls, [])
+        self.assertEqual(bot.client.stop_calls, [])
+        self.assertEqual(
+            pending_stops,
+            {"possibly-new", "possibly-rollback"},
+        )
+
+    def test_startup_recovers_mfe_trigger_older_than_recent_100_candles(self):
+        with TemporaryDirectory() as directory:
+            bot = self.make_bot()
+            bot.cfg.enable_early_protect = False
+            position = make_position("LONG")
+            position.entry_time = datetime(2026, 7, 15, tzinfo=timezone.utc)
+            full_history = make_long_gap_history_frame(position.entry_time)
+            recent_history = full_history.tail(100).reset_index(drop=True)
+            bot.positions = [position]
+            bot._positions_path = str(Path(directory) / "positions.json")
+            bot.client = RestartSyncClient("LONG", mark_price=100.0)
+
+            with patch("trader.fetch_klines", return_value=recent_history), patch(
+                "trader.fetch_klines_range",
+                return_value=full_history,
+                create=True,
+            ):
+                bot._sync_positions()
+
+            self.assertEqual(position.max_favorable_r, 0.5)
+            self.assertEqual(position.current_sl, 95.0)
+            self.assertEqual([call[2] for call in bot.client.stop_calls], [95.0])
+            self.assertEqual(
+                position.last_mfe_check_ms,
+                int(full_history["ot"].iloc[-1]),
+            )
+            persisted = json.loads(Path(bot._positions_path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted[0]["last_mfe_check_ms"],
+                int(full_history["ot"].iloc[-1]),
+            )
 
     def test_restart_sync_rebuilds_half_risk_stop_before_any_rehang(self):
         cases = (

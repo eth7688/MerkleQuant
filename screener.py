@@ -6,7 +6,7 @@
   python screener.py --short                (山寨币暴涨后做空扫选)
   python screener.py --short --days 7 --min-chg 50  (自定义做空参数)
 """
-import sys, time, requests, pandas as pd, numpy as np
+import math, sys, time, requests, pandas as pd, numpy as np
 from datetime import datetime, timezone
 
 # Windows终端兼容emoji (模块级, import时即生效)
@@ -175,6 +175,9 @@ INTERVAL_MS = {
     "1d": 24 * 60 * 60_000,
     "1w": 7 * 24 * 60 * 60_000,
 }
+INTERVAL_OPEN_PHASE_MS = {
+    "1w": 4 * 24 * 60 * 60_000,  # Monday 00:00 UTC relative to Unix epoch
+}
 
 def _closed_kline_frame(df, interval, limit=None):
     """统一只返回已收盘K线，避免未收盘K污染突破/分型/出场判断。"""
@@ -224,6 +227,244 @@ def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True,
         for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
         return _closed_kline_frame(df, interval, limit) if closed_only else df
     except: return None
+
+
+def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,
+                       market_type=None, testnet=None, price_type=None,
+                       pause_seconds=0.06, max_pages=1000):
+    """Fetch a complete closed-candle range, failing closed on partial pagination."""
+    step_ms = INTERVAL_MS.get(str(interval).strip())
+    if not step_ms:
+        return None
+    try:
+        start_ms = int(start_ms)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        phase_ms = INTERVAL_OPEN_PHASE_MS.get(str(interval).strip(), 0)
+        current_open_ms = (
+            ((now_ms - phase_ms) // step_ms) * step_ms + phase_ms
+        )
+        last_closed_open_ms = current_open_ms - step_ms
+        end_ms = (
+            last_closed_open_ms
+            if end_ms is None
+            else min(int(end_ms), last_closed_open_ms)
+        )
+        max_pages = max(1, int(max_pages))
+        pause_seconds = max(0.0, float(pause_seconds))
+    except (TypeError, ValueError):
+        return None
+
+    columns = ["ot", "o", "h", "l", "c", "v"]
+    if start_ms > end_ms:
+        empty = pd.DataFrame(columns=columns)
+        empty.attrs.update({
+            "range_complete": True,
+            "range_start_ms": start_ms,
+            "range_end_ms": end_ms,
+            "interval": interval,
+        })
+        return empty
+
+    first_expected_ms = (
+        ((start_ms - phase_ms + step_ms - 1) // step_ms) * step_ms
+        + phase_ms
+    )
+    last_expected_ms = (
+        ((end_ms - phase_ms) // step_ms) * step_ms
+        + phase_ms
+    )
+    if first_expected_ms > last_expected_ms:
+        empty = pd.DataFrame(columns=columns)
+        empty.attrs.update({
+            "range_complete": True,
+            "range_start_ms": start_ms,
+            "range_end_ms": end_ms,
+            "interval": interval,
+        })
+        return empty
+
+    rows = {}
+    complete = False
+    ex = exchange if exchange is not None else _exchange
+    try:
+        if ex == "bitget":
+            granularity = {
+                "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                "1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W",
+            }.get(interval)
+            if not granularity:
+                return None
+            cursor = end_ms
+            page_limit = 200
+            for page_index in range(max_pages):
+                response = requests.get(
+                    "https://api.bitget.com/api/v2/mix/market/history-candles",
+                    params={
+                        "symbol": symbol,
+                        "granularity": granularity,
+                        "productType": "USDT-FUTURES",
+                        "endTime": str(cursor),
+                        "limit": str(page_limit),
+                    },
+                    timeout=5,
+                )
+                if response.status_code != 200:
+                    return None
+                payload = response.json()
+                if payload.get("code") != "00000":
+                    return None
+                batch = payload.get("data") or []
+                if not batch:
+                    return None
+                valid = [item for item in batch if len(item) >= 6]
+                if not valid or len(valid) != len(batch):
+                    return None
+                open_times = [int(item[0]) for item in valid]
+                ordered_times = sorted(open_times)
+                if len(set(ordered_times)) != len(ordered_times):
+                    return None
+                if any(
+                    (open_time - phase_ms) % step_ms != 0
+                    for open_time in ordered_times
+                ):
+                    return None
+                if any(
+                    right - left != step_ms
+                    for left, right in zip(ordered_times, ordered_times[1:])
+                ):
+                    return None
+                newest = ordered_times[-1]
+                boundary_gap = cursor - newest
+                if (
+                    boundary_gap < 0
+                    or boundary_gap > step_ms
+                    or (page_index == 0 and boundary_gap >= step_ms)
+                ):
+                    return None
+                for item, open_time in zip(valid, open_times):
+                    if start_ms <= open_time <= end_ms:
+                        values = [
+                            open_time,
+                            float(item[1]),
+                            float(item[2]),
+                            float(item[3]),
+                            float(item[4]),
+                            float(item[5]),
+                        ]
+                        if not all(math.isfinite(value) for value in values[1:]):
+                            return None
+                        rows[open_time] = values
+                oldest = ordered_times[0]
+                if oldest < start_ms + step_ms:
+                    complete = True
+                    break
+                if oldest >= cursor:
+                    return None
+                cursor = oldest
+                if pause_seconds and page_index + 1 < max_pages:
+                    time.sleep(pause_seconds)
+        else:
+            if str(market_type or "spot").lower() == "futures":
+                base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+                endpoint = "markPriceKlines" if str(price_type or "").lower() == "mark" else "klines"
+                url = f"{base}/fapi/v1/{endpoint}"
+            else:
+                if testnet is True:
+                    base = "https://testnet.binance.vision"
+                elif testnet is False or exchange:
+                    base = "https://api.binance.com"
+                else:
+                    base = _rest_base
+                url = f"{base}/api/v3/klines"
+            cursor = start_ms
+            page_limit = 1000
+            for page_index in range(max_pages):
+                response = requests.get(
+                    url,
+                    params={
+                        "symbol": symbol,
+                        "interval": interval,
+                        "startTime": cursor,
+                        "endTime": end_ms,
+                        "limit": page_limit,
+                    },
+                    timeout=5,
+                )
+                response.raise_for_status()
+                batch = response.json() or []
+                if not batch:
+                    return None
+                valid = [item for item in batch if len(item) >= 6]
+                if not valid or len(valid) != len(batch):
+                    return None
+                open_times = [int(item[0]) for item in valid]
+                ordered_times = sorted(open_times)
+                if len(set(ordered_times)) != len(ordered_times):
+                    return None
+                if any(
+                    (open_time - phase_ms) % step_ms != 0
+                    for open_time in ordered_times
+                ):
+                    return None
+                if any(
+                    right - left != step_ms
+                    for left, right in zip(ordered_times, ordered_times[1:])
+                ):
+                    return None
+                first_open = ordered_times[0]
+                if first_open < cursor or first_open - cursor >= step_ms:
+                    return None
+                for item, open_time in zip(valid, open_times):
+                    if start_ms <= open_time <= end_ms:
+                        values = [
+                            open_time,
+                            float(item[1]),
+                            float(item[2]),
+                            float(item[3]),
+                            float(item[4]),
+                            float(item[5]),
+                        ]
+                        if not all(math.isfinite(value) for value in values[1:]):
+                            return None
+                        rows[open_time] = values
+                latest = ordered_times[-1]
+                if latest > end_ms:
+                    return None
+                if end_ms - latest < step_ms:
+                    complete = True
+                    break
+                next_cursor = latest + step_ms
+                if next_cursor <= cursor:
+                    return None
+                cursor = next_cursor
+                if pause_seconds and page_index + 1 < max_pages:
+                    time.sleep(pause_seconds)
+    except Exception:
+        return None
+
+    if not complete:
+        return None
+    ordered_keys = sorted(rows)
+    if not ordered_keys:
+        return None
+    if (
+        ordered_keys[0] != first_expected_ms
+        or ordered_keys[-1] != last_expected_ms
+        or any(
+            right - left != step_ms
+            for left, right in zip(ordered_keys, ordered_keys[1:])
+        )
+    ):
+        return None
+    frame = pd.DataFrame([rows[key] for key in ordered_keys], columns=columns)
+    frame.attrs.update({
+        "range_complete": True,
+        "range_start_ms": start_ms,
+        "range_end_ms": end_ms,
+        "interval": interval,
+    })
+    return frame
+
 
 def _fetch_klines_bitget(symbol, interval, limit=200, closed_only=True):
     granularity = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",

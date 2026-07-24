@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("AXIOM_DISABLE_AUTOSTART", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -52,7 +53,8 @@ class ExchangeEntryPriceSyncTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             bot._positions_path = str(Path(tmp) / "positions.json")
-            bot._sync_positions()
+            with patch("trader.fetch_klines", return_value=None):
+                bot._sync_positions()
 
         self.assertEqual(len(bot.positions), 1)
         self.assertEqual(bot.positions[0].entry_price, 101.25)
