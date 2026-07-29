@@ -1,7 +1,10 @@
 import math
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+
+RANGE_DAYS = (7, 30, 90, 180, 365)
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -101,4 +104,122 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
         "valid_exit_record_count": valid_exit_record_count,
         "excluded_records": excluded_records,
         "lifecycles": lifecycles,
+    }
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _summarize_lifecycles(lifecycles: list[dict], metadata: dict) -> dict:
+    values = [float(item["r"]) for item in lifecycles]
+    wins = [value for value in values if value > 0]
+    losses = [value for value in values if value < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    average_win = gross_profit / len(wins) if wins else None
+    average_loss = sum(losses) / len(losses) if losses else None
+
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    current_losses = 0
+    max_losses = 0
+    points = []
+    directions = {}
+    reasons = {}
+
+    for trade in lifecycles:
+        trade_r = float(trade["r"])
+        cumulative += trade_r
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+        points.append({"time": trade["time"], "r": _rounded(cumulative)})
+
+        if trade_r < 0:
+            current_losses += 1
+            max_losses = max(max_losses, current_losses)
+        else:
+            current_losses = 0
+
+        direction = trade["direction"] or "UNKNOWN"
+        direction_row = directions.setdefault(direction, {"trades": 0, "net_r": 0.0})
+        direction_row["trades"] += 1
+        direction_row["net_r"] += trade_r
+
+        for reason, reason_r in trade["reason_r"].items():
+            reason_row = reasons.setdefault(reason, {"trades": 0, "net_r": 0.0})
+            reason_row["trades"] += 1
+            reason_row["net_r"] += reason_r
+
+    positive_mfe = [trade for trade in lifecycles if trade["r"] > 0 and trade["mfe_r"] > 0]
+    mfe_denominator = sum(trade["mfe_r"] for trade in positive_mfe)
+    capture = (
+        sum(trade["r"] for trade in positive_mfe) / mfe_denominator
+        if mfe_denominator > 0 else None
+    )
+
+    for row in directions.values():
+        row["net_r"] = _rounded(row["net_r"])
+    for row in reasons.values():
+        row["net_r"] = _rounded(row["net_r"])
+
+    count = len(values)
+    return {
+        **metadata,
+        "valid_trade_count": count,
+        "net_r": _rounded(sum(values)),
+        "expectancy_r": _rounded(sum(values) / count) if count else None,
+        "win_rate": _rounded(len(wins) / count * 100) if count else None,
+        "average_win_r": _rounded(average_win) if average_win is not None else None,
+        "average_loss_r": _rounded(average_loss) if average_loss is not None else None,
+        "average_payoff_ratio": (
+            _rounded(average_win / abs(average_loss))
+            if average_win is not None and average_loss not in (None, 0) else None
+        ),
+        "profit_factor": _rounded(gross_profit / gross_loss) if gross_loss > 0 else None,
+        "max_drawdown_r": _rounded(max_drawdown),
+        "max_consecutive_losses": max_losses,
+        "largest_win_r": _rounded(max(wins)) if wins else None,
+        "largest_loss_r": _rounded(min(losses)) if losses else None,
+        "direction_breakdown": directions,
+        "exit_reason_breakdown": reasons,
+        "average_mfe_r": (
+            _rounded(sum(trade["mfe_r"] for trade in lifecycles) / count)
+            if count else None
+        ),
+        "mfe_capture_efficiency": _rounded(capture) if capture is not None else None,
+        "cumulative_r_points": points,
+    }
+
+
+def summarize_r_performance_ranges(
+    trade_log: list[dict],
+    now: Optional[datetime] = None,
+) -> dict:
+    grouped = build_r_trade_lifecycles(trade_log)
+    current = now or (datetime.now(timezone.utc) + timedelta(hours=8))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+
+    metadata = {
+        "source_record_count": grouped["source_record_count"],
+        "valid_exit_record_count": grouped["valid_exit_record_count"],
+        "excluded_records": grouped["excluded_records"],
+    }
+    ranges = {
+        "all": _summarize_lifecycles(grouped["lifecycles"], metadata),
+    }
+    now_timestamp = current.timestamp()
+    for days in RANGE_DAYS:
+        cutoff = now_timestamp - days * 86400
+        selected = [
+            trade for trade in grouped["lifecycles"]
+            if trade["timestamp"] >= cutoff
+        ]
+        ranges[str(days)] = _summarize_lifecycles(selected, metadata)
+
+    return {
+        "status": "ok" if grouped["lifecycles"] else "empty",
+        "ranges": ranges,
     }

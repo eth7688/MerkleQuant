@@ -1,7 +1,8 @@
 import math
 import unittest
+from datetime import datetime, timezone
 
-from performance_metrics import build_r_trade_lifecycles
+from performance_metrics import build_r_trade_lifecycles, summarize_r_performance_ranges
 
 
 class RLifecycleTests(unittest.TestCase):
@@ -123,3 +124,61 @@ class RLifecycleTests(unittest.TestCase):
 
         self.assertEqual([trade["key"] for trade in result["lifecycles"]], ["key", " key "])
         self.assertEqual([trade["r"] for trade in result["lifecycles"]], [1.0, 2.0])
+
+
+class RSummaryTests(unittest.TestCase):
+    NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+
+    def test_calculates_core_metrics_drawdown_streak_and_breakdowns(self):
+        rows = [
+            {"time": "2026-07-20T10:00:00+00:00", "risk": 100, "r": 2.0, "mfe_r": 3.0, "direction": "LONG", "reason": "ATR"},
+            {"time": "2026-07-21T10:00:00+00:00", "risk": 100, "r": -1.0, "mfe_r": 0.2, "direction": "SHORT", "reason": "SL"},
+            {"time": "2026-07-22T10:00:00+00:00", "risk": 100, "r": -0.5, "mfe_r": 0.4, "direction": "SHORT", "reason": "SL"},
+            {"time": "2026-07-23T10:00:00+00:00", "risk": 100, "r": 1.0, "mfe_r": 2.0, "direction": "LONG", "reason": "结构退出"},
+            {"time": "2026-07-24T10:00:00+00:00", "risk": 100, "r": 0.0, "mfe_r": 0.8, "direction": "LONG", "reason": "保本"},
+        ]
+
+        summary = summarize_r_performance_ranges(rows, self.NOW)["ranges"]["all"]
+
+        self.assertEqual(summary["valid_trade_count"], 5)
+        self.assertAlmostEqual(summary["net_r"], 1.5)
+        self.assertAlmostEqual(summary["expectancy_r"], 0.3)
+        self.assertAlmostEqual(summary["win_rate"], 40.0)
+        self.assertAlmostEqual(summary["average_win_r"], 1.5)
+        self.assertAlmostEqual(summary["average_loss_r"], -0.75)
+        self.assertAlmostEqual(summary["average_payoff_ratio"], 2.0)
+        self.assertAlmostEqual(summary["profit_factor"], 2.0)
+        self.assertAlmostEqual(summary["max_drawdown_r"], 1.5)
+        self.assertEqual(summary["max_consecutive_losses"], 2)
+        self.assertEqual(summary["largest_win_r"], 2.0)
+        self.assertEqual(summary["largest_loss_r"], -1.0)
+        self.assertEqual(summary["direction_breakdown"]["LONG"]["net_r"], 3.0)
+        self.assertEqual(summary["direction_breakdown"]["SHORT"]["net_r"], -1.5)
+        self.assertEqual(summary["exit_reason_breakdown"]["SL"]["net_r"], -1.5)
+        self.assertAlmostEqual(summary["average_mfe_r"], 1.28)
+        self.assertAlmostEqual(summary["mfe_capture_efficiency"], 0.6)
+
+    def test_groups_before_filtering_and_uses_final_exit_time_for_range(self):
+        key = "PREDICTA|PARTIAL|LONG|30m|1"
+        rows = [
+            {"time": "2026-07-01T10:00:00+00:00", "signal_key": key, "risk": 100, "r": 1.0},
+            {"time": "2026-07-28T10:00:00+00:00", "signal_key": key, "risk": 100, "r": 0.5},
+            {"time": "2026-07-10T10:00:00+00:00", "risk": 100, "r": -1.0},
+        ]
+
+        result = summarize_r_performance_ranges(rows, self.NOW)
+
+        self.assertEqual(result["ranges"]["7"]["valid_trade_count"], 1)
+        self.assertAlmostEqual(result["ranges"]["7"]["net_r"], 1.5)
+        self.assertEqual(result["ranges"]["30"]["valid_trade_count"], 2)
+
+    def test_returns_none_for_undefined_ratios(self):
+        rows = [
+            {"time": "2026-07-28T10:00:00+00:00", "risk": 100, "r": 1.0},
+        ]
+
+        summary = summarize_r_performance_ranges(rows, self.NOW)["ranges"]["all"]
+
+        self.assertIsNone(summary["average_loss_r"])
+        self.assertIsNone(summary["average_payoff_ratio"])
+        self.assertIsNone(summary["profit_factor"])
