@@ -36,6 +36,7 @@ video_frames/
 # Local agent state and private project memory
 .agents/
 .codex/
+.superpowers/
 memory/
 tmp_skill_review_tech_analysis/
 
