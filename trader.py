@@ -35,6 +35,7 @@ from predicta_indicator import (
     evaluate_predicta_setup,
     make_predicta_setup,
 )
+from performance_metrics import summarize_r_performance_ranges
 
 from screener import (
     fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
@@ -1117,6 +1118,8 @@ class SqueezeBreakoutBot:
         self._fast_equity_cache: list = []
         self._fast_drawdown_cache_ts: float = 0.0
         self._fast_drawdown_cache: dict = {}
+        self._fast_r_performance_cache_ts: float = 0.0
+        self._fast_r_performance_cache: dict = {}
         self._fast_position_snapshot_ts: float = 0.0
         self._last_stop_reconcile_ts: float = 0.0
         self._hermes_confirm_cache: dict = {}
@@ -2167,6 +2170,23 @@ class SqueezeBreakoutBot:
             except Exception:
                 pass
         return 0.0
+
+    def _r_performance_summary(self) -> dict:
+        now_ts = time.time()
+        if (
+            self._fast_r_performance_cache
+            and now_ts - self._fast_r_performance_cache_ts < 2
+        ):
+            return self._fast_r_performance_cache
+        try:
+            payload = summarize_r_performance_ranges(self.trade_log, now=bj_now())
+        except Exception as exc:
+            if getattr(self, "_log_ready", False):
+                self._log.warning(f"R绩效统计失败: {exc}")
+            payload = {"status": "error", "ranges": {}}
+        self._fast_r_performance_cache = payload
+        self._fast_r_performance_cache_ts = now_ts
+        return payload
 
     @staticmethod
     def _extract_order_number(obj, keys, allow_negative: bool = False):
@@ -8341,6 +8361,7 @@ class SqueezeBreakoutBot:
         rj_watchlist = getattr(self, "_rj_watchlist", {}) or {}
         rj_setup_pool_rows = self._rj_setup_pool_rows(limit=40, now_ts=now_ts)
         rj_pipeline = self._rj_pipeline_status(rj_setup_pool_rows)
+        r_performance = self._r_performance_summary()
         return {
             "fast": True,
             "running": self.running,
@@ -8401,6 +8422,7 @@ class SqueezeBreakoutBot:
             "last_scan": self.last_scan_time.isoformat() if self.last_scan_time else "",
             "last_signals": self.last_signal_count,
             "trade_count": len(self.trade_log),
+            "r_performance": r_performance,
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
@@ -8523,6 +8545,7 @@ class SqueezeBreakoutBot:
         now_ts = time.time()
         rj_setup_pool_rows = self._rj_setup_pool_rows(limit=40, now_ts=now_ts)
         rj_pipeline = self._rj_pipeline_status(rj_setup_pool_rows)
+        r_performance = self._r_performance_summary()
         return {
             "running": self.running,
             "uptime": int((bj_now() - self.start_time).total_seconds()) if self.start_time else 0,
@@ -8590,6 +8613,7 @@ class SqueezeBreakoutBot:
             "last_scan": self.last_scan_time.isoformat() if self.last_scan_time else "",
             "last_signals": self.last_signal_count,
             "trade_count": len(self.trade_log),
+            "r_performance": r_performance,
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
