@@ -133,6 +133,34 @@ process.stdout.write(JSON.stringify(snapshot()));
     return json.loads(completed.stdout)
 
 
+def run_r_details_state_probe():
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    start = source.index("var _rPerformanceDetailsOpen")
+    end = source.index("function initTraderPanel()")
+    script = f"""
+{source[start:end]}
+var initial=rPerformancePanelHtml();
+rememberRPerformanceDetailsState({{open:true}});
+var opened=rPerformancePanelHtml();
+rememberRPerformanceDetailsState({{open:false}});
+var closed=rPerformancePanelHtml();
+process.stdout.write(JSON.stringify({{
+  initialOpen:/<details[^>]*\\sopen(?:\\s|>)/.test(initial),
+  openedOpen:/<details[^>]*\\sopen(?:\\s|>)/.test(opened),
+  closedOpen:/<details[^>]*\\sopen(?:\\s|>)/.test(closed),
+  hasToggleHandler:opened.indexOf('ontoggle="rememberRPerformanceDetailsState(this)"')>=0
+}}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(completed.stdout)
+
+
 class RPerformanceIntegrationTests(unittest.TestCase):
     def test_engine_caches_r_summary_for_fast_polling(self):
         bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
@@ -207,6 +235,16 @@ class RPerformanceIntegrationTests(unittest.TestCase):
 
 
 class RPerformanceUiTests(unittest.TestCase):
+    def test_details_state_survives_dashboard_html_rebuild(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+
+        self.assertIn("var _rPerformanceDetailsOpen", source)
+        state = run_r_details_state_probe()
+        self.assertFalse(state["initialOpen"])
+        self.assertTrue(state["openedOpen"])
+        self.assertFalse(state["closedOpen"])
+        self.assertTrue(state["hasToggleHandler"])
+
     def test_normal_and_demo_views_reuse_one_r_panel(self):
         source = Path("web_ui.py").read_text(encoding="utf-8")
 

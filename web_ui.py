@@ -1707,6 +1707,11 @@ function renderTrader(){
   refreshTraderData();
 }
 
+var _rPerformanceDetailsOpen=false;
+function rememberRPerformanceDetailsState(details){
+  _rPerformanceDetailsOpen=!!(details&&details.open);
+}
+
 function rPerformancePanelHtml(){
   return '<section class="r-panel" id="rPerformancePanel">'
     +'<div class="r-head"><div class="r-title">R PERFORMANCE</div><div class="r-meta" id="rPerformanceMeta">--</div></div>'
@@ -1719,7 +1724,9 @@ function rPerformancePanelHtml(){
     +'<div class="r-card"><div class="r-label">最大回撤 R</div><div class="r-value r" id="rDrawdownValue">--</div></div>'
     +'</div>'
     +'<div class="r-chart-wrap" id="rPerformanceChart"><div class="eq-empty">等待有效 R 交易记录</div></div>'
-    +'<details class="r-details" id="rPerformanceDetails"><summary>更多复盘</summary><div class="r-detail-grid" id="rPerformanceDetailGrid"></div></details>'
+    +'<details class="r-details" id="rPerformanceDetails"'
+    +(_rPerformanceDetailsOpen?' open':'')
+    +' ontoggle="rememberRPerformanceDetailsState(this)"><summary>更多复盘</summary><div class="r-detail-grid" id="rPerformanceDetailGrid"></div></details>'
     +'</section>';
 }
 
