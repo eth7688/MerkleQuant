@@ -9,6 +9,12 @@ from trader import SqueezeBreakoutBot
 
 def run_r_renderer_probe(scenario):
     source = Path("web_ui.py").read_text(encoding="utf-8")
+    direction_attack = json.dumps(
+        """<img src=x onerror=globalThis.pwned=1> & " '"""
+    )
+    reason_attack = json.dumps(
+        """TP <img onerror=globalThis.pwned=2> & " '"""
+    )
     helpers = source[
         source.index("function getRRangeSummary(d)"):
         source.index("function fmtMoney(v, signed)")
@@ -51,14 +57,20 @@ function snapshot(){{
       nodes.rPayoffValue.textContent,nodes.rProfitFactorValue.textContent,
       nodes.rAverageValue.textContent,nodes.rDrawdownValue.textContent
     ],
+    classes:[
+      nodes.rNetValue.className,nodes.rExpectancyValue.className,
+      nodes.rPayoffValue.className,nodes.rProfitFactorValue.className,
+      nodes.rAverageValue.className,nodes.rDrawdownValue.className
+    ],
     chart:nodes.rPerformanceChart.innerHTML,
     detail:nodes.rPerformanceDetailGrid.innerHTML
   }};
 }}
-if({json.dumps(scenario)}==='stale'){{
+var scenario={json.dumps(scenario)};
+if(scenario==='stale'){{
   renderRPerformance({{r_performance:{{ranges:{{'7':summary(2)}}}}}});
   renderRPerformance({{r_performance:{{status:'error',ranges:{{}}}}}});
-}}else{{
+}}else if(scenario==='non_finite'){{
   var invalid=summary(Infinity);
   invalid.valid_trade_count=Infinity;
   invalid.win_rate=NaN;
@@ -78,6 +90,36 @@ if({json.dumps(scenario)}==='stale'){{
   invalid.largest_win_r=NaN;
   invalid.largest_loss_r=Infinity;
   renderRPerformance({{r_performance:{{ranges:{{'7':invalid}}}}}});
+}}else if(scenario==='malicious_labels'){{
+  var malicious=summary(1);
+  malicious.direction_breakdown={{}};
+  malicious.direction_breakdown[{direction_attack}]={{trades:1,net_r:1}};
+  malicious.exit_reason_breakdown={{}};
+  malicious.exit_reason_breakdown[{reason_attack}]={{trades:1,net_r:1}};
+  renderRPerformance({{r_performance:{{ranges:{{'7':malicious}}}}}});
+}}else if(scenario==='only_loss'){{
+  var loss=summary(-2);
+  loss.win_rate=0;
+  loss.expectancy_r=-1;
+  loss.average_win_r=null;
+  loss.average_loss_r=-1;
+  loss.average_payoff_ratio=null;
+  loss.profit_factor=0;
+  loss.max_drawdown_r=2;
+  loss.cumulative_r_points=[{{r:-1}},{{r:-2}}];
+  loss.exit_reason_breakdown={{SL:{{trades:2,net_r:-2}}}};
+  renderRPerformance({{r_performance:{{ranges:{{'7':loss}}}}}});
+}}else if(scenario==='excluded'){{
+  var excluded=summary(1);
+  excluded.valid_exit_record_count=2;
+  excluded.source_record_count=5;
+  excluded.excluded_records=3;
+  renderRPerformance({{r_performance:{{ranges:{{'7':excluded}}}}}});
+}}else if(scenario==='range_reason'){{
+  _equityRangeDays=180;
+  var ranged=summary(2);
+  ranged.exit_reason_breakdown={{TP:{{trades:2,net_r:2}}}};
+  renderRPerformance({{r_performance:{{ranges:{{'180':ranged}}}}}});
 }}
 process.stdout.write(JSON.stringify(snapshot()));
 """
@@ -100,12 +142,61 @@ class RPerformanceIntegrationTests(unittest.TestCase):
         bot._log_ready = False
 
         expected = {"status": "ok", "ranges": {"all": {"net_r": 1}}}
-        with patch("trader.summarize_r_performance_ranges", return_value=expected) as calculate:
+        with (
+            patch("trader.time.monotonic", side_effect=[100.0, 101.0]),
+            patch("trader.summarize_r_performance_ranges", return_value=expected) as calculate,
+        ):
             first = bot._r_performance_summary()
             second = bot._r_performance_summary()
 
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
+        calculate.assert_called_once()
+
+    def test_engine_recalculates_r_summary_after_cache_expiry(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.trade_log = []
+        bot._fast_r_performance_cache_ts = 0.0
+        bot._fast_r_performance_cache = {}
+        bot._log_ready = False
+
+        first_payload = {"status": "ok", "ranges": {"all": {"net_r": 1}}}
+        second_payload = {"status": "ok", "ranges": {"all": {"net_r": 2}}}
+        with (
+            patch("trader.time.monotonic", side_effect=[100.0, 101.99, 102.0]),
+            patch(
+                "trader.summarize_r_performance_ranges",
+                side_effect=[first_payload, second_payload],
+            ) as calculate,
+        ):
+            first = bot._r_performance_summary()
+            cached = bot._r_performance_summary()
+            refreshed = bot._r_performance_summary()
+
+        self.assertEqual(first, first_payload)
+        self.assertEqual(cached, first_payload)
+        self.assertEqual(refreshed, second_payload)
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_engine_returns_and_caches_error_payload_on_calculator_exception(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.trade_log = []
+        bot._fast_r_performance_cache_ts = 0.0
+        bot._fast_r_performance_cache = {}
+        bot._log_ready = False
+
+        with (
+            patch("trader.time.monotonic", side_effect=[100.0, 101.0]),
+            patch(
+                "trader.summarize_r_performance_ranges",
+                side_effect=RuntimeError("calculator failed"),
+            ) as calculate,
+        ):
+            first = bot._r_performance_summary()
+            second = bot._r_performance_summary()
+
+        self.assertEqual(first, {"status": "error", "ranges": {}})
+        self.assertEqual(second, first)
         calculate.assert_called_once()
 
     def test_both_status_methods_publish_the_same_named_payload(self):
@@ -124,6 +215,7 @@ class RPerformanceUiTests(unittest.TestCase):
         self.assertIn("function renderRPerformance(d)", source)
         self.assertIn("function resetRPerformance(message)", source)
         self.assertIn("function finiteRNumber(value)", source)
+        self.assertIn("function escapeRHtml(value)", source)
         self.assertEqual(source.count("h+=rPerformancePanelHtml();"), 2)
         self.assertIn("renderRPerformance(d);", source)
 
@@ -145,7 +237,7 @@ class RPerformanceUiTests(unittest.TestCase):
     def test_runtime_resets_stale_panel_when_summary_disappears(self):
         state = run_r_renderer_probe("stale")
 
-        self.assertEqual(state["meta"], "无统计数据")
+        self.assertEqual(state["meta"], "1W · 无统计数据")
         self.assertEqual(state["metrics"], ["--"] * 6)
         self.assertIn("等待有效 R 交易记录", state["chart"])
         self.assertIn("暂无复盘数据", state["detail"])
@@ -162,3 +254,34 @@ class RPerformanceUiTests(unittest.TestCase):
         self.assertIn("R 曲线数据无效", state["chart"])
         self.assertNotIn("<svg", state["chart"])
         self.assertNotRegex(rendered, r"NaN|Infinity")
+
+    def test_runtime_escapes_all_payload_derived_labels(self):
+        state = run_r_renderer_probe("malicious_labels")
+
+        self.assertNotIn("<img", state["detail"])
+        self.assertIn("&lt;img", state["detail"])
+        self.assertIn("&amp;", state["detail"])
+        self.assertIn("&quot;", state["detail"])
+        self.assertIn("&#39;", state["detail"])
+
+    def test_runtime_renders_only_loss_state_without_inventing_win_metrics(self):
+        state = run_r_renderer_probe("only_loss")
+
+        self.assertEqual(
+            state["metrics"],
+            ["−2.00R", "−1.00R", "--", "0.00", "-- / −1.00R", "−2.00R"],
+        )
+        self.assertEqual(state["classes"][0], "r-value r")
+        self.assertEqual(state["classes"][4], "r-value neu")
+
+    def test_runtime_reports_excluded_records(self):
+        state = run_r_renderer_probe("excluded")
+
+        self.assertIn("有效记录 2 / 5", state["meta"])
+        self.assertIn("未计入 3 条", state["meta"])
+
+    def test_runtime_reports_current_range_and_exit_reason_trade_count(self):
+        state = run_r_renderer_probe("range_reason")
+
+        self.assertTrue(state["meta"].startswith("6M · "))
+        self.assertIn("TP 2 笔 · +2.00R", state["detail"])

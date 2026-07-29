@@ -2172,7 +2172,7 @@ class SqueezeBreakoutBot:
         return 0.0
 
     def _r_performance_summary(self) -> dict:
-        now_ts = time.time()
+        now_ts = time.monotonic()
         if (
             self._fast_r_performance_cache
             and now_ts - self._fast_r_performance_cache_ts < 2

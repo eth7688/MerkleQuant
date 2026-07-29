@@ -1,6 +1,6 @@
 import math
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from performance_metrics import build_r_trade_lifecycles, summarize_r_performance_ranges
 
@@ -125,6 +125,75 @@ class RLifecycleTests(unittest.TestCase):
         self.assertEqual([trade["key"] for trade in result["lifecycles"]], ["key", " key "])
         self.assertEqual([trade["r"] for trade in result["lifecycles"]], [1.0, 2.0])
 
+    def test_missing_excursions_remain_unmeasured(self):
+        rows = [
+            {"time": "2026-07-20T10:00:00+00:00", "risk": 100, "r": 1.0},
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        trade = result["lifecycles"][0]
+        self.assertIsNone(trade["mfe_r"])
+        self.assertIsNone(trade["mae_r"])
+
+    def test_invalid_excursions_remain_unmeasured(self):
+        rows = [
+            {
+                "time": "2026-07-20T10:00:00+00:00",
+                "risk": 100,
+                "r": 1.0,
+                "mfe_r": math.inf,
+                "mae_r": "invalid",
+            },
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        trade = result["lifecycles"][0]
+        self.assertIsNone(trade["mfe_r"])
+        self.assertIsNone(trade["mae_r"])
+
+    def test_partial_excursions_use_only_finite_observations(self):
+        key = "PREDICTA|PARTIAL|LONG|30m|2"
+        rows = [
+            {
+                "time": "2026-07-20T10:00:00+00:00",
+                "signal_key": key,
+                "risk": 100,
+                "r": 0.25,
+            },
+            {
+                "time": "2026-07-20T10:01:00+00:00",
+                "signal_key": key,
+                "risk": 100,
+                "r": 0.25,
+                "mfe_r": math.nan,
+                "mae_r": math.inf,
+            },
+            {
+                "time": "2026-07-20T10:02:00+00:00",
+                "signal_key": key,
+                "risk": 100,
+                "r": 0.5,
+                "mfe_r": 2.5,
+                "mae_r": 0.4,
+            },
+            {
+                "time": "2026-07-20T10:03:00+00:00",
+                "signal_key": key,
+                "risk": 100,
+                "r": 0.5,
+                "mfe_r": 3.0,
+                "mae_r": 0.2,
+            },
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        trade = result["lifecycles"][0]
+        self.assertEqual(trade["mfe_r"], 3.0)
+        self.assertEqual(trade["mae_r"], 0.4)
+
 
 class RSummaryTests(unittest.TestCase):
     NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
@@ -182,3 +251,78 @@ class RSummaryTests(unittest.TestCase):
         self.assertIsNone(summary["average_loss_r"])
         self.assertIsNone(summary["average_payoff_ratio"])
         self.assertIsNone(summary["profit_factor"])
+
+    def test_average_mfe_uses_only_measured_lifecycles(self):
+        rows = [
+            {"time": "2026-07-27T10:00:00+00:00", "risk": 100, "r": 1.0},
+            {
+                "time": "2026-07-28T10:00:00+00:00",
+                "risk": 100,
+                "r": 1.0,
+                "mfe_r": 4.0,
+            },
+        ]
+
+        summary = summarize_r_performance_ranges(rows, self.NOW)["ranges"]["all"]
+
+        self.assertEqual(summary["average_mfe_r"], 4.0)
+
+    def test_average_mfe_is_none_when_no_lifecycle_has_a_measurement(self):
+        rows = [
+            {"time": "2026-07-27T10:00:00+00:00", "risk": 100, "r": 1.0},
+            {
+                "time": "2026-07-28T10:00:00+00:00",
+                "risk": 100,
+                "r": -1.0,
+                "mfe_r": math.nan,
+            },
+        ]
+
+        summary = summarize_r_performance_ranges(rows, self.NOW)["ranges"]["all"]
+
+        self.assertIsNone(summary["average_mfe_r"])
+
+    def test_range_cutoff_includes_exact_boundary_only(self):
+        cutoff = self.NOW - timedelta(days=7)
+        rows = [
+            {"time": cutoff.isoformat(), "risk": 100, "r": 1.0},
+            {
+                "time": (cutoff - timedelta(microseconds=1)).isoformat(),
+                "risk": 100,
+                "r": -1.0,
+            },
+        ]
+
+        summary = summarize_r_performance_ranges(rows, self.NOW)["ranges"]["7"]
+
+        self.assertEqual(summary["valid_trade_count"], 1)
+        self.assertEqual(summary["net_r"], 1.0)
+
+    def test_caps_only_chart_points_and_preserves_first_and_last(self):
+        start = self.NOW - timedelta(hours=10)
+        rows = [
+            {
+                "time": (start + timedelta(minutes=index)).isoformat(),
+                "risk": 100,
+                "r": 1.0,
+            }
+            for index in range(600)
+        ]
+
+        ranges = summarize_r_performance_ranges(rows, self.NOW)["ranges"]
+
+        for key in ("7", "30", "90", "180", "365", "all"):
+            with self.subTest(range=key):
+                summary = ranges[key]
+                self.assertEqual(summary["valid_trade_count"], 600)
+                self.assertEqual(summary["net_r"], 600.0)
+                self.assertEqual(summary["expectancy_r"], 1.0)
+                self.assertEqual(len(summary["cumulative_r_points"]), 500)
+                self.assertEqual(
+                    summary["cumulative_r_points"][0],
+                    {"time": rows[0]["time"], "r": 1.0},
+                )
+                self.assertEqual(
+                    summary["cumulative_r_points"][-1],
+                    {"time": rows[-1]["time"], "r": 600.0},
+                )

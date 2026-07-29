@@ -1937,6 +1937,18 @@ function getRRangeSummary(d){
   var key=Number(_equityRangeDays||0)>0?String(_equityRangeDays):'all';
   return ranges[key]||null;
 }
+function getRRangeLabel(){
+  var labels={7:'1W',30:'1M',90:'3M',180:'6M',365:'1Y',0:'ALL'};
+  return labels[Number(_equityRangeDays||0)]||'ALL';
+}
+function escapeRHtml(value){
+  return String(value===null||value===undefined?'':value)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
 function finiteRNumber(value){
   if(value===null||value===undefined||value==='') return null;
   var n=Number(value);
@@ -1969,7 +1981,7 @@ function setRValue(id,text,value,tone){
 }
 function resetRPerformance(message){
   var meta=document.getElementById('rPerformanceMeta');
-  if(meta) meta.textContent=message||'无统计数据';
+  if(meta) meta.textContent=getRRangeLabel()+' · '+(message||'无统计数据');
   setRValue('rNetValue','--',null);
   setRValue('rExpectancyValue','--',null);
   setRValue('rPayoffValue','--',null,'p');
@@ -2177,7 +2189,7 @@ function renderRPerformance(d){
   if(!chart) return;
   if(meta){
     var excluded=finiteRNumber(s.excluded_records);
-    meta.textContent='完整交易 '+fmtRCount(s.valid_trade_count)
+    meta.textContent=getRRangeLabel()+' · 完整交易 '+fmtRCount(s.valid_trade_count)
       +' · 胜率 '+fmtRPercent(s.win_rate)
       +' · 连亏峰值 '+fmtRCount(s.max_consecutive_losses)
       +' · 有效记录 '+fmtRCount(s.valid_exit_record_count)+' / '+fmtRCount(s.source_record_count)
@@ -2223,11 +2235,14 @@ function renderRPerformance(d){
   }
 
   var directions=s.direction_breakdown||{}, reasons=s.exit_reason_breakdown||{};
-  var directionText=Object.keys(directions).map(function(k){return k+' '+fmtRValue((directions[k]||{}).net_r,true)}).join('<br>')||'--';
+  var directionText=Object.keys(directions).map(function(k){return escapeRHtml(k)+' '+fmtRValue((directions[k]||{}).net_r,true)}).join('<br>')||'--';
   var reasonText=Object.keys(reasons).sort(function(a,b){
     var av=finiteRNumber((reasons[a]||{}).net_r), bv=finiteRNumber((reasons[b]||{}).net_r);
     return (bv===null?-1:Math.abs(bv))-(av===null?-1:Math.abs(av));
-  }).map(function(k){return k+' '+fmtRValue((reasons[k]||{}).net_r,true)}).join('<br>')||'--';
+  }).map(function(k){
+    var row=reasons[k]||{};
+    return escapeRHtml(k)+' '+fmtRCount(row.trades)+' 笔 · '+fmtRValue(row.net_r,true);
+  }).join('<br>')||'--';
   var capture=finiteRNumber(s.mfe_capture_efficiency);
   var detail=document.getElementById('rPerformanceDetailGrid');
   if(detail) detail.innerHTML='<div class="r-detail-box"><b>方向贡献</b><br>'+directionText+'</div>'

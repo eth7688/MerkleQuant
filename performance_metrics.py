@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 
 RANGE_DAYS = (7, 30, 90, 180, 365)
+MAX_CUMULATIVE_R_POINTS = 500
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -71,15 +72,23 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
             "time": closed_at.isoformat(),
             "timestamp": closed_at.timestamp(),
             "r": 0.0,
-            "mfe_r": 0.0,
-            "mae_r": 0.0,
+            "mfe_r": None,
+            "mae_r": None,
             "reasons": [],
             "final_reason": reason,
             "reason_r": {},
         })
         trade["r"] += exit_r
-        trade["mfe_r"] = max(trade["mfe_r"], mfe_r or 0.0)
-        trade["mae_r"] = max(trade["mae_r"], mae_r or 0.0)
+        if mfe_r is not None:
+            trade["mfe_r"] = (
+                mfe_r if trade["mfe_r"] is None
+                else max(trade["mfe_r"], mfe_r)
+            )
+        if mae_r is not None:
+            trade["mae_r"] = (
+                mae_r if trade["mae_r"] is None
+                else max(trade["mae_r"], mae_r)
+            )
         trade["reason_r"][reason] = trade["reason_r"].get(reason, 0.0) + exit_r
         if reason not in trade["reasons"]:
             trade["reasons"].append(reason)
@@ -93,8 +102,10 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
     lifecycles = sorted(groups.values(), key=lambda item: item["timestamp"])
     for trade in lifecycles:
         trade["r"] = round(trade["r"], 6)
-        trade["mfe_r"] = round(trade["mfe_r"], 6)
-        trade["mae_r"] = round(trade["mae_r"], 6)
+        if trade["mfe_r"] is not None:
+            trade["mfe_r"] = round(trade["mfe_r"], 6)
+        if trade["mae_r"] is not None:
+            trade["mae_r"] = round(trade["mae_r"], 6)
         trade["reason_r"] = {
             key: round(value, 6) for key, value in trade["reason_r"].items()
         }
@@ -109,6 +120,17 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
 
 def _rounded(value: float) -> float:
     return round(float(value), 6)
+
+
+def _cap_cumulative_points(points: list[dict]) -> list[dict]:
+    if len(points) <= MAX_CUMULATIVE_R_POINTS:
+        return points
+    last_index = len(points) - 1
+    denominator = MAX_CUMULATIVE_R_POINTS - 1
+    return [
+        points[index * last_index // denominator]
+        for index in range(MAX_CUMULATIVE_R_POINTS)
+    ]
 
 
 def _summarize_lifecycles(lifecycles: list[dict], metadata: dict) -> dict:
@@ -152,7 +174,16 @@ def _summarize_lifecycles(lifecycles: list[dict], metadata: dict) -> dict:
             reason_row["trades"] += 1
             reason_row["net_r"] += reason_r
 
-    positive_mfe = [trade for trade in lifecycles if trade["r"] > 0 and trade["mfe_r"] > 0]
+    measured_mfe = [
+        trade["mfe_r"] for trade in lifecycles
+        if trade["mfe_r"] is not None
+    ]
+    positive_mfe = [
+        trade for trade in lifecycles
+        if trade["r"] > 0
+        and trade["mfe_r"] is not None
+        and trade["mfe_r"] > 0
+    ]
     mfe_denominator = sum(trade["mfe_r"] for trade in positive_mfe)
     capture = (
         sum(trade["r"] for trade in positive_mfe) / mfe_denominator
@@ -185,11 +216,11 @@ def _summarize_lifecycles(lifecycles: list[dict], metadata: dict) -> dict:
         "direction_breakdown": directions,
         "exit_reason_breakdown": reasons,
         "average_mfe_r": (
-            _rounded(sum(trade["mfe_r"] for trade in lifecycles) / count)
-            if count else None
+            _rounded(sum(measured_mfe) / len(measured_mfe))
+            if measured_mfe else None
         ),
         "mfe_capture_efficiency": _rounded(capture) if capture is not None else None,
-        "cumulative_r_points": points,
+        "cumulative_r_points": _cap_cumulative_points(points),
     }
 
 
