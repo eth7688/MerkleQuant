@@ -1128,6 +1128,23 @@ tr.row-strong{background:linear-gradient(90deg,rgba(52,211,153,0.05) 0%,transpar
 .eq-dot.base{background:rgba(148,163,184,0.65);border-top:1px dashed rgba(148,163,184,0.9)}
 @media(max-width:768px){.eq-head{align-items:flex-start;flex-direction:column}.eq-metrics{grid-template-columns:repeat(2,1fr)}.eq-chart-wrap{height:210px}.eq-range button{padding:4px 7px}}
 @media(max-width:480px){.eq-metrics{grid-template-columns:1fr}.eq-value{font-size:15px}.eq-chart-wrap{height:190px}}
+.r-panel{background:linear-gradient(180deg,rgba(18,22,27,.97),rgba(11,14,18,.99));border:1px solid rgba(52,211,153,.18);border-radius:10px;padding:14px 16px;margin:-8px 0 18px;box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 8px 24px rgba(0,0,0,.28)}
+.r-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.r-title{font-size:12px;font-weight:800;letter-spacing:.08em;color:var(--s-green)}
+.r-meta{font-size:9px;color:var(--muted);font-family:var(--font-mono)}
+.r-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
+.r-card{min-width:0;padding:9px;background:rgba(4,7,10,.72);border:1px solid rgba(255,255,255,.045);border-radius:8px}
+.r-label{font-size:8px;color:var(--text2);font-weight:700;white-space:nowrap;margin-bottom:4px}
+.r-value{font:800 15px var(--font-mono);font-variant-numeric:tabular-nums}
+.r-value.g{color:var(--s-green)}.r-value.r{color:var(--s-red)}.r-value.neu{color:#fff}.r-value.p{color:var(--s-purple)}
+.r-chart-wrap{height:150px;margin-top:10px;border-top:1px solid rgba(255,255,255,.04)}
+.r-chart{width:100%;height:100%;display:block}
+.r-details{margin-top:8px;border-top:1px solid rgba(255,255,255,.04);padding-top:7px}
+.r-details summary{cursor:pointer;color:var(--text2);font-size:10px}
+.r-detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.r-detail-box{font-size:9px;color:var(--muted);background:rgba(4,7,10,.55);padding:8px;border-radius:7px}
+@media(max-width:900px){.r-metrics{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.r-metrics{grid-template-columns:repeat(2,1fr)}.r-detail-grid{grid-template-columns:1fr}.r-head{align-items:flex-start;flex-direction:column}}
 @keyframes breathG{0%{text-shadow:0 0 10px rgba(52,211,153,0.2)}100%{text-shadow:0 0 24px rgba(52,211,153,0.6)}}
 @keyframes breathR{0%{text-shadow:0 0 10px rgba(248,113,113,0.2)}100%{text-shadow:0 0 24px rgba(248,113,113,0.6)}}
 
@@ -1688,6 +1705,22 @@ function renderTrader(){
   refreshTraderData();
 }
 
+function rPerformancePanelHtml(){
+  return '<section class="r-panel" id="rPerformancePanel">'
+    +'<div class="r-head"><div class="r-title">R PERFORMANCE</div><div class="r-meta" id="rPerformanceMeta">--</div></div>'
+    +'<div class="r-metrics">'
+    +'<div class="r-card"><div class="r-label">累计净 R</div><div class="r-value" id="rNetValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">每笔期望</div><div class="r-value" id="rExpectancyValue">--</div></div>'
+    +'<div class="r-card" title="平均盈利R ÷ 平均亏损R绝对值"><div class="r-label">平均盈亏比</div><div class="r-value p" id="rPayoffValue">--</div></div>'
+    +'<div class="r-card" title="全部盈利R ÷ 全部亏损R绝对值"><div class="r-label">Profit Factor</div><div class="r-value p" id="rProfitFactorValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">平均盈利 / 亏损</div><div class="r-value" id="rAverageValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">最大回撤 R</div><div class="r-value r" id="rDrawdownValue">--</div></div>'
+    +'</div>'
+    +'<div class="r-chart-wrap" id="rPerformanceChart"><div class="eq-empty">等待有效 R 交易记录</div></div>'
+    +'<details class="r-details" id="rPerformanceDetails"><summary>更多复盘</summary><div class="r-detail-grid" id="rPerformanceDetailGrid"></div></details>'
+    +'</section>';
+}
+
 function initTraderPanel(){
   document.getElementById('main').innerHTML='<div style="text-align:center;padding:60px;color:var(--muted)">加载配置中...</div>';
   document.getElementById('stats').innerHTML='';
@@ -1714,6 +1747,7 @@ function initTraderPanel(){
     h+='<div class="eq-chart-wrap" id="equityChart"><div class="eq-empty">等待交易记录生成净值曲线</div></div>';
     h+='<div class="eq-legend"><span><i class="eq-dot"></i>账户净值</span><span><i class="eq-dot base"></i>初始权益</span></div>';
     h+='</div>';
+    h+=rPerformancePanelHtml();
     // Heartbeat bar — 下排全宽底栏 (纯展示, 无按钮)
     h+='<div class="axiom-heartbeat axiom-hb-bar" id="axiomTimerBox" style="display:none;margin-bottom:18px;border-radius:0 0 10px 10px;width:100%">';
     h+='<div class="ah-status"><span class="ah-dot" id="acStatusDot"></span><span class="ah-label" id="acStatusLabel">距下轮扫描</span></div>';
@@ -1897,6 +1931,26 @@ function setEquityRange(days, btn){
   for(var i=0;i<bs.length;i++) bs[i].classList.remove('active');
   if(btn) btn.classList.add('active');
   if(_lastTraderData) renderEquityReview(_lastTraderData);
+}
+function getRRangeSummary(d){
+  var ranges=((d||{}).r_performance||{}).ranges||{};
+  var key=Number(_equityRangeDays||0)>0?String(_equityRangeDays):'all';
+  return ranges[key]||null;
+}
+function fmtRValue(value,signed){
+  if(value===null||value===undefined||!isFinite(Number(value))) return '--';
+  var n=Number(value), prefix=signed?(n>0?'+':n<0?'−':''):(n<0?'−':'');
+  return prefix+Math.abs(n).toFixed(2)+'R';
+}
+function fmtRatio(value){
+  return value===null||value===undefined||!isFinite(Number(value))?'--':Number(value).toFixed(2);
+}
+function setRValue(id,text,value,tone){
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.textContent=text;
+  var n=Number(value);
+  el.className='r-value '+(tone||(isFinite(n)?(n>0?'g':n<0?'r':'neu'):'neu'));
 }
 function fmtMoney(v, signed){
   var n=Number(v||0);
@@ -2084,6 +2138,59 @@ function calcDrawdown(points){
   }
   return {abs:maxAbs,pct:maxPct};
 }
+function renderRPerformance(d){
+  var s=getRRangeSummary(d), meta=document.getElementById('rPerformanceMeta');
+  var chart=document.getElementById('rPerformanceChart');
+  if(!chart) return;
+  if(!s){
+    if(meta) meta.textContent='无统计数据';
+    chart.innerHTML='<div class="eq-empty">等待有效 R 交易记录</div>';
+    return;
+  }
+  if(meta){
+    meta.textContent='完整交易 '+Number(s.valid_trade_count||0)
+      +' · 胜率 '+(s.win_rate===null||s.win_rate===undefined?'--':Number(s.win_rate).toFixed(1)+'%')
+      +' · 连亏峰值 '+Number(s.max_consecutive_losses||0)
+      +' · 有效记录 '+Number(s.valid_exit_record_count||0)+' / '+Number(s.source_record_count||0)
+      +(Number(s.excluded_records||0)>0?' · 未计入 '+Number(s.excluded_records)+' 条':'');
+  }
+  setRValue('rNetValue',fmtRValue(s.net_r,true),s.net_r);
+  setRValue('rExpectancyValue',fmtRValue(s.expectancy_r,true),s.expectancy_r);
+  setRValue('rPayoffValue',fmtRatio(s.average_payoff_ratio),s.average_payoff_ratio,'p');
+  setRValue('rProfitFactorValue',fmtRatio(s.profit_factor),s.profit_factor,'p');
+  document.getElementById('rAverageValue').textContent=fmtRValue(s.average_win_r,true)+' / '+fmtRValue(s.average_loss_r,true);
+  setRValue('rDrawdownValue',fmtRValue(-Math.abs(Number(s.max_drawdown_r||0)),true),-Math.abs(Number(s.max_drawdown_r||0)),'r');
+
+  var points=(s.cumulative_r_points||[]).slice();
+  if(!points.length){
+    chart.innerHTML='<div class="eq-empty">等待有效 R 交易记录</div>';
+  }else{
+    var W=860,H=150,L=44,R=12,T=12,B=22, values=points.map(function(p){return Number(p.r||0);});
+    values.push(0);
+    var min=Math.min.apply(null,values),max=Math.max.apply(null,values);
+    if(max-min<1){max+=.5;min-=.5}
+    var span=max-min,pad=span*.12;min-=pad;max+=pad;
+    var coords=points.map(function(p,i){
+      return [L+(points.length===1?0:i/(points.length-1))*(W-L-R),T+(max-Number(p.r||0))/(max-min)*(H-T-B)];
+    });
+    var zero=T+(max-0)/(max-min)*(H-T-B);
+    var poly=coords.map(function(c){return c[0].toFixed(1)+','+c[1].toFixed(1)}).join(' ');
+    chart.innerHTML='<svg class="r-chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+      +'<line x1="'+L+'" y1="'+zero.toFixed(1)+'" x2="'+(W-R)+'" y2="'+zero.toFixed(1)+'" stroke="rgba(148,163,184,.45)" stroke-dasharray="4 5"/>'
+      +'<polyline points="'+poly+'" fill="none" stroke="'+(Number(s.net_r||0)>=0?'#34d399':'#f87171')+'" stroke-width="2"/>'
+      +'</svg>';
+  }
+
+  var directions=s.direction_breakdown||{}, reasons=s.exit_reason_breakdown||{};
+  var directionText=Object.keys(directions).map(function(k){return k+' '+fmtRValue(directions[k].net_r,true)}).join('<br>')||'--';
+  var reasonText=Object.keys(reasons).sort(function(a,b){return Math.abs(reasons[b].net_r)-Math.abs(reasons[a].net_r)}).map(function(k){return k+' '+fmtRValue(reasons[k].net_r,true)}).join('<br>')||'--';
+  var detail=document.getElementById('rPerformanceDetailGrid');
+  if(detail) detail.innerHTML='<div class="r-detail-box"><b>方向贡献</b><br>'+directionText+'</div>'
+    +'<div class="r-detail-box"><b>平仓原因贡献</b><br>'+reasonText+'</div>'
+    +'<div class="r-detail-box"><b>MFE 与极值</b><br>平均 MFE '+fmtRValue(s.average_mfe_r,false)
+    +'<br>捕获效率 '+(s.mfe_capture_efficiency===null||s.mfe_capture_efficiency===undefined?'--':(Number(s.mfe_capture_efficiency)*100).toFixed(1)+'%')
+    +'<br>最佳 '+fmtRValue(s.largest_win_r,true)+' · 最差 '+fmtRValue(s.largest_loss_r,true)+'</div>';
+}
 function renderEquityReview(d){
   _lastTraderData=d;
   var a=acct(d);
@@ -2113,6 +2220,7 @@ function renderEquityReview(d){
     var src=a.dailyBasis==='equity'?'权益':'记录';
     sum.textContent='交易 '+(d.total_trades||0)+' | 胜率 '+(d.win_rate||0).toFixed(1)+'% | 今日'+src+' '+fmtMoney(a.dailyDisplay,true)+' | 已实现 '+fmtMoney(a.realized,true)+' | 持仓 '+fmtMoney(a.open,true)+' | 账差 '+fmtMoney(a.diff,true);
   }
+  renderRPerformance(d);
   var box=document.getElementById('equityChart');
   if(!box) return;
   if(!pts.length){box.innerHTML='<div class="eq-empty">等待交易记录生成净值曲线</div>'; return;}
@@ -3178,6 +3286,7 @@ function fetchDemoData(){
     h+='<div class="eq-chart-wrap" id="equityChart"><div class="eq-empty">等待演示交易生成净值曲线</div></div>';
     h+='<div class="eq-legend"><span><i class="eq-dot"></i>账户净值</span><span><i class="eq-dot base"></i>初始权益</span></div>';
     h+='</div>';
+    h+=rPerformancePanelHtml();
     h+='<div class="hud-grid hud-demo"><div class="hud-box"><div class="hud-title">配置本金</div><div class="hud-val neu" style="font-size:16px">'+(uiBase>0?'$'+uiBase.toFixed(2):'--')+'</div></div><div class="hud-box"><div class="hud-title">已实现盈亏</div><div class="hud-val '+(a.realized>=0?'g':'r')+'">'+fmtMoney(a.realized,true)+'</div></div><div class="hud-box"><div class="hud-title">持仓浮动</div><div class="hud-val '+(a.open>=0?'g':'r')+'">'+fmtMoney(a.open,true)+'</div></div><div class="hud-box"><div class="hud-title">记录净盈</div><div class="hud-val '+(a.recordNet>=0?'g':'r')+'">'+fmtMoney(a.recordNet,true)+'</div></div><div class="hud-box"><div class="hud-title">'+dayLabel+'</div><div class="hud-val '+(dailyPnl>=0?'g':'r')+'">'+fmtMoney(dailyPnl,true)+'</div></div><div class="hud-box"><div class="hud-title">权益净盈</div><div class="hud-val '+(accountPnl>=0?'g':'r')+'">'+fmtMoney(accountPnl,true)+'</div></div><div class="hud-box"><div class="hud-title">账差</div><div class="hud-val '+(a.diff>=0?'g':'r')+'">'+fmtMoney(a.diff,true)+'</div></div><div class="hud-box"><div class="hud-title">持仓 / 胜率</div><div class="hud-val neu">'+posCount+' / '+Number(d.win_rate||0).toFixed(1)+'%</div></div></div>';
     h+=renderDemoPositionCards(d);
     h+=renderDemoTradeList(d);

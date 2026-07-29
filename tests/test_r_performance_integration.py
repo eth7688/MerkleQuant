@@ -27,3 +27,29 @@ class RPerformanceIntegrationTests(unittest.TestCase):
 
         self.assertEqual(source.count('"r_performance": r_performance'), 2)
         self.assertGreaterEqual(source.count("r_performance = self._r_performance_summary()"), 2)
+
+
+class RPerformanceUiTests(unittest.TestCase):
+    def test_normal_and_demo_views_reuse_one_r_panel(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+
+        self.assertIn("function rPerformancePanelHtml()", source)
+        self.assertIn("function getRRangeSummary(d)", source)
+        self.assertIn("function renderRPerformance(d)", source)
+        self.assertEqual(source.count("h+=rPerformancePanelHtml();"), 2)
+        self.assertIn("renderRPerformance(d);", source)
+
+    def test_panel_contains_confirmed_core_metrics_and_diagnostics(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+
+        for token in (
+            "rNetValue",
+            "rExpectancyValue",
+            "rPayoffValue",
+            "rProfitFactorValue",
+            "rAverageValue",
+            "rDrawdownValue",
+            "rPerformanceChart",
+            "rPerformanceDetails",
+        ):
+            self.assertIn(token, source)
