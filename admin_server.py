@@ -447,6 +447,7 @@ function saveDemoFullCfg(){
     max_daily_loss: parseFloat(document.getElementById('deMaxDL').value)||0,
     max_consecutive_loss: parseInt(document.getElementById('deMaxCL').value)||5,
     cooldown_minutes: parseInt(document.getElementById('deCooldown').value)||60,
+    half_risk_trigger_r: parseFloat(document.getElementById('deHalfRiskR').value)||0,
     enable_early_protect: document.getElementById('deEarlyProtect').value==='1',
     early_protect_r: parseFloat(document.getElementById('deEarlyR').value)||0.8,
     early_protect_lock_r: parseFloat(document.getElementById('deEarlyLock').value)||0,
@@ -570,6 +571,7 @@ function renderEngine(el){
     h+='<div class="t-section">';
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-purple);box-shadow:0 0 5px rgba(168,85,247,0.3)"></span><span>三阶止盈</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
+    h+='<div class="field"><label>0.5R半损保护 (0=关闭)</label><input type="number" id="deHalfRiskR" value="'+(cfg.half_risk_trigger_r??0)+'" min="0" max="0.79" step="0.1"></div>';
     h+='<div class="field"><label>提前保护</label><select id="deEarlyProtect"><option value="1"'+(cfg.enable_early_protect!==false?' selected':'')+'>启用</option><option value="0"'+(cfg.enable_early_protect===false?' selected':'')+'>关闭</option></select></div>';
     h+='<div class="field"><label>提前保护R</label><input type="number" id="deEarlyR" value="'+(cfg.early_protect_r||0.8)+'" min="0.3" max="1.2" step="0.1"></div>';
     h+='<div class="field"><label>提前锁定R</label><input type="number" id="deEarlyLock" value="'+(cfg.early_protect_lock_r||0)+'" min="0" max="0.5" step="0.05"></div>';

@@ -152,6 +152,8 @@ def run(args) -> int:
         fee_rate=float(rules.get("fee_rate", 0.0006)),
         slippage_bps=float(rules.get("slippage_bps", 2.0)),
         exit_rules=ExitRules(
+            half_risk_trigger_r=float(rules.get("half_risk_trigger_r", 0.0)),
+            enable_early_protect=bool(rules.get("enable_early_protect", True)),
             early_protect_r=float(rules.get("early_protect_r", 0.8)),
             early_lock_r=float(rules.get("early_protect_lock_r", 0.0)),
             tier1_r=float(rules.get("tier1_defense_r", 1.2)),
@@ -247,6 +249,8 @@ def run_portfolio(args) -> int:
         fee_rate=float(rules.get("fee_rate", 0.0006)),
         slippage_bps=float(rules.get("slippage_bps", 2.0)),
         exit_rules=ExitRules(
+            half_risk_trigger_r=float(rules.get("half_risk_trigger_r", 0.0)),
+            enable_early_protect=bool(rules.get("enable_early_protect", True)),
             early_protect_r=float(rules.get("early_protect_r", 0.8)),
             early_lock_r=float(rules.get("early_protect_lock_r", 0.0)),
             tier1_r=float(rules.get("tier1_defense_r", 1.2)),

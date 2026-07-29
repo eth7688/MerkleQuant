@@ -58,6 +58,8 @@ class ExitDecision:
 
 @dataclass(frozen=True)
 class ExitRules:
+    half_risk_trigger_r: float = 0.0
+    enable_early_protect: bool = True
     early_protect_r: float = 0.8
     early_lock_r: float = 0.0
     tier1_r: float = 1.2
@@ -77,6 +79,7 @@ class PositionState:
     remaining_qty: float | None = None
     mfe_r: float = 0.0
     mae_r: float = 0.0
+    half_risk_protected: bool = False
     early_protected: bool = False
     tier1_done: bool = False
     tier2_done: bool = False
@@ -229,9 +232,32 @@ def advance_position(
     sign = 1.0 if position.direction == "LONG" else -1.0
     events: list[ExitDecision] = []
 
-    if not position.early_protected and position.mfe_r >= rules.early_protect_r:
+    half_risk_enabled = rules.half_risk_trigger_r > 0
+    early_stage_reached = (
+        rules.enable_early_protect
+        and position.mfe_r >= rules.early_protect_r
+    )
+    if (
+        half_risk_enabled
+        and not position.half_risk_protected
+        and position.mfe_r >= rules.half_risk_trigger_r
+        and not early_stage_reached
+    ):
+        candidate = position.entry - sign * 0.5 * risk
+        position.current_stop = (
+            max(position.current_stop, candidate)
+            if sign > 0
+            else min(position.current_stop, candidate)
+        )
+        position.half_risk_protected = True
+        events.append(
+            ExitDecision("move_stop", position.current_stop, 0.0, "half_risk_protect", timestamp)
+        )
+
+    if not position.early_protected and early_stage_reached:
         candidate = position.entry + sign * rules.early_lock_r * risk
         position.current_stop = max(position.current_stop, candidate) if sign > 0 else min(position.current_stop, candidate)
+        position.half_risk_protected = True
         position.early_protected = True
         events.append(ExitDecision("move_stop", position.current_stop, 0.0, "early_protect", timestamp))
 

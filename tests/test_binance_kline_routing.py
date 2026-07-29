@@ -1,7 +1,7 @@
 import os
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -118,13 +118,17 @@ class BinanceKlineRoutingTest(unittest.TestCase):
             initial_sl=0.84285714,
             initial_band_hi=0.84,
             initial_band_lo=0.83,
+            source_interval="30m",
             breakeven_triggered=True,
             partial_tp_triggered=True,
             max_favorable_r=2.76315862,
         )
         rows = 30
+        step_ms = 1_800_000
+        entry_ms = int(entry_time.timestamp() * 1000)
+        first_open_ms = ((entry_ms + step_ms - 1) // step_ms) * step_ms
         frame = pd.DataFrame({
-            "ot": [int(entry_time.timestamp() * 1000) + i * 1_800_000 for i in range(rows)],
+            "ot": [first_open_ms + i * step_ms for i in range(rows)],
             "o": [0.82] * rows,
             "h": [0.825] * rows,
             "l": [0.807] * (rows - 1) + [0.804],
@@ -132,12 +136,67 @@ class BinanceKlineRoutingTest(unittest.TestCase):
             "v": [1.0] * rows,
         })
 
-        with patch("trader.fetch_klines", return_value=frame):
+        with patch("trader.fetch_klines", return_value=frame), patch(
+            "trader.fetch_klines_range",
+            return_value=frame,
+        ):
             bot.check_exit(position)
 
         expected_mfe = (0.832 - 0.804) / (0.84285714 - 0.832)
         self.assertAlmostEqual(position.max_favorable_r, expected_mfe)
         self.assertEqual(getattr(position, "excursion_price_source", ""), "mark")
+
+    def test_new_position_does_not_use_pre_entry_mark_price_extrema(self):
+        cfg = TradeConfig(
+            mode="paper",
+            enabled=False,
+            exchange="binance",
+            market_type="futures",
+            testnet=True,
+            enable_time_stop=False,
+            half_risk_trigger_r=0.5,
+            enable_early_protect=True,
+            early_protect_r=0.8,
+            early_protect_lock_r=0.0,
+            use_atr_trail=False,
+        )
+        bot = SqueezeBreakoutBot(cfg)
+        real_entry = datetime(2026, 7, 21, 11, 25, tzinfo=timezone.utc)
+        display_entry = real_entry + timedelta(hours=8)
+        position = Position(
+            symbol="NIGHTUSDT",
+            direction="LONG",
+            entry_price=100.0,
+            entry_time=display_entry,
+            quantity=10.0,
+            sl_price=90.0,
+            current_sl=90.0,
+            risk_usdt=100.0,
+            signal_score=100.0,
+            initial_sl=90.0,
+            initial_band_hi=101.0,
+            initial_band_lo=99.0,
+        )
+        rows = 30
+        first_open = real_entry - timedelta(minutes=30 * rows)
+        frame = pd.DataFrame({
+            "ot": [int((first_open + timedelta(minutes=30 * i)).timestamp() * 1000) for i in range(rows)],
+            "o": [100.0] * rows,
+            "h": [112.0] * rows,
+            "l": [95.0] * rows,
+            "c": [100.1] * rows,
+            "v": [1.0] * rows,
+        })
+
+        with patch("trader.fetch_klines", return_value=frame):
+            reason = bot.check_exit(position)
+
+        self.assertIsNone(reason)
+        self.assertFalse(position.breakeven_triggered)
+        self.assertFalse(position.half_risk_protected)
+        self.assertEqual(position.current_sl, position.initial_sl)
+        self.assertEqual(position.excursion_price_source, "")
+        self.assertLess(position.max_favorable_r, cfg.early_protect_r)
 
 
 if __name__ == "__main__":

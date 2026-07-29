@@ -15,7 +15,7 @@
   python trader.py --backtest SYMBOL    # 单币回测(开发中)
 """
 
-import os, sys, time, json, hmac, hashlib, threading, logging, subprocess, shlex, re
+import os, sys, time, json, hmac, hashlib, threading, logging, subprocess, shlex, re, tempfile
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -38,8 +38,9 @@ from predicta_indicator import (
 from performance_metrics import summarize_r_performance_ranges
 
 from screener import (
-    fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
-    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME,
+    fetch_klines, fetch_klines_range, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
+    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME, INTERVAL_MS,
+    INTERVAL_OPEN_PHASE_MS,
     _find_fractal_sl_in_window, _find_fractal_structure_sequence, is_tradfi_or_junk,
     get_entry_float_limit, get_breakout_confirm_window, get_squeeze_max
 )
@@ -69,6 +70,14 @@ log.addHandler(_default_file_handler)
 def bj_now():
     # 北京时间显示 (UTC+8)
     return (datetime.now(timezone.utc) + timedelta(hours=8)).replace(microsecond=0)
+
+
+def _entry_ms_for_market_data(entry_time: datetime, latest_open_ms: int) -> int:
+    """Convert the project's Beijing display timestamp at the UTC market-data boundary."""
+    raw_ms = int(entry_time.timestamp() * 1000)
+    if raw_ms - int(latest_open_ms) >= 6 * 60 * 60 * 1000:
+        return raw_ms - 8 * 60 * 60 * 1000
+    return raw_ms
 
 POSITIONS_PATH = "positions.json"
 TRADE_LOG_PATH = "trades.jsonl"
@@ -191,6 +200,7 @@ class TradeConfig:
     # 风控 — 止损/止盈
     atr_mult_sl: float = 0.5           # SL额外偏移(ATR倍数), 0=纯均线边缘
     # 三阶止盈参数
+    half_risk_trigger_r: float = 0.0   # >0启用: 达阈值后把初始1R风险收窄到0.5R
     enable_early_protect: bool = True  # 提前保护: 未到1.2R前先保本
     early_protect_r: float = 0.8       # 提前保护触发R
     early_protect_lock_r: float = 0.0  # 提前保护锁定R, 0=SL推到入场价
@@ -483,12 +493,33 @@ class BinanceClient:
             "symbol": symbol, "leverage": leverage
         }, signed=True)
 
+    def set_compatible_leverage(self, symbol, leverage):
+        """设置请求杠杆；不支持时逐级降到更低的安全档位。"""
+        requested = max(1, int(float(leverage or 1)))
+        candidates = []
+        for candidate in (requested, 20, 10, 5, 3, 2, 1):
+            candidate = min(requested, candidate)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            result = self.set_leverage(symbol, candidate)
+            if result:
+                if candidate != requested:
+                    self._log.info(
+                        f"Binance杠杆按合约兼容降档: {symbol} {requested}x -> {candidate}x"
+                    )
+                return result
+        return None
+
     def cancel_all_orders(self, symbol):
         if self.market_type == "futures":
             r1 = self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
-            if not self.testnet:
-                self._req("DELETE", "/fapi/v1/algo/openOrders", {"symbol": symbol}, signed=True)
-            return r1
+            if self.testnet:
+                return r1
+            r2 = self._req("DELETE", "/fapi/v1/algo/openOrders", {"symbol": symbol}, signed=True)
+            if r1 is None or r2 is None:
+                return None
+            return {"regular": r1, "algo": r2}
         else:
             return self._req("DELETE", "/api/v3/openOrders", {"symbol": symbol}, signed=True)
 
@@ -747,11 +778,20 @@ class BitgetClient:
         if symbol:
             params["symbol"] = symbol
         data = self._req("GET", "/api/v2/mix/order/orders-plan-pending", params)
-        if isinstance(data, dict):
-            return data.get("entrustedList") or []
-        if isinstance(data, list):
-            return data
-        return []
+        if data is None:
+            return None
+        if not isinstance(data, dict) or "entrustedList" not in data:
+            return None
+        orders = data.get("entrustedList")
+        if not isinstance(orders, list):
+            return None
+        if any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
+            for order in orders
+        ):
+            return None
+        return orders
 
     def resolve_close_trade(self, symbol, order_response=None, direction="", quantity=0.0):
         """平仓后反查 Bitget 成交/历史仓位, 获取真实已实现PnL。"""
@@ -873,7 +913,7 @@ class BitgetClient:
                     "stopLossPrice": str(round(stop_price, 8)),
                 }
                 result = self._req("POST", path, params)
-                if result and isinstance(result, dict) and result.get("code") == "00000":
+                if result is not None:
                     self._log.info(f"[带单止损] {symbol} SL={stop_price:.4f} trackingNo={tracking_no}")
                 else:
                     err = result.get("msg","") if isinstance(result, dict) else str(result)[:100]
@@ -895,9 +935,15 @@ class BitgetClient:
                         "symbol": symbol, "productType": "USDT-FUTURES",
                         "marginCoin": "USDT", "orderId": old_oid
                     })
-                    if r is not None and isinstance(r, dict) and r.get("code") == "00000":
-                        self._active_stop_ids.pop(symbol, None)
-                except: pass
+                    if r is None:
+                        self._log.error(
+                            f"Bitget旧止损撤销未确认: {symbol} id={old_oid}"
+                        )
+                        return None
+                    self._active_stop_ids.pop(symbol, None)
+                except Exception as e:
+                    self._log.error(f"Bitget旧止损撤销异常: {symbol} id={old_oid}: {e}")
+                    return None
             path = "/api/v2/mix/order/place-plan-order"
             sym_info = self.get_symbol_info(symbol)
             if sym_info and "pricePlace" in sym_info:
@@ -945,10 +991,12 @@ class BitgetClient:
                     "symbol": symbol, "productType": "USDT-FUTURES",
                     "marginCoin": "USDT", "orderId": known_oid
                 })
-                if r is not None and isinstance(r, dict) and r.get("code") == "00000":
+                if r is not None:
                     self._active_stop_ids.pop(symbol, None)  # 取消成功才清除
-                # 如果返回非成功码, 保留ID供 stop_order 内部再试
-            except: pass  # 网络异常也保留ID
+                return r
+            except Exception:
+                return None  # 网络异常保留ID
+        return {}  # 没有已跟踪止损时，取消步骤是已确认的空操作
 
     def cleanup_all_stops(self, symbols: list):
         """批量清理止损单 — 逐个symbol尝试取消所有计划+普通挂单"""
@@ -1040,6 +1088,9 @@ class Position:
     signal_score: float     # 入场时评分
     initial_band_hi: float  # 入场时均线上轨
     initial_band_lo: float  # 入场时均线下轨
+    initial_entry_price: float = 0.0     # 原始成交价/R锚点, 交易所均价同步不得覆盖
+    initial_risk_per_unit: float = 0.0   # 原始每单位风险, 持仓生命周期内不可变
+    half_risk_protected: bool = False
     breakeven_triggered: bool = False
     breakeven_cooldown: int = 0  # 保本后冷却计数, 防秒碰止损
     partial_tp_triggered: bool = False  # 2.0R减仓50%已执行
@@ -1054,6 +1105,7 @@ class Position:
     source_strategy: str = ""  # structure / rj_only, 用于策略差异化出场
     max_favorable_r: float = 0.0  # 入场后最大顺势推进R倍数, 用于未起爆超时退出
     max_adverse_r: float = 0.0    # 入场后最大逆势推进R倍数(MAE), 用于参数复盘
+    last_mfe_check_ms: int = 0    # 最后完整合并的已收盘K线开盘时间
     time_stop_armed: bool = True  # 兼容旧持仓文件; 实际执行统一由 enable_time_stop 控制
     time_stop_armed_at: Optional[datetime] = None  # 兼容旧持仓文件; 超时计数统一使用 entry_time
     time_stop_watch: bool = False  # RJ-only基础超时后进入观察态
@@ -1073,6 +1125,14 @@ class Position:
     hermes_confirm: dict = field(default_factory=dict)
     excursion_price_source: str = ""
     choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
+    stop_replace_state: str = ""  # durable protective-stop transaction state
+
+    def __post_init__(self):
+        if float(self.initial_entry_price or 0.0) <= 0:
+            self.initial_entry_price = float(self.entry_price or 0.0)
+        if float(self.initial_risk_per_unit or 0.0) <= 0:
+            anchor_sl = float(self.initial_sl or self.sl_price or 0.0)
+            self.initial_risk_per_unit = abs(float(self.initial_entry_price) - anchor_sl)
 
 
 # ============================================================
@@ -4949,18 +5009,540 @@ class SqueezeBreakoutBot:
         except Exception as e:
             self._log.error(f"Telegram通知失败: {e}")
 
+    def _position_r_anchor(self, pos: Position) -> tuple:
+        """Return the immutable entry/risk pair, migrating legacy positions in memory."""
+        entry = float(getattr(pos, "initial_entry_price", 0.0) or 0.0)
+        if entry <= 0:
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            pos.initial_entry_price = entry
+        risk = float(getattr(pos, "initial_risk_per_unit", 0.0) or 0.0)
+        if risk <= 0:
+            initial_sl = float(
+                getattr(pos, "initial_sl", 0.0)
+                or getattr(pos, "sl_price", 0.0)
+                or 0.0
+            )
+            risk = abs(entry - initial_sl)
+            pos.initial_risk_per_unit = risk
+        return entry, risk
+
+    def _post_entry_history(self, pos: Position, df):
+        if df is None or len(df) == 0 or "ot" not in df:
+            return df.iloc[0:0] if df is not None else None
+        try:
+            open_times = pd.to_numeric(df["ot"], errors="coerce")
+            valid_open_times = open_times.dropna()
+            if len(valid_open_times) == 0:
+                return df.iloc[0:0]
+            entry_ms = _entry_ms_for_market_data(pos.entry_time, int(valid_open_times.max()))
+            return df[open_times >= entry_ms]
+        except Exception:
+            return df.iloc[0:0]
+
+    def _history_with_unobserved_excursion(
+        self,
+        pos: Position,
+        interval: str,
+        recent_df,
+        price_source: str = "",
+    ) -> tuple:
+        """Return recent data plus every closed candle not covered by the durable MFE cursor."""
+        recent_history = self._post_entry_history(pos, recent_df)
+        if recent_df is None or len(recent_df) == 0 or "ot" not in recent_df:
+            return recent_history, 0
+        try:
+            step_ms = INTERVAL_MS.get(
+                str(interval).strip(),
+                self._interval_seconds(interval) * 1000,
+            )
+            phase_ms = INTERVAL_OPEN_PHASE_MS.get(str(interval).strip(), 0)
+
+            def mergeable(history) -> bool:
+                if history is None or len(history) == 0:
+                    return True
+                if "ot" not in history or "h" not in history or "l" not in history:
+                    return False
+                open_values = pd.to_numeric(
+                    history["ot"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                high_values = pd.to_numeric(
+                    history["h"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                low_values = pd.to_numeric(
+                    history["l"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                if not (
+                    np.isfinite(open_values).all()
+                    and np.isfinite(high_values).all()
+                    and np.isfinite(low_values).all()
+                    and np.equal(open_values, np.floor(open_values)).all()
+                ):
+                    return False
+                ordered_times = sorted(int(value) for value in open_values)
+                return bool(
+                    len(set(ordered_times)) == len(ordered_times)
+                    and all(
+                        (open_time - phase_ms) % step_ms == 0
+                        for open_time in ordered_times
+                    )
+                    and all(
+                        right - left == step_ms
+                        for left, right in zip(
+                            ordered_times,
+                            ordered_times[1:],
+                        )
+                    )
+                )
+
+            raw_recent_open_times = pd.to_numeric(
+                recent_df["ot"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            if not (
+                np.isfinite(raw_recent_open_times).all()
+                and np.equal(
+                    raw_recent_open_times,
+                    np.floor(raw_recent_open_times),
+                ).all()
+            ):
+                return recent_history, 0
+            recent_open_times = (
+                pd.Series(raw_recent_open_times.astype("int64"))
+                .drop_duplicates()
+                .sort_values()
+            )
+            if len(recent_open_times) == 0:
+                return recent_history, 0
+            if any(
+                (int(open_time) - phase_ms) % step_ms != 0
+                for open_time in recent_open_times
+            ):
+                return recent_history, 0
+            end_ms = int(recent_open_times.iloc[-1])
+            entry_ms = _entry_ms_for_market_data(pos.entry_time, end_ms)
+            last_check_ms = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+            old_source = str(getattr(pos, "excursion_price_source", "") or "")
+            if price_source and old_source != price_source:
+                last_check_ms = 0
+            start_ms = (
+                max(entry_ms, last_check_ms + step_ms)
+                if last_check_ms > 0
+                else entry_ms
+            )
+            if start_ms > end_ms:
+                return recent_history, 0
+
+            relevant_times = recent_open_times[recent_open_times >= start_ms]
+            recent_covers_range = False
+            if len(relevant_times) > 0:
+                first_open = int(relevant_times.iloc[0])
+                last_open = int(relevant_times.iloc[-1])
+                expected_first = (
+                    (
+                        (start_ms - phase_ms + step_ms - 1)
+                        // step_ms
+                    )
+                    * step_ms
+                    + phase_ms
+                )
+                gaps = relevant_times.diff().dropna()
+                recent_covers_range = (
+                    first_open == expected_first
+                    and last_open == end_ms
+                    and (
+                        len(gaps) == 0
+                        or bool((gaps == step_ms).all())
+                    )
+                )
+            if recent_covers_range:
+                return (
+                    (recent_history, end_ms)
+                    if mergeable(recent_history)
+                    else (recent_history, 0)
+                )
+
+            missing_history = fetch_klines_range(
+                pos.symbol,
+                interval,
+                start_ms,
+                end_ms,
+                exchange=self.cfg.exchange,
+                market_type=self.cfg.market_type,
+                testnet=self.cfg.testnet,
+                price_type="mark",
+            )
+            if missing_history is None:
+                self._log.warning(
+                    f"{pos.symbol} MFE history pagination incomplete: "
+                    f"start={start_ms} end={end_ms}"
+                )
+                return recent_history, 0
+            missing_history = self._post_entry_history(pos, missing_history)
+            frames = [
+                frame
+                for frame in (missing_history, recent_history)
+                if frame is not None and len(frame) > 0
+            ]
+            if not frames:
+                return recent_history, end_ms
+            history = pd.concat(frames, ignore_index=True)
+            history["ot"] = pd.to_numeric(history["ot"], errors="coerce")
+            history = (
+                history.dropna(subset=["ot"])
+                .drop_duplicates(subset=["ot"], keep="last")
+                .sort_values("ot")
+                .reset_index(drop=True)
+            )
+            return (history, end_ms) if mergeable(history) else (history, 0)
+        except Exception as e:
+            self._log.warning(f"{pos.symbol} MFE history merge failed: {e}")
+            return recent_history, 0
+
+    def _merge_position_excursion(
+        self,
+        pos: Position,
+        history,
+        current_price: float = 0.0,
+        price_source: str = "",
+    ) -> bool:
+        """Merge all available post-entry extrema into durable MFE/MAE."""
+        entry, risk = self._position_r_anchor(pos)
+        if history is None or len(history) == 0 or risk <= 0:
+            return False
+        try:
+            high = float(pd.to_numeric(history["h"], errors="coerce").max())
+            low = float(pd.to_numeric(history["l"], errors="coerce").min())
+        except Exception:
+            return False
+        if not np.isfinite(high) or not np.isfinite(low):
+            return False
+        if pos.direction == "LONG":
+            historical_favorable = (high - entry) / risk
+            historical_adverse = (entry - low) / risk
+            current_r = (float(current_price) - entry) / risk if current_price else 0.0
+        else:
+            historical_favorable = (entry - low) / risk
+            historical_adverse = (high - entry) / risk
+            current_r = (entry - float(current_price)) / risk if current_price else 0.0
+
+        old_mfe = float(getattr(pos, "max_favorable_r", 0.0) or 0.0)
+        old_mae = float(getattr(pos, "max_adverse_r", 0.0) or 0.0)
+        source_changed = bool(
+            price_source
+            and str(getattr(pos, "excursion_price_source", "") or "") != price_source
+        )
+        if source_changed:
+            new_mfe = max(0.0, current_r, historical_favorable)
+            new_mae = max(0.0, historical_adverse)
+        else:
+            new_mfe = max(old_mfe, 0.0, current_r, historical_favorable)
+            new_mae = max(old_mae, 0.0, historical_adverse)
+        pos.max_favorable_r = new_mfe
+        pos.max_adverse_r = new_mae
+        if price_source:
+            pos.excursion_price_source = price_source
+        return (
+            source_changed
+            or abs(new_mfe - old_mfe) > 1e-12
+            or abs(new_mae - old_mae) > 1e-12
+        )
+
+    def _protection_recovery_target(self, pos: Position) -> tuple:
+        """Return the strongest tighten-only startup protection target and stage."""
+        entry, risk = self._position_r_anchor(pos)
+        current_sl = float(pos.current_sl)
+        if entry <= 0 or risk <= 0:
+            return current_sl, ""
+        protect_r = float(getattr(pos, "max_favorable_r", 0.0) or 0.0)
+        target = current_sl
+        stage = ""
+        half_trigger = max(
+            0.0,
+            float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+        )
+        if half_trigger > 0 and protect_r >= half_trigger:
+            half_target = entry - risk * 0.5 if pos.direction == "LONG" else entry + risk * 0.5
+            target = max(target, half_target) if pos.direction == "LONG" else min(target, half_target)
+            stage = "half"
+
+        early_enabled = bool(getattr(self.cfg, "enable_early_protect", True))
+        early_trigger = max(
+            0.1,
+            float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
+        )
+        if early_enabled and protect_r >= early_trigger:
+            lock_r = max(
+                0.0,
+                float(getattr(self.cfg, "early_protect_lock_r", 0.0) or 0.0),
+            )
+            early_target = entry + risk * lock_r if pos.direction == "LONG" else entry - risk * lock_r
+            target = max(target, early_target) if pos.direction == "LONG" else min(target, early_target)
+            stage = "early"
+        return target, stage
+
+    def _stop_result_confirmed(self, pos: Position, result) -> bool:
+        if bool(getattr(self.cfg, "testnet", False)) and str(
+            getattr(self.cfg, "exchange", "")
+        ).lower() == "binance":
+            return True
+        if str(getattr(self.cfg, "exchange", "")).lower() == "bitget":
+            if getattr(pos, "tracking_no", ""):
+                return result is not None
+            return isinstance(result, dict) and bool(result.get("orderId"))
+        return bool(result)
+
+    def _cancel_result_confirmed(self, result) -> bool:
+        if bool(getattr(self.cfg, "testnet", False)) and str(
+            getattr(self.cfg, "exchange", "")
+        ).lower() == "binance":
+            return True
+        return result is not None
+
+    def _remember_active_stop(self, symbol: str, result) -> None:
+        if not isinstance(result, dict) or not result.get("orderId"):
+            return
+        if not hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids = {}
+        self.client._active_stop_ids[symbol] = str(result["orderId"])
+
+    def _cancel_protective_stop(self, pos: Position):
+        try:
+            return self.client.cancel_all_orders(pos.symbol)
+        except Exception as e:
+            self._log.error(
+                f"保护止损撤单异常: {pos.symbol} action=cancel_exception error={e}"
+            )
+            return None
+
+    def _recover_uncertain_stop_tracking(self, pos: Position) -> bool:
+        """Resolve a crash-window Bitget stop before any replacement is attempted."""
+        state = str(getattr(pos, "stop_replace_state", "") or "")
+        uncertain_states = (
+            "canceling_old_stop",
+            "placing_new_stop",
+            "retry_pending_untracked_stop",
+            "retry_pending_unprotected",
+        )
+        if str(getattr(self.cfg, "exchange", "")).lower() != "bitget":
+            return True
+
+        if not hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids = {}
+        tracked_stop_id = self.client._active_stop_ids.get(pos.symbol)
+        needs_untracked_reconcile = (
+            not tracked_stop_id
+            and not str(getattr(pos, "tracking_no", "") or "")
+        )
+        if state not in uncertain_states and not needs_untracked_reconcile:
+            return True
+
+        getter = getattr(self.client, "get_pending_plan_orders", None)
+        if not callable(getter):
+            self._log.critical(
+                f"保护止损不确定状态无法核对: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+        try:
+            pending = getter(pos.symbol)
+        except Exception as e:
+            self._log.critical(
+                f"保护止损不确定状态核对异常: {pos.symbol} "
+                f"action=critical_retry_pending state={state} error={e}"
+            )
+            return False
+        if pending is None:
+            self._log.critical(
+                f"保护止损不确定状态核对未确认: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+
+        if not isinstance(pending, list) or any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
+            for order in pending
+        ):
+            self._log.critical(
+                f"保护止损不确定状态返回畸形计划单: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+        live_ids = sorted({
+            str(order["orderId"])
+            for order in pending
+        })
+        if len(live_ids) > 1:
+            self._log.critical(
+                f"保护止损发现多张未决计划单: {pos.symbol} "
+                f"action=critical_retry_pending ids={','.join(live_ids)}"
+            )
+            return False
+        if live_ids:
+            self.client._active_stop_ids[pos.symbol] = live_ids[0]
+            self._log.warning(
+                f"保护止损恢复崩溃窗口ID: {pos.symbol} "
+                f"state={state} active_stop_id={live_ids[0]}"
+            )
+        else:
+            self.client._active_stop_ids.pop(pos.symbol, None)
+            self._log.warning(
+                f"保护止损恢复确认无活动计划单: {pos.symbol} state={state}"
+            )
+        return True
+
+    def _submit_protective_stop(self, pos: Position, stop_price: float) -> tuple:
+        side = "SELL" if pos.direction == "LONG" else "BUY"
+        try:
+            result = self.client.stop_order(
+                pos.symbol,
+                side,
+                round(stop_price, 8),
+                round(pos.quantity, 8),
+                tracking_no=pos.tracking_no,
+            )
+        except Exception as e:
+            self._log.error(
+                f"保护止损挂单异常: {pos.symbol} action=place_exception "
+                f"stop={stop_price:.8f} error={e}"
+            )
+            result = None
+        confirmed = self._stop_result_confirmed(pos, result)
+        if confirmed:
+            self._remember_active_stop(pos.symbol, result)
+        return result, confirmed
+
+    def _rollback_protective_stop(
+        self,
+        pos: Position,
+        old_sl: float,
+        desired_sl: float,
+        stop_result,
+    ) -> bool:
+        rollback_result, restored = self._submit_protective_stop(pos, old_sl)
+        pos.current_sl = old_sl
+        if restored:
+            pos.stop_replace_state = "rollback_restored"
+            persisted = self._save_positions()
+            self._log.error(
+                f"保护止损换单待重试: {pos.symbol} action=retry_pending rollback=restored "
+                f"SL保持{old_sl:.4f}, 目标{desired_sl:.4f}, stop_result={stop_result}"
+            )
+            if not persisted:
+                self._log.critical(
+                    f"保护止损回滚ID持久化失败: {pos.symbol} action=critical_retry_pending "
+                    f"rollback_result={rollback_result}"
+                )
+            return False
+
+        pos.stop_replace_state = "retry_pending_unprotected"
+        self._save_positions()
+        self._log.critical(
+            f"保护止损换单严重失败: {pos.symbol} action=critical_retry_pending "
+            f"new_sl={desired_sl:.4f} rollback_sl={old_sl:.4f} "
+            f"stop_result={stop_result} rollback_result={rollback_result}"
+        )
+        return False
+
+    def _replace_protective_stop(
+        self,
+        pos: Position,
+        desired_sl: float,
+        rollback_sl: Optional[float] = None,
+    ) -> bool:
+        """Cancel, persist transition, place, and rollback as one stop transaction."""
+        old_sl = float(pos.current_sl if rollback_sl is None else rollback_sl)
+        desired_sl = float(desired_sl)
+        if self.client is None:
+            pos.current_sl = desired_sl
+            pos.stop_replace_state = ""
+            return True
+
+        if not self._recover_uncertain_stop_tracking(pos):
+            return False
+
+        # Persist both the latest MFE and the recoverable pre-cancel transaction state.
+        previous_state = str(getattr(pos, "stop_replace_state", "") or "")
+        pos.stop_replace_state = "canceling_old_stop"
+        if not self._save_positions():
+            pos.stop_replace_state = previous_state
+            self._log.error(
+                f"保护止损换单阻止: {pos.symbol} action=persist_failed_before_cancel"
+            )
+            return False
+
+        stop_ids = getattr(self.client, "_active_stop_ids", None)
+        old_stop_id = stop_ids.get(pos.symbol) if isinstance(stop_ids, dict) else None
+        cancel_result = self._cancel_protective_stop(pos)
+        if not self._cancel_result_confirmed(cancel_result):
+            if old_stop_id:
+                if not hasattr(self.client, "_active_stop_ids"):
+                    self.client._active_stop_ids = {}
+                self.client._active_stop_ids[pos.symbol] = old_stop_id
+            self._log.error(
+                f"保护止损换单阻止: {pos.symbol} action=cancel_unconfirmed "
+                f"tracked_stop_id={old_stop_id or ''}"
+            )
+            return False
+
+        if hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids.pop(pos.symbol, None)
+        pos.stop_replace_state = "placing_new_stop"
+        if not self._save_positions():
+            self._log.critical(
+                f"保护止损过渡状态持久化失败: {pos.symbol} action=critical_retry_pending"
+            )
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, "transition_persist_failed"
+            )
+
+        stop_result, applied = self._submit_protective_stop(pos, desired_sl)
+        if not applied:
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, stop_result
+            )
+
+        pos.current_sl = desired_sl
+        pos.stop_replace_state = ""
+        if self._save_positions():
+            return True
+
+        # Do not leave a successfully placed but untracked orphan after a save failure.
+        cancel_new = self._cancel_protective_stop(pos)
+        if self._cancel_result_confirmed(cancel_new):
+            if hasattr(self.client, "_active_stop_ids"):
+                self.client._active_stop_ids.pop(pos.symbol, None)
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, "new_stop_persist_failed"
+            )
+        pos.stop_replace_state = "retry_pending_untracked_stop"
+        self._save_positions()
+        self._log.critical(
+            f"保护止损新单持久化且撤销均失败: {pos.symbol} "
+            f"action=critical_retry_pending stop_result={stop_result}"
+        )
+        return False
+
     def _save_positions(self):
-        """持久化当前持仓 + 活动止损单ID到文件"""
+        """Atomically persist positions and active stop IDs."""
+        tmp_path = None
         try:
             data = []
             stop_ids = getattr(self.client, '_active_stop_ids', {}) if self.client else {}
             for p in self.positions:
+                initial_entry_price, initial_risk_per_unit = self._position_r_anchor(p)
                 entry = {
                     "symbol": p.symbol, "direction": p.direction,
                     "entry_price": p.entry_price, "quantity": p.quantity,
                     "sl_price": p.sl_price, "current_sl": p.current_sl,
                     "risk_usdt": p.risk_usdt, "signal_score": p.signal_score,
                     "entry_time": p.entry_time.isoformat() if p.entry_time else "",
+                    "initial_entry_price": initial_entry_price,
+                    "initial_risk_per_unit": initial_risk_per_unit,
+                    "half_risk_protected": bool(getattr(p, "half_risk_protected", False)),
                     "breakeven_triggered": p.breakeven_triggered,
                     "breakeven_cooldown": p.breakeven_cooldown,
                     "partial_tp_triggered": p.partial_tp_triggered,
@@ -4972,6 +5554,7 @@ class SqueezeBreakoutBot:
                     "source_strategy": getattr(p, "source_strategy", ""),
                     "max_favorable_r": p.max_favorable_r,
                     "max_adverse_r": p.max_adverse_r,
+                    "last_mfe_check_ms": int(getattr(p, "last_mfe_check_ms", 0) or 0),
                     "excursion_price_source": getattr(p, "excursion_price_source", ""),
                     "time_stop_armed": p.time_stop_armed,
                     "time_stop_armed_at": p.time_stop_armed_at.isoformat() if getattr(p, "time_stop_armed_at", None) else "",
@@ -4992,12 +5575,33 @@ class SqueezeBreakoutBot:
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
                     "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
                     "active_stop_id": stop_ids.get(p.symbol, ""),
+                    "stop_replace_state": str(getattr(p, "stop_replace_state", "") or ""),
                 }
                 data.append(entry)
-            with open(getattr(self, '_positions_path', 'positions.json'), "w") as f:
-                json.dump(data, f, indent=2)
+            path = Path(getattr(self, '_positions_path', 'positions.json'))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                json.dump(data, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            return True
         except Exception as e:
             self._log.error(f"保存持仓失败: {e}")
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return False
 
     def _restore_stop_ids(self):
         """从持仓文件恢复 active_stop_ids (跨重启去重)"""
@@ -5030,7 +5634,10 @@ class SqueezeBreakoutBot:
                     risk_usdt=d.get("risk_usdt", 0), signal_score=d.get("signal_score", 0),
                     initial_band_hi=d.get("initial_band_hi", d["entry_price"]*1.02),
                     initial_band_lo=d.get("initial_band_lo", d["entry_price"]*0.98),
+                    initial_entry_price=float(d.get("initial_entry_price", 0.0) or 0.0),
+                    initial_risk_per_unit=float(d.get("initial_risk_per_unit", 0.0) or 0.0),
                 )
+                pos.half_risk_protected = bool(d.get("half_risk_protected", False))
                 pos.breakeven_triggered = d.get("breakeven_triggered", False)
                 pos.breakeven_cooldown = d.get("breakeven_cooldown", 0)
                 pos.partial_tp_triggered = d.get("partial_tp_triggered", False)
@@ -5041,7 +5648,9 @@ class SqueezeBreakoutBot:
                 pos.source_interval = d.get('source_interval', '15m')
                 pos.max_favorable_r = float(d.get('max_favorable_r', 0.0) or 0.0)
                 pos.max_adverse_r = float(d.get('max_adverse_r', 0.0) or 0.0)
+                pos.last_mfe_check_ms = int(d.get('last_mfe_check_ms', 0) or 0)
                 pos.excursion_price_source = str(d.get('excursion_price_source', '') or '')
+                pos.stop_replace_state = str(d.get('stop_replace_state', '') or '')
                 pos.btc_regime_fields = d.get('btc_regime_fields', {}) or {k: v for k, v in d.items() if str(k).startswith('btc_')}
                 pos.signal_key = d.get('signal_key', '')
                 raw_strategy = str(d.get('source_strategy', '') or '').strip().lower()
@@ -5097,6 +5706,7 @@ class SqueezeBreakoutBot:
                             exchange_positions.append(symbol)
                             existing_pos = next((pp for pp in self.positions if pp.symbol == symbol), None)
                             if existing_pos is not None:
+                                self._position_r_anchor(existing_pos)
                                 old_entry = float(getattr(existing_pos, "entry_price", 0.0) or 0.0)
                                 if entry_price > 0:
                                     existing_pos.entry_price = entry_price
@@ -5185,23 +5795,43 @@ class SqueezeBreakoutBot:
                                     et = datetime.fromtimestamp(open_ms/1000, tz=timezone.utc) + timedelta(hours=8)
                             except:
                                 pass
-                            # 计算实际风险 (qty × SL距离), 超标时用配置风险做保本/锁利参考
-                            actual_risk = qty * abs(entry_price - sl_price)
-                            sync_risk = self.get_risk_for_interval(restore_interval)
-                            ref_risk = round(min(actual_risk, sync_risk), 2)
-                            if actual_risk > sync_risk * 1.1:
-                                self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
-                                                f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
                             initial_sl_price = getattr(matched_local, 'initial_sl', 0.0) if matched_local else 0.0
                             if not initial_sl_price:
                                 initial_sl_price = sl_price
+                            if matched_local:
+                                initial_entry_price, initial_risk_per_unit = self._position_r_anchor(
+                                    matched_local
+                                )
+                            else:
+                                initial_entry_price = entry_price
+                                initial_risk_per_unit = abs(
+                                    initial_entry_price - initial_sl_price
+                                )
+                            actual_risk = qty * initial_risk_per_unit
+                            sync_risk = self.get_risk_for_interval(restore_interval)
+                            persisted_risk = float(
+                                getattr(matched_local, "risk_usdt", 0.0) or 0.0
+                            ) if matched_local else 0.0
+                            ref_risk = round(
+                                persisted_risk if persisted_risk > 0 else min(actual_risk, sync_risk),
+                                2,
+                            )
+                            if actual_risk > sync_risk * 1.1:
+                                self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
+                                                f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
                             pos = Position(
                                 symbol=symbol, direction=direction, entry_price=entry_price,
                                 entry_time=et, quantity=qty,
                                 sl_price=initial_sl_price, initial_sl=initial_sl_price, current_sl=sl_price,
                                 risk_usdt=ref_risk, signal_score=0,
                                 initial_band_hi=entry_price*1.02, initial_band_lo=entry_price*0.98,
+                                initial_entry_price=initial_entry_price,
+                                initial_risk_per_unit=initial_risk_per_unit,
                                 source_interval=restore_interval,
+                            )
+                            pos.half_risk_protected = (
+                                bool(getattr(matched_local, "half_risk_protected", False))
+                                if matched_local else False
                             )
                             pos.breakeven_triggered = breached
                             pos.breakeven_cooldown = matched_local.breakeven_cooldown if (breached and matched_local) else 0
@@ -5210,7 +5840,9 @@ class SqueezeBreakoutBot:
                             pos.lowest_price = getattr(matched_local, 'lowest_price', 999999.0) if matched_local else 999999.0
                             pos.max_favorable_r = getattr(matched_local, 'max_favorable_r', 0.0) if matched_local else 0.0
                             pos.max_adverse_r = getattr(matched_local, 'max_adverse_r', 0.0) if matched_local else 0.0
+                            pos.last_mfe_check_ms = getattr(matched_local, 'last_mfe_check_ms', 0) if matched_local else 0
                             pos.excursion_price_source = getattr(matched_local, 'excursion_price_source', '') if matched_local else ''
+                            pos.stop_replace_state = getattr(matched_local, 'stop_replace_state', '') if matched_local else ''
                             pos.source_strategy = getattr(matched_local, 'source_strategy', '') if matched_local else ''
                             pos.signal_key = getattr(matched_local, 'signal_key', '') if matched_local else ''
                             if not pos.source_strategy:
@@ -5248,13 +5880,6 @@ class SqueezeBreakoutBot:
                             pos._exchange_position_synced = True
                             self.positions.append(pos)
                             self._log.info(f"{symbol} restore source_interval={restore_interval}")
-                            # 恢复持仓后立即挂止损单到交易所
-                            sl_side = "SELL" if direction == "LONG" else "BUY"
-                            sl_result = self.client.stop_order(symbol, sl_side, round(sl_price, 8), round(qty, 8))
-                            if sl_result:
-                                self._log.info(f"{symbol} 止损单确认已挂 SL={sl_price:.4f} id={sl_result.get('orderId','?')}")
-                            else:
-                                self._log.warning(f"{symbol} 止损单挂单失败, bot内部兜底 SL={sl_price:.4f}")
                             self._log.warning(f"[合约同步] {symbol} {direction} 价{entry_price} 量{qty} "
                                             f"SL={sl_price:.4f} 风险${actual_risk:.2f}")
                 except Exception as e:
@@ -5321,15 +5946,91 @@ class SqueezeBreakoutBot:
         self.positions = deduped
 
         if self.positions:
-            # 给所有持仓补挂止损单 (stop_order 内部已去重, 不会重复创建)
+            # web_ui预加载和交易所新重建统一走同一条：先补全MFE并收紧，再只挂一次。
             if self.client is not None and self.cfg.market_type == "futures":
-                self._log.info(f"开始补挂止损: 共{len(self.positions)}个持仓")
-                for pos in self.positions:
-                    try:
-                        sl_side = "SELL" if pos.direction == "LONG" else "BUY"
-                        self.client.stop_order(pos.symbol, sl_side, round(pos.current_sl, 8), round(pos.quantity, 8))
-                    except Exception as e:
-                        self._log.error(f"{pos.symbol} 补挂止损异常: {e}")
+                self._log.info(f"开始恢复保护止损: 共{len(self.positions)}个持仓")
+            for pos in self.positions:
+                self._position_r_anchor(pos)
+                try:
+                    interval = str(
+                        getattr(pos, "source_interval", "")
+                        or getattr(self.cfg, "scan_interval", "15m")
+                    ).split(",")[0].strip() or "15m"
+                    recovery_df = fetch_klines(
+                        pos.symbol,
+                        interval,
+                        100,
+                        exchange=self.cfg.exchange,
+                        market_type=self.cfg.market_type,
+                        testnet=self.cfg.testnet,
+                        price_type="mark",
+                    )
+                    if recovery_df is not None and len(recovery_df) > 0:
+                        recovered_price = float(recovery_df["c"].iloc[-1])
+                        if float(getattr(pos, "current_price", 0.0) or 0.0) <= 0:
+                            pos.current_price = recovered_price
+                    price_source = (
+                        "mark"
+                        if self.cfg.exchange == "binance"
+                        and self.cfg.market_type == "futures"
+                        else ""
+                    )
+                    history, history_end_ms = self._history_with_unobserved_excursion(
+                        pos,
+                        interval,
+                        recovery_df,
+                        price_source,
+                    )
+                    old_price_source = str(
+                        getattr(pos, "excursion_price_source", "") or ""
+                    )
+                    merge_price_source = (
+                        price_source if history_end_ms > 0 else old_price_source
+                    )
+                    self._merge_position_excursion(
+                        pos,
+                        history,
+                        float(getattr(pos, "current_price", 0.0) or 0.0),
+                        merge_price_source,
+                    )
+                    if history_end_ms > 0:
+                        pos.last_mfe_check_ms = history_end_ms
+                except Exception as e:
+                    self._log.warning(f"{pos.symbol} 启动MFE恢复失败: {e}")
+
+                old_sl = float(pos.current_sl)
+                target_sl, stage = self._protection_recovery_target(pos)
+                current_market = float(getattr(pos, "current_price", 0.0) or 0.0)
+                valid_target = (
+                    current_market <= 0
+                    or (pos.direction == "LONG" and target_sl < current_market)
+                    or (pos.direction == "SHORT" and target_sl > current_market)
+                )
+                if target_sl != old_sl and not valid_target:
+                    self._log.warning(
+                        f"{pos.symbol} 启动保护跳过: action=invalid_price_side "
+                        f"current={current_market:.8f} target={target_sl:.8f}"
+                    )
+                    target_sl = old_sl
+                    stage = ""
+
+                if self.client is not None and self.cfg.market_type == "futures":
+                    applied = self._replace_protective_stop(
+                        pos,
+                        target_sl,
+                        rollback_sl=old_sl,
+                    )
+                else:
+                    pos.current_sl = target_sl
+                    applied = True
+                if applied and stage:
+                    pos.half_risk_protected = True
+                    if stage == "early":
+                        pos.breakeven_triggered = True
+                        pos.breakeven_cooldown = max(
+                            3, int(getattr(pos, "breakeven_cooldown", 0) or 0)
+                        )
+                    self._save_positions()
             # 恢复后保留原始止损价(分型止损), 仅刷新市场数据供UI显示
             for pos in self.positions:
                 if self.cfg.market_type == "futures" and getattr(pos, "_exchange_position_synced", False):
@@ -5347,7 +6048,7 @@ class SqueezeBreakoutBot:
                 except Exception as e:
                     self._log.warning(f"刷新{pos.symbol}失败: {e}")
             self.status_text = f"已恢复 {len(self.positions)} 个持仓"
-            # 重启不重挂止损单 (计划委托在交易所持久保留)
+            # 持久化恢复后的固定R、MFE与最终活动止损ID。
             self._save_positions()
 
     def _init_client(self):
@@ -5528,32 +6229,81 @@ class SqueezeBreakoutBot:
 
         return quantity, position_usdt, actual_risk
 
-    def _floor_qty(self, symbol, qty):
+    def _floor_qty(self, symbol, qty, market_order=True):
         """按交易对精度向下取整 (floor), 受交易所minQty/maxQty/step约束"""
         import math
         try:
             info = self.client.get_symbol_info(symbol)
             if info:
-                for f in info.get("filters", []):
-                    if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                        step = float(f["stepSize"])
-                        min_qty = float(f.get("minQty", step))
-                        max_qty = float(f.get("maxQty", 0))  # 0 = 不限
-                        decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
-                        floored = round(math.floor(qty / step) * step, decimals)
-                        if max_qty > 0 and floored > max_qty:
-                            floored = math.floor(max_qty / step) * step
-                            self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
-                        if floored < min_qty:
-                            self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
-                            return 0
-                        return floored
+                filters = {
+                    f.get("filterType"): f
+                    for f in info.get("filters", [])
+                    if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE")
+                }
+                preferred = "MARKET_LOT_SIZE" if market_order else "LOT_SIZE"
+                f = filters.get(preferred) or filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE")
+                if f:
+                    step = float(f["stepSize"])
+                    min_qty = float(f.get("minQty", step))
+                    max_qty = float(f.get("maxQty", 0))  # 0 = 不限
+                    decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
+                    floored = round(math.floor(qty / step) * step, decimals)
+                    if max_qty > 0 and floored > max_qty:
+                        floored = math.floor(max_qty / step) * step
+                        self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
+                    if floored < min_qty:
+                        self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
+                        return 0
+                    return floored
         except:
             pass
         if qty > 100: return math.floor(qty * 10) / 10
         if qty > 1: return math.floor(qty * 1000) / 1000
         if qty > 0.01: return math.floor(qty * 100000) / 100000
         return math.floor(qty * 100000000) / 100000000
+
+    def _prepare_futures_entry(self, symbol, entry_price, sl_price, qty):
+        """下市价单前应用Binance杠杆和最大名义价值约束。"""
+        entry_price = float(entry_price or 0.0)
+        sl_price = float(sl_price or 0.0)
+        qty = float(qty or 0.0)
+        pos_usdt = qty * entry_price
+        risk = qty * abs(entry_price - sl_price)
+        requested = max(1, int(float(getattr(self.cfg, "leverage", 1) or 1)))
+        meta = {
+            "requested_leverage": requested,
+            "effective_leverage": requested,
+            "max_notional_value": 0.0,
+        }
+        if self.client is None or self.cfg.market_type != "futures":
+            return qty, pos_usdt, risk, meta
+        if str(getattr(self.cfg, "exchange", "") or "").lower() != "binance":
+            self.client.set_leverage(symbol, requested)
+            return qty, pos_usdt, risk, meta
+
+        result = self.client.set_compatible_leverage(symbol, requested)
+        if not result:
+            meta["reason"] = "leverage_unavailable"
+            return 0.0, 0.0, 0.0, meta
+        if isinstance(result, dict):
+            meta["effective_leverage"] = int(float(result.get("leverage") or requested))
+            try:
+                meta["max_notional_value"] = float(result.get("maxNotionalValue") or 0.0)
+            except (TypeError, ValueError):
+                meta["max_notional_value"] = 0.0
+
+        max_notional = meta["max_notional_value"]
+        if max_notional > 0 and pos_usdt > max_notional * 0.98:
+            qty = self._floor_qty(symbol, max_notional * 0.98 / entry_price)
+            pos_usdt = qty * entry_price
+            risk = qty * abs(entry_price - sl_price)
+            meta["notional_capped"] = True
+        else:
+            meta["notional_capped"] = False
+        if qty <= 0:
+            meta["reason"] = "qty_too_small_after_leverage"
+            return 0.0, 0.0, 0.0, meta
+        return qty, pos_usdt, risk, meta
 
     # ========== 风控检查 ==========
     def _check_risk_limits(self) -> bool:
@@ -5760,6 +6510,7 @@ class SqueezeBreakoutBot:
             }))
             return None
 
+        leverage_meta = {}
         if self.client is not None:
             info = self.client.get_symbol_info(symbol)
             if info is None or (isinstance(info, dict) and info.get("status") == "BREAK"):
@@ -5770,6 +6521,18 @@ class SqueezeBreakoutBot:
                     "testnet": self.cfg.testnet,
                 }))
                 return None
+            if self.cfg.market_type == "futures":
+                qty, pos_usdt, risk, leverage_meta = self._prepare_futures_entry(
+                    symbol, entry_price, sl_price, qty
+                )
+                if qty <= 0:
+                    self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                        "reason": leverage_meta.get("reason", "leverage_unavailable"),
+                        "entry": entry_price,
+                        "sl": sl_price,
+                        **leverage_meta,
+                    }))
+                    return None
             if pos_usdt < 5.5 and self.cfg.market_type == "futures":
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                     "reason": "min_notional",
@@ -5777,8 +6540,6 @@ class SqueezeBreakoutBot:
                     "min_notional": 5.5,
                 }))
                 return None
-            if self.cfg.market_type == "futures":
-                self.client.set_leverage(symbol, self.cfg.leverage)
 
         hermes_state = (
             self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
@@ -5824,6 +6585,7 @@ class SqueezeBreakoutBot:
             "exchange": self.cfg.exchange,
             "mode": self.cfg.mode,
             "testnet": self.cfg.testnet,
+            **leverage_meta,
         }))
 
         fill_price = entry_price
@@ -5915,6 +6677,7 @@ class SqueezeBreakoutBot:
             "hermes_confirm": self._public_hermes_confirm(hermes_state),
             **target_zone,
             **btc_regime_fields,
+            **leverage_meta,
         }))
         mode_label = "测试网真实模拟" if self.client is not None else "纸笔模拟"
         self._log.info(
@@ -6678,6 +7441,7 @@ class SqueezeBreakoutBot:
         symbol = pos.symbol
         inv = getattr(pos, 'source_interval', self.cfg.scan_interval.split(',')[0] if ',' in self.cfg.scan_interval else self.cfg.scan_interval)
         inv = str(inv or '15m').split(',')[0].strip() or '15m'
+        r_entry, initial_risk = self._position_r_anchor(pos)
         # 未起爆超时先做本地快判: 如果历史最大推进都没到阈值, 不等行情接口直接释放僵尸仓。
         # 若历史曾到过阈值, 继续拉当前价, 按"当前R"决定是否因回落失败而退出。
         if (getattr(self.cfg, 'enable_time_stop', True)
@@ -6689,12 +7453,9 @@ class SqueezeBreakoutBot:
                 quick_r = None
                 try:
                     quick_price = float(getattr(pos, 'current_price', 0.0) or 0.0)
-                    quick_risk = abs(pos.entry_price - pos.initial_sl) if pos.initial_sl > 0 else (
-                        pos.risk_usdt / pos.quantity if pos.quantity > 0 else 0
-                    )
-                    if quick_price > 0 and quick_risk > 0:
-                        quick_r = ((quick_price - pos.entry_price) / quick_risk if pos.direction == 'LONG'
-                                   else (pos.entry_price - quick_price) / quick_risk)
+                    if quick_price > 0 and initial_risk > 0:
+                        quick_r = ((quick_price - r_entry) / initial_risk if pos.direction == 'LONG'
+                                   else (r_entry - quick_price) / initial_risk)
                 except:
                     quick_r = None
                 if quick_r is not None:
@@ -6703,8 +7464,11 @@ class SqueezeBreakoutBot:
                     )
                     if reason:
                         return reason
-                early_protect_on = bool(getattr(self.cfg, 'enable_early_protect', True))
-                if quick_r is None and not early_protect_on:
+                protection_on = (
+                    bool(getattr(self.cfg, "enable_early_protect", True))
+                    or float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0) > 0
+                )
+                if quick_r is None and not protection_on:
                     reason = self._time_stop_exit_decision(
                         pos, inv, elapsed_bars, None, min_progress_r, "local_timer"
                     )
@@ -6734,12 +7498,6 @@ class SqueezeBreakoutBot:
         current_price = closes.iloc[-1]; current_high = highs.iloc[-1]; current_low = lows.iloc[-1]
         ema_ratchet_val = ema(closes, self.cfg.ema_ratchet).iloc[-1]
 
-        # 1R锚点
-        if pos.initial_sl > 0:
-            initial_risk = abs(pos.entry_price - pos.initial_sl)
-        else:
-            initial_risk = pos.risk_usdt / pos.quantity if pos.quantity > 0 else 0.01
-
         # 实时浮盈 (用收盘价算r_multiple; 用极值算二阶触发)
         exchange_pnl = None
         if self.client is not None and self.cfg.market_type == "futures":
@@ -6758,117 +7516,223 @@ class SqueezeBreakoutBot:
             (current_price - pos.entry_price) * pos.quantity if pos.direction == "LONG"
             else (pos.entry_price - current_price) * pos.quantity)
 
-        # R-Multiple (统一使用实时当前价 current_price)
-        if initial_risk > 0:
-            if pos.direction == "LONG":
-                r_multiple = (float(current_price) - pos.entry_price) / initial_risk
-                favorable_r = (float(current_high) - pos.entry_price) / initial_risk
-                adverse_r = max(0.0, (pos.entry_price - float(current_low)) / initial_risk)
-            else:
-                r_multiple = (pos.entry_price - float(current_price)) / initial_risk
-                favorable_r = (pos.entry_price - float(current_low)) / initial_risk
-                adverse_r = max(0.0, (float(current_high) - pos.entry_price) / initial_risk)
-        else:
-            r_multiple = 0.0
-            favorable_r = 0.0
-            adverse_r = 0.0
         excursion_source = (
             "mark"
             if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
             else ""
         )
-        if excursion_source and getattr(pos, "excursion_price_source", "") != excursion_source and initial_risk > 0:
-            history = df
-            try:
-                entry_ms = int(pos.entry_time.timestamp() * 1000)
-                since_entry = df[df["ot"] >= entry_ms]
-                if len(since_entry) > 0:
-                    history = since_entry
-            except Exception:
-                pass
-            if pos.direction == "LONG":
-                rebased_favorable = (float(history["h"].max()) - pos.entry_price) / initial_risk
-                rebased_adverse = (pos.entry_price - float(history["l"].min())) / initial_risk
-            else:
-                rebased_favorable = (pos.entry_price - float(history["l"].min())) / initial_risk
-                rebased_adverse = (float(history["h"].max()) - pos.entry_price) / initial_risk
-            pos.max_favorable_r = max(0.0, float(r_multiple), float(rebased_favorable))
-            pos.max_adverse_r = max(0.0, float(rebased_adverse))
-            pos.excursion_price_source = excursion_source
-            self._log.info(
-                f"{symbol} MFE/MAE switched to mark-price basis: "
-                f"MFE={pos.max_favorable_r:.2f}R MAE={pos.max_adverse_r:.2f}R"
-            )
-            self._save_positions()
-        old_max_r = getattr(pos, 'max_favorable_r', 0.0)
-        if favorable_r > old_max_r:
-            pos.max_favorable_r = favorable_r
-            min_progress_r = float(getattr(self.cfg, 'time_stop_min_r', 0.6) or 0.6)
-            if favorable_r >= min_progress_r or favorable_r - old_max_r >= 0.05:
-                self._save_positions()
-        old_adverse_r = getattr(pos, 'max_adverse_r', 0.0)
-        if adverse_r > old_adverse_r:
-            pos.max_adverse_r = adverse_r
-            if adverse_r - old_adverse_r >= 0.05:
-                self._save_positions()
+        previous_mfe_cursor = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+        post_entry_history, history_end_ms = self._history_with_unobserved_excursion(
+            pos,
+            inv,
+            df,
+            excursion_source,
+        )
 
-        # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
-        if (getattr(self.cfg, 'enable_early_protect', True)
-                and not pos.partial_tp_triggered
-                and initial_risk > 0
-                and pos.quantity > 0):
-            early_trigger_r = max(0.1, float(getattr(self.cfg, 'early_protect_r', 0.8) or 0.8))
-            early_lock_r = max(0.0, float(getattr(self.cfg, 'early_protect_lock_r', 0.0) or 0.0))
-            protect_r = max(float(r_multiple), float(favorable_r), float(getattr(pos, 'max_favorable_r', 0.0) or 0.0))
-            if protect_r >= early_trigger_r:
-                desired_sl = (
-                    pos.entry_price + initial_risk * early_lock_r
-                    if pos.direction == 'LONG'
-                    else pos.entry_price - initial_risk * early_lock_r
+        if len(post_entry_history) > 0:
+            current_high = post_entry_history["h"].max()
+            current_low = post_entry_history["l"].min()
+        else:
+            current_high = current_price
+            current_low = current_price
+
+        # R-Multiple始终使用不可变的原始成交价和原始每单位风险。
+        if initial_risk > 0:
+            if pos.direction == "LONG":
+                r_multiple = (float(current_price) - r_entry) / initial_risk
+                favorable_r = (float(current_high) - r_entry) / initial_risk
+                adverse_r = max(0.0, (r_entry - float(current_low)) / initial_risk)
+            else:
+                r_multiple = (r_entry - float(current_price)) / initial_risk
+                favorable_r = (r_entry - float(current_low)) / initial_risk
+                adverse_r = max(0.0, (float(current_high) - r_entry) / initial_risk)
+        else:
+            r_multiple = 0.0
+            favorable_r = 0.0
+            adverse_r = 0.0
+        old_excursion_source = str(getattr(pos, "excursion_price_source", "") or "")
+        merge_excursion_source = (
+            excursion_source if history_end_ms > 0 else old_excursion_source
+        )
+        excursion_changed = self._merge_position_excursion(
+            pos,
+            post_entry_history,
+            float(current_price),
+            merge_excursion_source,
+        )
+        cursor_changed = history_end_ms > previous_mfe_cursor
+        if cursor_changed:
+            pos.last_mfe_check_ms = history_end_ms
+        if excursion_changed or cursor_changed:
+            if (
+                merge_excursion_source
+                and old_excursion_source != merge_excursion_source
+            ):
+                self._log.info(
+                    f"{symbol} MFE/MAE switched to mark-price basis: "
+                    f"MFE={pos.max_favorable_r:.2f}R MAE={pos.max_adverse_r:.2f}R"
                 )
-                should_move = (
-                    (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
-                    (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
+            if not self._save_positions() and cursor_changed:
+                pos.last_mfe_check_ms = previous_mfe_cursor
+
+        half_trigger_r = max(
+            0.0,
+            float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+        )
+        early_trigger_r = max(
+            0.1,
+            float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
+        )
+        early_protect_on = bool(getattr(self.cfg, "enable_early_protect", True))
+        protect_r = max(
+            float(r_multiple),
+            float(favorable_r),
+            float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+        )
+
+        if (
+            half_trigger_r > 0
+            and not pos.partial_tp_triggered
+            and initial_risk > 0
+            and pos.quantity > 0
+            and protect_r >= half_trigger_r
+            and (not early_protect_on or protect_r < early_trigger_r)
+        ):
+            desired_sl = (
+                r_entry - initial_risk * 0.5
+                if pos.direction == "LONG"
+                else r_entry + initial_risk * 0.5
+            )
+            should_move = (
+                (pos.direction == "LONG" and desired_sl > pos.current_sl)
+                or (pos.direction == "SHORT" and desired_sl < pos.current_sl)
+            )
+            already_tighter = (
+                (pos.direction == "LONG" and pos.current_sl >= desired_sl)
+                or (pos.direction == "SHORT" and pos.current_sl <= desired_sl)
+            )
+            valid_price_side = (
+                (pos.direction == "LONG" and desired_sl < current_price)
+                or (pos.direction == "SHORT" and desired_sl > current_price)
+            )
+            if should_move and not valid_price_side:
+                self._log.warning(
+                    f"半损保护跳过: {symbol} action=invalid_price_side "
+                    f"current={current_price:.4f} target={desired_sl:.4f}"
                 )
-                if should_move:
-                    old_sl = pos.current_sl
-                    pos.current_sl = desired_sl
-                    pos.breakeven_triggered = True
-                    pos.breakeven_cooldown = 3
+            elif should_move:
+                old_sl = pos.current_sl
+                pos.max_favorable_r = max(
+                    float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+                    float(protect_r),
+                )
+                applied = self._replace_protective_stop(
+                    pos,
+                    desired_sl,
+                    rollback_sl=old_sl,
+                )
+                if applied:
+                    pos.half_risk_protected = True
                     self._log.info(
-                        f'提前保护: {symbol} ({inv}) R={r_multiple:.2f}>={early_trigger_r:.2f} '
-                        f'SL {old_sl:.4f}->{pos.current_sl:.4f} 锁{early_lock_r:.2f}R'
+                        f"半损保护: {symbol} ({inv}) MFE={protect_r:.2f}R>={half_trigger_r:.2f}R "
+                        f"SL {old_sl:.4f}->{pos.current_sl:.4f} 最大亏损收窄至0.50R"
                     )
-                    if self.client is not None:
-                        self.client.cancel_all_orders(symbol)
-                        sl_side = 'SELL' if pos.direction == 'LONG' else 'BUY'
-                        self.client.stop_order(
-                            symbol, sl_side, round(pos.current_sl, 8), round(pos.quantity, 8),
-                            tracking_no=pos.tracking_no
-                        )
                     self._append_signal_event("position_protect", symbol, {
                         "symbol": symbol,
                         "direction": pos.direction,
                         "interval": inv,
-                        "reason": "early_protect",
-                        "entry": round(float(pos.entry_price), 8),
+                        "reason": "half_risk_protect",
+                        "entry": round(float(r_entry), 8),
+                        "initial_sl": round(float(pos.initial_sl), 8),
                         "current_price": round(float(current_price), 8),
                         "old_sl": round(float(old_sl), 8),
                         "new_sl": round(float(pos.current_sl), 8),
                         "r": round(float(r_multiple), 4),
                         "protect_r": round(float(protect_r), 4),
-                        "mfe_r": round(float(getattr(pos, 'max_favorable_r', 0.0)), 4),
-                        "mae_r": round(float(getattr(pos, 'max_adverse_r', 0.0)), 4),
-                        "trigger_r": early_trigger_r,
-                        "lock_r": early_lock_r,
+                        "mfe_r": round(float(getattr(pos, "max_favorable_r", 0.0)), 4),
+                        "mae_r": round(float(getattr(pos, "max_adverse_r", 0.0)), 4),
+                        "trigger_r": half_trigger_r,
+                        "lock_r": -0.5,
+                        "action": "half_risk_applied",
                         "quantity": round(float(pos.quantity), 8),
                         "signal_key": getattr(pos, "signal_key", ""),
                     })
                     self._save_positions()
+            elif already_tighter and not pos.half_risk_protected:
+                pos.half_risk_protected = True
+                self._log.info(
+                    f"半损保护状态恢复: {symbol} action=already_tighter "
+                    f"current_sl={pos.current_sl:.4f} target={desired_sl:.4f}"
+                )
+                self._save_positions()
+
+        # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
+        if (early_protect_on
+                and not pos.partial_tp_triggered
+                and initial_risk > 0
+                and pos.quantity > 0):
+            early_lock_r = max(0.0, float(getattr(self.cfg, 'early_protect_lock_r', 0.0) or 0.0))
+            if protect_r >= early_trigger_r:
+                desired_sl = (
+                    r_entry + initial_risk * early_lock_r
+                    if pos.direction == 'LONG'
+                    else r_entry - initial_risk * early_lock_r
+                )
+                should_move = (
+                    (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
+                    (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
+                )
+                valid_price_side = (
+                    (pos.direction == 'LONG' and desired_sl < current_price)
+                    or (pos.direction == 'SHORT' and desired_sl > current_price)
+                )
+                if should_move and not valid_price_side:
+                    self._log.warning(
+                        f"提前保护跳过: {symbol} action=invalid_price_side "
+                        f"current={current_price:.4f} target={desired_sl:.4f}"
+                    )
+                elif should_move:
+                    old_sl = pos.current_sl
+                    pos.max_favorable_r = max(
+                        float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+                        float(protect_r),
+                    )
+                    if self._replace_protective_stop(
+                        pos,
+                        desired_sl,
+                        rollback_sl=old_sl,
+                    ):
+                        pos.half_risk_protected = True
+                        pos.breakeven_triggered = True
+                        pos.breakeven_cooldown = 3
+                        self._log.info(
+                            f'提前保护: {symbol} ({inv}) R={r_multiple:.2f}>={early_trigger_r:.2f} '
+                            f'SL {old_sl:.4f}->{pos.current_sl:.4f} 锁{early_lock_r:.2f}R'
+                        )
+                        self._append_signal_event("position_protect", symbol, {
+                            "symbol": symbol,
+                            "direction": pos.direction,
+                            "interval": inv,
+                            "reason": "early_protect",
+                            "entry": round(float(r_entry), 8),
+                            "current_price": round(float(current_price), 8),
+                            "old_sl": round(float(old_sl), 8),
+                            "new_sl": round(float(pos.current_sl), 8),
+                            "r": round(float(r_multiple), 4),
+                            "protect_r": round(float(protect_r), 4),
+                            "mfe_r": round(float(getattr(pos, 'max_favorable_r', 0.0)), 4),
+                            "mae_r": round(float(getattr(pos, 'max_adverse_r', 0.0)), 4),
+                            "trigger_r": early_trigger_r,
+                            "lock_r": early_lock_r,
+                            "quantity": round(float(pos.quantity), 8),
+                            "signal_key": getattr(pos, "signal_key", ""),
+                        })
+                        self._save_positions()
                 elif not pos.breakeven_triggered and (
                     (pos.direction == 'LONG' and pos.current_sl >= desired_sl) or
                     (pos.direction == 'SHORT' and pos.current_sl <= desired_sl)
                 ):
+                    pos.half_risk_protected = True
                     pos.breakeven_triggered = True
                     pos.breakeven_cooldown = 3
                     self._save_positions()
@@ -6892,7 +7756,7 @@ class SqueezeBreakoutBot:
                 self._log.info(f'{symbol} 数量无法减仓50%, 直接启用追踪')
                 pos.partial_tp_triggered = True
                 pos.breakeven_triggered = True  # 核心：点亮一阶防守，防止被一阶覆盖
-                new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                 pos.current_sl = new_sl
                 if self.client is not None:
                     self.client.cancel_all_orders(symbol)
@@ -6911,7 +7775,7 @@ class SqueezeBreakoutBot:
                         pos.quantity -= close_qty
                         pos.partial_tp_triggered = True
                         pos.breakeven_triggered = True  # 核心：点亮一阶防守
-                        new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                        new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                         pos.current_sl = new_sl
                         mode_label = 'ATR吊灯' if getattr(self.cfg, 'use_atr_trail', False) else 'EMA棘轮'
                         self._log.info(f'2.0R减仓: {symbol} 抛{close_qty:.4f} 余{pos.quantity:.4f} SL锁1R->{new_sl:.4f} [三阶={mode_label}]')
@@ -6981,7 +7845,7 @@ class SqueezeBreakoutBot:
                     pos.quantity -= close_qty
                     pos.partial_tp_triggered = True
                     pos.breakeven_triggered = True
-                    new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                    new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                     pos.current_sl = new_sl
                     self._log.info(f'2.0R减仓(纸笔): {symbol} 抛{close_qty:.4f} 余{pos.quantity:.4f} SL锁1R->{new_sl:.4f}')
                     partial_pnl = self._calc_trade_pnl(pos.direction, pos.entry_price, current_price, close_qty)
@@ -7007,7 +7871,7 @@ class SqueezeBreakoutBot:
         # ==== 第一阶: 1.2R 绝对防守, 可在提前保本后继续升级锁0.2R ====
         elif r_multiple >= self.cfg.tier1_defense_r:
             buf = initial_risk * 0.2
-            desired_sl = pos.entry_price + buf if pos.direction == 'LONG' else pos.entry_price - buf
+            desired_sl = r_entry + buf if pos.direction == 'LONG' else r_entry - buf
             should_move = (
                 (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
                 (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
@@ -7030,7 +7894,7 @@ class SqueezeBreakoutBot:
                     "direction": pos.direction,
                     "interval": inv,
                     "reason": "tier1_defense_upgrade",
-                    "entry": round(float(pos.entry_price), 8),
+                    "entry": round(float(r_entry), 8),
                     "current_price": round(float(current_price), 8),
                     "old_sl": round(float(old_sl), 8),
                     "new_sl": round(float(pos.current_sl), 8),
