@@ -29,9 +29,9 @@ def _record_r(record: dict) -> Optional[float]:
     risk = _finite_float(record.get("risk"))
     if risk is None or risk <= 0:
         return None
-    persisted = _finite_float(record.get("r"))
-    if persisted is not None:
-        return persisted
+    persisted_value = record.get("r")
+    if persisted_value is not None and str(persisted_value).strip():
+        return _finite_float(persisted_value)
     pnl = _finite_float(record.get("pnl"))
     return None if pnl is None else pnl / risk
 
@@ -42,7 +42,11 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
     excluded_records = 0
 
     for index, record in enumerate(trade_log or []):
-        if not isinstance(record, dict) or record.get("voided"):
+        if (
+            not isinstance(record, dict)
+            or record.get("voided")
+            or str(record.get("status") or "").strip().lower() == "voided"
+        ):
             excluded_records += 1
             continue
         closed_at = _parse_time(record.get("time"))
@@ -52,8 +56,8 @@ def build_r_trade_lifecycles(trade_log: list[dict]) -> dict:
             continue
 
         valid_exit_record_count += 1
-        signal_key = str(record.get("signal_key") or "").strip()
-        group_key = signal_key or f"legacy:{index}"
+        signal_key = record.get("signal_key")
+        group_key = signal_key if signal_key is not None and signal_key != "" else f"legacy:{index}"
         reason = str(record.get("reason") or "未标注").strip() or "未标注"
         mfe_r = _finite_float(record.get("mfe_r"))
         mae_r = _finite_float(record.get("mae_r"))

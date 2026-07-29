@@ -70,3 +70,56 @@ class RLifecycleTests(unittest.TestCase):
         self.assertEqual(result["valid_exit_record_count"], 1)
         self.assertEqual(result["excluded_records"], 4)
         self.assertEqual(len(result["lifecycles"]), 1)
+
+    def test_excludes_non_finite_persisted_r_even_when_pnl_can_derive_r(self):
+        rows = [
+            {
+                "time": "2026-07-20T10:00:00+00:00",
+                "risk": 100,
+                "pnl": 50,
+                "r": math.inf,
+            }
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        self.assertEqual(result["valid_exit_record_count"], 0)
+        self.assertEqual(result["excluded_records"], 1)
+        self.assertEqual(result["lifecycles"], [])
+
+    def test_excludes_records_with_voided_status_case_insensitively(self):
+        rows = [
+            {
+                "time": "2026-07-20T10:00:00+00:00",
+                "risk": 100,
+                "r": 1,
+                "status": "VoIdEd",
+            }
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        self.assertEqual(result["valid_exit_record_count"], 0)
+        self.assertEqual(result["excluded_records"], 1)
+        self.assertEqual(result["lifecycles"], [])
+
+    def test_preserves_whitespace_in_signal_key_when_grouping(self):
+        rows = [
+            {
+                "time": "2026-07-20T10:00:00+00:00",
+                "signal_key": "key",
+                "risk": 100,
+                "r": 1,
+            },
+            {
+                "time": "2026-07-20T10:01:00+00:00",
+                "signal_key": " key ",
+                "risk": 100,
+                "r": 2,
+            },
+        ]
+
+        result = build_r_trade_lifecycles(rows)
+
+        self.assertEqual([trade["key"] for trade in result["lifecycles"]], ["key", " key "])
+        self.assertEqual([trade["r"] for trade in result["lifecycles"]], [1.0, 2.0])
