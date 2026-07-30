@@ -659,7 +659,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
-    def test_incremental_fetches_use_futures_mainnet_and_closed_candles(
+    def test_initial_and_incremental_reflow_reads_use_bitget_usdt_futures(
         self, universe, latest, ranged
     ):
         universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0}, {"NEWUSDT": "CRYPTO"})
@@ -678,15 +678,15 @@ class ReflowScanServiceTests(unittest.TestCase):
             })
             scan_momentum_reflow(path, max_workers=1)
         latest.assert_any_call(
-            "NEWUSDT", "1h", 1000, exchange="binance", closed_only=True,
+            "NEWUSDT", "1h", 1000, exchange="bitget", closed_only=True,
             market_type="futures", testnet=False,
         )
         latest.assert_any_call(
-            "OLDUSDT", "1d", 40, exchange="binance", closed_only=True,
+            "OLDUSDT", "1d", 40, exchange="bitget", closed_only=True,
             market_type="futures", testnet=False,
         )
         ranged.assert_called_once_with(
-            "OLDUSDT", "1h", 0, exchange="binance",
+            "OLDUSDT", "1h", 0, exchange="bitget",
             market_type="futures", testnet=False,
         )
 
