@@ -413,10 +413,12 @@ function renderFuel(el){
 }
 var _reflowRenderGeneration=0;
 function isCurrentReflowRender(generation, box){
-  return generation===_reflowRenderGeneration &&
+  return _currentPage==='reflow' &&
+    generation===_reflowRenderGeneration &&
     document.getElementById('reflowAutoEnabled')===box;
 }
 function refreshCurrentReflowPanel(){
+  if(_currentPage!=='reflow') return;
   var box=document.getElementById('reflowAutoEnabled');
   var content=document.getElementById('content');
   if(box&&content) renderReflow(content);

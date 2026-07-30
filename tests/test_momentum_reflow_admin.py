@@ -26,6 +26,7 @@ def run_admin_javascript(test_body):
         const fs = require('fs');
         const vm = require('vm');
         vm.runInThisContext(fs.readFileSync(0, 'utf8'));
+        vm.runInThisContext("_currentPage='reflow'");
 
         const ids = [
           'reflowAutoEnabled', 'reflowEnabledState', 'reflowUpdatedAt',
@@ -525,6 +526,44 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(finalState.textContent, '已关闭');
                   await flush();
                   assert.strictEqual(requests.length, 6);
+                """
+            )
+        )
+
+    def test_navigation_away_blocks_pending_save_reconciliation(self):
+        run_admin_javascript(
+            textwrap.dedent(
+                """
+                  renderReflow(content);
+                  requests[0].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:100, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:200,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  const detachedBox = elements.reflowAutoEnabled;
+                  const detachedState = elements.reflowEnabledState;
+                  const detachedError = elements.reflowSaveError;
+                  detachedBox.checked = true;
+                  detachedBox.onchange();
+
+                  switchPage('dashboard');
+                  assert.strictEqual(requests.length, 3);
+                  assert.strictEqual(elements.reflowAutoEnabled, detachedBox);
+                  requests[1].resolve(response(true, {
+                    ok:true, auto_scan_enabled:true,
+                    updated_at:300, updated_by:'admin'
+                  }));
+                  await flush();
+
+                  assert.strictEqual(requests.length, 3);
+                  assert.strictEqual(elements.reflowAutoEnabled, detachedBox);
+                  assert.strictEqual(detachedBox.checked, true);
+                  assert.strictEqual(detachedBox.disabled, true);
+                  assert.strictEqual(detachedBox.dataset.savedChecked, 'false');
+                  assert.strictEqual(detachedState.textContent, '已关闭');
+                  assert.strictEqual(detachedError.style.display, 'none');
+                  assert.strictEqual(detachedError.textContent, '');
                 """
             )
         )
