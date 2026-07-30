@@ -16,10 +16,18 @@ from trader import TradeConfig, SqueezeBreakoutBot
 import os as _os
 from pathlib import Path
 from momentum_reflow import scan_momentum_reflow
+from momentum_reflow_dashboard import (
+    load_reflow_dashboard,
+    load_reflow_settings,
+    merge_reflow_signals,
+    next_reflow_scan_at,
+)
 
 # 交易引擎实例 (全局单例)
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 MOMENTUM_REFLOW_LEDGER = Path(__file__).with_name("momentum_reflow_state.json")
+MOMENTUM_REFLOW_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_settings.json"
+MOMENTUM_REFLOW_HISTORY = Path(_BASE_DIR) / "momentum_reflow_daily_signals.json"
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -423,12 +431,23 @@ cache = {"squeeze_4h":[],"squeeze_1h":[],"squeeze_15m":[],"squeeze_1d":[],"squee
          "breakout_4h":[],"breakout_1h":[],"breakout_15m":[],"breakout_1d":[],
          "short_4h":[],"short_1h":[],"volume_4h":[],"volume_1h":[],"trader":[],
          "funding":{"negative":[],"positive":[],"nextTime":0},
-         "reflow_1h":{"rows":[],"scanned":0,"errors":0,"initialized":0}}
+         "reflow_1h":None}
 state = {"time":"--","text":"就绪","scanning":False,"progress":""}
 _scan_lock = threading.Lock()
 _scan_worker = None
 _scan_generation = 0
 _scan_worker_token = None
+_reflow_automation_lock = threading.Lock()
+_reflow_automation = {
+    "running": False,
+    "last_auto_scan_at": 0,
+    "last_auto_error": "",
+    "last_skip_at": 0,
+    "next_scan_at": 0,
+}
+_reflow_scheduler_lock = threading.Lock()
+_reflow_scheduler_thread = None
+_reflow_scheduler_stop = threading.Event()
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -3555,7 +3574,9 @@ if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, data=cache, demo_cfg_json=_json.dumps(demo_display_cfg))
+    data = dict(cache)
+    data["reflow_1h"] = _reflow_dashboard_payload(cache.get("reflow_1h"))
+    return render_template_string(HTML, data=data, demo_cfg_json=_json.dumps(demo_display_cfg))
 
 # ═══ CryptoRank 中文雷达 ═══
 _CR_DIST = _os.path.join(_BASE_DIR, 'crypot-rank-bot-main', 'dist')
@@ -3588,7 +3609,9 @@ def proxy_cryptorank_api():
 
 @app.route("/data")
 def get_data():
-    return jsonify({"data":cache,"time":state["time"],"status":state["text"],
+    data = dict(cache)
+    data["reflow_1h"] = _reflow_dashboard_payload(cache.get("reflow_1h"))
+    return jsonify({"data":data,"time":state["time"],"status":state["text"],
                     "scanning":state["scanning"],"progress":state["progress"]})
 
 @app.route("/scan/funding")
@@ -3601,7 +3624,7 @@ def do_funding():
         return jsonify({"scanning": True, "status": "扫描中..."})
     return jsonify({"scanning":True})
 
-def _start_scan_worker(label, work, apply_result):
+def _start_scan_worker(label, work, apply_result, apply_error=None):
     global _scan_worker, _scan_generation, _scan_worker_token
     with _scan_lock:
         if state["scanning"] or (_scan_worker is not None and _scan_worker.is_alive()):
@@ -3636,6 +3659,8 @@ def _start_scan_worker(label, work, apply_result):
             except Exception as e:
                 with _scan_lock:
                     if is_current():
+                        if apply_error is not None:
+                            apply_error(e)
                         state["text"] = str(e)[:80]
             finally:
                 with _scan_lock:
@@ -3654,27 +3679,239 @@ def _start_scan_worker(label, work, apply_result):
             raise
     return True
 
+def _reflow_dashboard_payload(base=None, now_ms=None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    payload = (
+        load_reflow_dashboard(MOMENTUM_REFLOW_HISTORY, now_ms)
+        if base is None
+        else dict(base)
+    )
+    with _reflow_automation_lock:
+        automation = dict(_reflow_automation)
+    with _scan_lock:
+        automation.update(
+            scanning=bool(state["scanning"]),
+            progress=state["progress"],
+        )
+    try:
+        settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+    except (OSError, ValueError) as error:
+        automation["auto_scan_enabled"] = False
+        automation["last_auto_error"] = str(error)[:80]
+    else:
+        automation["auto_scan_enabled"] = settings["auto_scan_enabled"]
+    payload["automation"] = automation
+    return payload
+
+def _run_reflow_scan(progress):
+    result = scan_momentum_reflow(MOMENTUM_REFLOW_LEDGER, progress=progress)
+    return merge_reflow_signals(
+        MOMENTUM_REFLOW_HISTORY,
+        MOMENTUM_REFLOW_LEDGER,
+        result,
+        int(time.time() * 1000),
+    )
+
+def _update_reflow_automation_success(trigger, payload):
+    if trigger != "auto":
+        return
+    with _reflow_automation_lock:
+        _reflow_automation["last_auto_scan_at"] = int(time.time() * 1000)
+        _reflow_automation["last_auto_error"] = ""
+
+def _update_reflow_automation_error(trigger, error):
+    if trigger != "auto":
+        return
+    with _reflow_automation_lock:
+        _reflow_automation["last_auto_error"] = str(error)[:80]
+
+def _start_reflow_scan(trigger):
+    label = "动能回流自动扫描" if trigger == "auto" else "reflow 1h 扫描中"
+
+    def apply_result(payload):
+        cache["reflow_1h"] = payload
+        _update_reflow_automation_success(trigger, payload)
+        return len(payload["rows"])
+
+    return _start_scan_worker(
+        label,
+        _run_reflow_scan,
+        apply_result,
+        lambda error: _update_reflow_automation_error(trigger, error),
+    )
+
+def _new_reflow_scheduler_state(**overrides):
+    scheduler_state = {
+        "previous_enabled": None,
+        "last_attempt_slot": 0,
+        "last_skip_at": 0,
+        "next_scan_at": 0,
+    }
+    scheduler_state.update(overrides)
+    return scheduler_state
+
+def _reflow_scheduler_step(now, settings, scheduler_state, start_scan):
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    enabled = settings.get("auto_scan_enabled")
+    if type(enabled) is not bool:
+        raise ValueError("auto_scan_enabled must be a boolean")
+
+    updated = dict(scheduler_state)
+    if not enabled:
+        updated["previous_enabled"] = False
+        updated["next_scan_at"] = 0
+        return updated
+
+    now_ms = int(now.timestamp() * 1000)
+    previous_enabled = updated.get("previous_enabled")
+    next_scan_at = int(updated.get("next_scan_at") or 0)
+    immediate = previous_enabled is not True
+    due = next_scan_at > 0 and now_ms >= next_scan_at
+    updated["previous_enabled"] = True
+
+    if not immediate and not due:
+        if next_scan_at == 0:
+            updated["next_scan_at"] = int(
+                next_reflow_scan_at(now).timestamp() * 1000
+            )
+        return updated
+
+    attempt_slot = now_ms if immediate else next_scan_at
+    if updated.get("last_attempt_slot") == attempt_slot:
+        updated["next_scan_at"] = int(
+            next_reflow_scan_at(now).timestamp() * 1000
+        )
+        return updated
+    updated["last_attempt_slot"] = attempt_slot
+    started = start_scan()
+    if not started:
+        updated["last_skip_at"] = attempt_slot
+    updated["next_scan_at"] = int(
+        next_reflow_scan_at(now).timestamp() * 1000
+    )
+    return updated
+
+def _reflow_scheduler_loop():
+    scheduler_state = _new_reflow_scheduler_state()
+    settings_error = ""
+    try:
+        while not _reflow_scheduler_stop.is_set():
+            now = datetime.now(timezone.utc)
+            try:
+                settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+            except Exception as error:
+                settings_error = str(error)[:80]
+                scheduler_state = _reflow_scheduler_step(
+                    now,
+                    {"auto_scan_enabled": False},
+                    scheduler_state,
+                    lambda: False,
+                )
+                with _reflow_automation_lock:
+                    _reflow_automation["last_auto_error"] = settings_error
+                    _reflow_automation["last_skip_at"] = scheduler_state["last_skip_at"]
+                    _reflow_automation["next_scan_at"] = 0
+                    _reflow_automation["auto_scan_enabled"] = False
+            else:
+                with _reflow_automation_lock:
+                    if (
+                        settings_error
+                        and _reflow_automation["last_auto_error"] == settings_error
+                    ):
+                        _reflow_automation["last_auto_error"] = ""
+                settings_error = ""
+                scheduler_state = _reflow_scheduler_step(
+                    now,
+                    settings,
+                    scheduler_state,
+                    lambda: _start_reflow_scan("auto"),
+                )
+                with _reflow_automation_lock:
+                    _reflow_automation["last_skip_at"] = scheduler_state["last_skip_at"]
+                    _reflow_automation["next_scan_at"] = scheduler_state["next_scan_at"]
+                    _reflow_automation["auto_scan_enabled"] = settings[
+                        "auto_scan_enabled"
+                    ]
+            _reflow_scheduler_stop.wait(1)
+    finally:
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = False
+
+def _start_reflow_scheduler():
+    global _reflow_scheduler_thread
+    with _reflow_scheduler_lock:
+        if (
+            _reflow_scheduler_thread is not None
+            and _reflow_scheduler_thread.is_alive()
+        ):
+            return False
+        _reflow_scheduler_stop.clear()
+        worker = threading.Thread(target=_reflow_scheduler_loop, daemon=True)
+        _reflow_scheduler_thread = worker
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = True
+        try:
+            worker.start()
+        except Exception:
+            _reflow_scheduler_thread = None
+            with _reflow_automation_lock:
+                _reflow_automation["running"] = False
+            raise
+    return True
+
+def _stop_reflow_scheduler_for_tests():
+    global _reflow_scheduler_thread
+    _reflow_scheduler_stop.set()
+    with _reflow_scheduler_lock:
+        worker = _reflow_scheduler_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _reflow_scheduler_lock:
+        if _reflow_scheduler_thread is not worker:
+            return
+        still_running = worker is not None and worker.is_alive()
+        if not still_running:
+            _reflow_scheduler_thread = None
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = still_running
+
+@app.route("/api/reflow/automation/status")
+def reflow_automation_status():
+    with _reflow_automation_lock:
+        automation = dict(_reflow_automation)
+    try:
+        settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+    except (OSError, ValueError) as error:
+        return jsonify({
+            **automation,
+            "auto_scan_enabled": False,
+            "error": str(error)[:80],
+        }), 503
+    return jsonify({
+        **automation,
+        "auto_scan_enabled": settings["auto_scan_enabled"],
+    })
+
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
     if mode == "reflow" and interval != "1h":
         return jsonify({"error":"reflow only supports 1h"}), 400
-    key = f"{mode}_{interval}"
     if mode == "reflow":
-        def work(progress):
-            return scan_momentum_reflow(MOMENTUM_REFLOW_LEDGER, progress=progress)
+        if not _start_reflow_scan("manual"):
+            return jsonify({"scanning":True,"status":"扫描中..."})
+        return jsonify({"scanning":True})
 
-        def apply_result(result):
-            cache[key] = result
-            return len(result.get("rows", []))
-    else:
-        def work(progress):
-            if mode == "diverge": return scan_divergence(interval)
-            if mode == "breakout": return scan_breakout(interval)
-            return scan(interval, mode, 5)
+    key = f"{mode}_{interval}"
+    def work(progress):
+        if mode == "diverge": return scan_divergence(interval)
+        if mode == "breakout": return scan_breakout(interval)
+        return scan(interval, mode, 5)
 
-        def apply_result(result):
-            cache[key] = result
-            return len(result)
+    def apply_result(result):
+        cache[key] = result
+        return len(result)
 
     if not _start_scan_worker(f"{mode} {interval} 扫描中", work, apply_result):
         return jsonify({"scanning":True,"status":"扫描中..."})
@@ -4103,4 +4340,5 @@ def _deduct_fuel_commission(pnl: float):
 if __name__=="__main__":
     print("\n  >>> Axiom Quant v1.0 <<<")
     print("  http://127.0.0.1:5000\n")
+    _start_reflow_scheduler()
     app.run(host="0.0.0.0",port=5000,debug=False,threaded=True)

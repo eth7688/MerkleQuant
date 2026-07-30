@@ -528,6 +528,7 @@ def _scan_symbol(
             "window_index": int(candidate["window_index"]),
             "breakout_time": int(event["breakout_open_time"]),
             "breakout_close_time": event.get("breakout_close_time"),
+            "return_open_time": int(candidate["return_open_time"]),
             "max_expansion_atr": float(event["max_expansion_atr"]),
             "daily_kind": confirmation["kind"],
             "daily_rank": int(confirmation["rank"]),

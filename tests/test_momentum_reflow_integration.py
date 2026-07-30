@@ -3,8 +3,13 @@ import json
 import subprocess
 import time
 import unittest
+from threading import Event
 from pathlib import Path
 from unittest.mock import patch
+
+
+with patch("trader.SqueezeBreakoutBot.start"):
+    importlib.import_module("web_ui")
 
 
 def wait_until_idle(web_ui, timeout=2.0):
@@ -81,6 +86,25 @@ def reset_scan_admission(web_ui):
         setattr(web_ui, worker_name, None)
 
 
+def candidate():
+    return {
+        "symbol": "BTCUSDT",
+        "direction": "LONG",
+        "instrument_type": "CRYPTO",
+        "breakout_time": 100,
+        "breakout_close_time": 3_600_100,
+        "return_open_time": 1_000,
+        "price": 100.0,
+        "ema50": 99.0,
+        "window_index": 1,
+        "daily_kind": "strong_momentum",
+        "daily_rank": 3,
+        "breakout_volume_ratio": 3.0,
+        "max_expansion_atr": 3.0,
+        "close_distance_atr": 0.0,
+    }
+
+
 class MomentumReflowUiTests(unittest.TestCase):
     def test_sidebar_description_and_renderer_are_wired(self):
         source = Path("web_ui.py").read_text(encoding="utf-8")
@@ -92,19 +116,113 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertIn('mode == "reflow"', source)
         self.assertIn("Array.isArray(rows.rows)", source)
 
-    def test_route_starts_reflow_scan_and_caches_payload(self):
+    def test_manual_reflow_scan_merges_today_history(self):
         web_ui = importlib.import_module("web_ui")
-        payload = {"rows": [], "scanned": 2, "errors": 0, "initialized": 2}
-        web_ui.state.update(scanning=False, progress="", text="")
-        web_ui.cache["reflow_1h"] = []
+        scan_result = {
+            "rows": [candidate()],
+            "scanned": 283,
+            "errors": 0,
+            "initialized": 0,
+        }
+        dashboard_payload = {
+            "day": "2026-07-30",
+            "rows": [candidate()],
+        }
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
 
-        with patch.object(web_ui, "scan_momentum_reflow", return_value=payload):
+        with patch.object(web_ui, "scan_momentum_reflow", return_value=scan_result), \
+             patch.object(
+                 web_ui, "merge_reflow_signals", return_value=dashboard_payload
+             ) as merge:
             response = web_ui.app.test_client().get("/scan/reflow/1h")
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.get_json()["scanning"])
-            self.assertTrue(wait_until_payload_and_idle(web_ui, payload))
+            self.assertTrue(
+                wait_until_payload_and_idle(web_ui, dashboard_payload)
+            )
 
-        self.assertEqual(web_ui.cache["reflow_1h"], payload)
+        self.assertEqual(web_ui.cache["reflow_1h"], dashboard_payload)
+        merge.assert_called_once()
+
+    def test_other_scan_running_blocks_auto_reflow(self):
+        web_ui = importlib.import_module("web_ui")
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
+        blocker = Event()
+        generic_started = Event()
+
+        def work(progress):
+            generic_started.set()
+            blocker.wait(1)
+            return []
+
+        self.assertTrue(
+            web_ui._start_scan_worker("generic", work, lambda result: len(result))
+        )
+        self.assertTrue(generic_started.wait(1))
+        with patch.object(web_ui, "scan_momentum_reflow") as scan:
+            self.assertFalse(web_ui._start_reflow_scan("auto"))
+        blocker.set()
+        self.assertTrue(wait_until_idle(web_ui))
+        scan.assert_not_called()
+
+    def test_data_loads_persisted_today_without_market_scan(self):
+        web_ui = importlib.import_module("web_ui")
+        persisted = {"day": "2026-07-30", "rows": [candidate()]}
+        web_ui.cache["reflow_1h"] = None
+
+        with patch.object(
+            web_ui, "load_reflow_dashboard", return_value=persisted
+        ) as load, patch.object(
+            web_ui,
+            "load_reflow_settings",
+            return_value={"auto_scan_enabled": True},
+        ), patch.object(web_ui, "scan_momentum_reflow") as scan:
+            payload = web_ui.app.test_client().get("/data").get_json()
+
+        self.assertEqual(payload["data"]["reflow_1h"]["rows"], persisted["rows"])
+        self.assertIn("automation", payload["data"]["reflow_1h"])
+        load.assert_called_once()
+        scan.assert_not_called()
+
+    def test_stale_reflow_worker_cannot_overwrite_payload_or_automation(self):
+        web_ui = importlib.import_module("web_ui")
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.started = False
+                workers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        stale_payload = {"day": "2026-07-30", "rows": [candidate()]}
+        sentinel_payload = {"day": "2026-07-30", "rows": []}
+        with patch.object(web_ui.threading, "Thread", DeferredThread), \
+             patch.object(web_ui, "_run_reflow_scan", return_value=stale_payload):
+            self.assertTrue(web_ui._start_reflow_scan("auto"))
+            stale_worker = workers[-1]
+            with web_ui._scan_lock:
+                web_ui.state["scanning"] = False
+                web_ui._scan_worker = None
+            self.assertTrue(web_ui._start_reflow_scan("manual"))
+
+            web_ui.cache["reflow_1h"] = sentinel_payload
+            with web_ui._reflow_automation_lock:
+                web_ui._reflow_automation["last_auto_scan_at"] = 777
+            stale_worker.target()
+
+        self.assertEqual(web_ui.cache["reflow_1h"], sentinel_payload)
+        self.assertEqual(web_ui._reflow_automation["last_auto_scan_at"], 777)
+        self.assertTrue(web_ui.state["scanning"])
 
     def test_reflow_admission_reserves_one_worker_before_thread_start(self):
         web_ui = importlib.import_module("web_ui")

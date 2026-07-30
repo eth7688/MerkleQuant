@@ -463,6 +463,44 @@ def make_return_window_hourly_history(symbol):
 
 
 class ReflowScanServiceTests(unittest.TestCase):
+    @patch("momentum_reflow.daily_confirmation")
+    @patch("momentum_reflow.advance_symbol")
+    @patch("momentum_reflow.fetch_klines")
+    def test_scan_symbol_returns_first_return_open_time(
+        self, fetch, advance, confirmation
+    ):
+        return_open_time = BASE_OT + HOUR_MS
+        fetch.side_effect = [
+            make_closed_hourly_history("TESTUSDT"),
+            make_closed_daily_history("TESTUSDT"),
+        ]
+        confirmation.return_value = {
+            "passed": True,
+            "kind": "strong_momentum",
+            "rank": 3,
+        }
+        advance.return_value = (
+            {
+                "event": {
+                    "breakout_open_time": BASE_OT,
+                    "breakout_close_time": return_open_time,
+                    "max_expansion_atr": 2.0,
+                    "breakout_volume_ratio": 2.5,
+                }
+            },
+            {
+                "direction": "LONG",
+                "return_open_time": return_open_time,
+                "window_index": 1,
+            },
+        )
+
+        _, candidate, _, _ = momentum_reflow._scan_symbol(
+            "TESTUSDT", {}, False
+        )
+
+        self.assertEqual(candidate["return_open_time"], return_open_time)
+
     @patch("momentum_reflow.fetch_klines_range")
     def test_incremental_context_uses_full_ema_initialization_window(self, ranged):
         cursor = 2_000 * HOUR_MS
