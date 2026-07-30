@@ -3548,7 +3548,7 @@ function renderCryptorank(page){
 // ===== INIT =====
 var firstMenu=document.querySelector('.menu-items');
 if(firstMenu){firstMenu.classList.add('open'); firstMenu.previousElementSibling.classList.add('open');}
-if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||!Array.isArray(v.rows)||v.rows.length===0)})){
+if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||(Array.isArray(v.rows)?v.rows.length===0:(!Array.isArray(v.negative)||v.negative.length===0)&&(!Array.isArray(v.positive)||v.positive.length===0)))})){
   document.getElementById('scanLabel').textContent='首次使用，点击开始扫描';
 }
 </script></body></html>"""

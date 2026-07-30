@@ -266,6 +266,16 @@ class MomentumReflowUiTests(unittest.TestCase):
             "empty",
         )
 
+    def test_first_use_prompt_recognizes_nonempty_funding_sides(self):
+        for funding in (
+            {"negative": ["BTCUSDT"], "positive": []},
+            {"negative": [], "positive": ["BTCUSDT"]},
+        ):
+            self.assertEqual(
+                first_use_scan_label({"breakout_1h": [], "funding": funding}),
+                "empty",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
