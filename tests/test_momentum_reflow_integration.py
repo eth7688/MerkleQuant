@@ -87,6 +87,45 @@ process.stdout.write(JSON.stringify({{nodes:nodes,sourceLength:payload.rows.leng
     return json.loads(completed.stdout)
 
 
+def poll_reflow_payload(initial_payload, updated_payload):
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    lifecycle = source[
+        source.index("function show(tab, btn)"):
+        source.index("// ===== TRADER PANEL =====")
+    ]
+    script = f"""
+var D={{reflow_1h:{json.dumps(initial_payload)}}};
+var cur='squeeze_4h', pollTimer=null, traderPoll=null, btcPoll=null, demoPoll=null;
+var _lastTraderData=null, _traderInitDone=false, _reflowPolling=false, _pollingScan=false;
+var rendered=[];
+var nodes={{}};
+global.document={{
+  querySelectorAll:function(){{return []; }},
+  getElementById:function(id){{return nodes[id]||(nodes[id]={{style:{{}},textContent:'',className:'',disabled:false}});}}
+}};
+global.clearInterval=function(){{}};
+global.setInterval=function(fn){{global.pollFn=fn;return 7;}};
+global.setTimeout=function(){{}};
+global.stopEngineHeartbeat=function(){{}};
+global.setDesc=function(){{}};
+global.renderMomentumReflow=function(payload){{rendered.push(payload.rows[0].symbol);}};
+global.fetch=function(){{return Promise.resolve({{json:function(){{return Promise.resolve({{data:{{reflow_1h:{json.dumps(updated_payload)}}},time:'12:00',status:'',progress:'',scanning:false}});}}}});}};
+{lifecycle}
+show('reflow_1h', null);
+Promise.resolve().then(function(){{return Promise.resolve();}}).then(function(){{
+  process.stdout.write(JSON.stringify({{renders:rendered,interval:pollTimer}}));
+}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(completed.stdout)
+
+
 def first_use_scan_label(cache):
     source = Path("web_ui.py").read_text(encoding="utf-8")
     marker = "var firstMenu=document.querySelector('.menu-items');"
@@ -386,7 +425,7 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertIn("0.18 ATR", rendered)
         self.assertIn("\u5f3a\u52a8\u80fd\u65e5K", rendered)
         self.assertIn("2.4x", rendered)
-        self.assertIn("1970-01-01 08:00", rendered)
+        self.assertNotIn("1970-01-01 08:00", rendered)
         self.assertIn("reflow-long", rendered)
         self.assertIn("reflow-short", rendered)
         self.assertIn("&lt;img", rendered)
@@ -456,6 +495,49 @@ class MomentumReflowUiTests(unittest.TestCase):
         result = render_reflow_payload({"rows": [candidate()]})
 
         self.assertIn("reflow-mobile-details", result["main"]["innerHTML"])
+
+    def test_mobile_contract_keeps_freshness_and_details_control_visible(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+
+        self.assertIn("reflow-mobile-detail-cell", source)
+        self.assertIn("reflow-dashboard table th:nth-child(n+8)", source)
+
+    def test_dashboard_scanning_status_includes_zero_and_missing_progress(self):
+        for progress in (0, None):
+            result = render_reflow_payload({
+                "rows": [],
+                "automation": {"scanning": True, "progress": progress},
+            })
+            stats = result["stats"]["innerHTML"]
+
+            self.assertIn("扫描中", stats)
+            if progress == 0:
+                self.assertIn("0", stats)
+
+    def test_dashboard_timestamp_zero_or_missing_never_renders_epoch(self):
+        row = candidate()
+        row.update(breakout_time=0, return_open_time=0)
+        result = render_reflow_payload({
+            "rows": [row],
+            "automation": {"last_auto_scan_at": 0, "next_scan_at": None},
+        })
+        rendered = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
+
+        self.assertNotIn("1970-01-01", rendered)
+        self.assertGreaterEqual(rendered.count("--"), 2)
+
+    def test_reflow_page_polls_and_rerenders_updated_payload(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+        self.assertIn("var _reflowPolling=false", source)
+        first = candidate()
+        first["symbol"] = "FIRSTUSDT"
+        updated = candidate()
+        updated["symbol"] = "UPDATEDUSDT"
+
+        result = poll_reflow_payload({"rows": [first]}, {"rows": [updated]})
+
+        self.assertEqual(result["interval"], 7)
+        self.assertEqual(result["renders"], ["FIRSTUSDT", "UPDATEDUSDT"])
 
 
     def test_first_use_prompt_normalizes_mixed_cache_shapes(self):
