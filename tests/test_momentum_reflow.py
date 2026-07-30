@@ -1,9 +1,18 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
-from momentum_reflow import add_hourly_indicators, daily_confirmation
+from momentum_reflow import (
+    add_hourly_indicators,
+    advance_symbol,
+    daily_confirmation,
+    load_ledger,
+    save_ledger,
+)
 
 
 def candle_frame(count=80, start=100.0):
@@ -140,6 +149,234 @@ class DailyConfirmationTests(unittest.TestCase):
     def test_rejects_insufficient_history(self):
         result = daily_confirmation(candle_frame(2), "LONG")
         self.assertEqual(result, {"passed": False, "kind": "none", "rank": 0})
+
+
+HOUR_MS = 3_600_000
+BASE_OT = 100 * HOUR_MS
+
+
+def make_waiting_state(direction):
+    return {
+        "last_processed_open_time": BASE_OT,
+        "event": {
+            "direction": direction,
+            "state": "WAIT_FIRST_RETURN",
+            "breakout_open_time": BASE_OT - 4 * HOUR_MS,
+            "breakout_volume_ratio": 2.0,
+            "expansion_time": BASE_OT - 3 * HOUR_MS,
+            "max_expansion_atr": 2.0,
+            "first_touch_time": 0,
+            "return_window_index": 0,
+            "audit_reason": "expansion_confirmed",
+        },
+    }
+
+
+def make_touch_frame(close=100.1, ema50=100.0, atr14=1.0, offset=1, direction="LONG"):
+    target = BASE_OT + offset * HOUR_MS
+    ema_values = (
+        [ema50 - 0.3, ema50 - 0.2, ema50 - 0.1, ema50]
+        if direction == "LONG"
+        else [ema50 + 0.3, ema50 + 0.2, ema50 + 0.1, ema50]
+    )
+    rows = []
+    for index, ema_value in enumerate(ema_values):
+        row_close = close if index == 3 else ema_values[index]
+        rows.append(
+            {
+                "ot": target - (3 - index) * HOUR_MS,
+                "o": row_close,
+                "h": max(row_close, ema_value + 0.1),
+                "l": min(row_close, ema_value - 0.1),
+                "c": row_close,
+                "v": 100.0,
+                "ema50": ema_value,
+                "atr14": atr14,
+                "vol_ma20_prev": 100.0,
+            }
+        )
+    rows[-1]["h"] = max(close, ema50 + 0.2 * atr14)
+    rows[-1]["l"] = min(close, ema50 - 0.2 * atr14)
+    return pd.DataFrame(rows)
+
+
+def make_far_frame(offset=2):
+    frame = make_touch_frame(close=102.0, offset=offset)
+    frame.loc[frame.index[-1], ["h", "l"]] = [102.2, 101.8]
+    return frame
+
+
+def make_state_machine_frame(direction, expansion_offset=0, start_offset=-5):
+    sign = 1.0 if direction == "LONG" else -1.0
+    ema_values = [99.7, 99.8, 99.9, 100.0, 100.1, 100.2, 100.3, 100.4]
+    if direction == "SHORT":
+        ema_values = list(reversed(ema_values))
+    closes = [value - 0.1 * sign for value in ema_values]
+    breakout_index = 4
+    closes[breakout_index] = ema_values[breakout_index] + (1.6 if expansion_offset == 0 else 0.1) * sign
+    for index in range(1, 4):
+        follow_index = breakout_index + index
+        if follow_index >= len(closes):
+            break
+        closes[follow_index] = ema_values[follow_index] + (1.6 if expansion_offset == index else 0.1) * sign
+    rows = []
+    for index, (ema_value, close_value) in enumerate(zip(ema_values, closes)):
+        open_value = close_value
+        volume = 100.0
+        if index == breakout_index:
+            open_value = ema_value - 1.0 * sign
+            volume = 200.0
+        high = max(open_value, close_value) + 0.1
+        low = min(open_value, close_value) - 0.1
+        if index == len(ema_values) - 1:
+            high = max(high, ema_value + 0.2)
+            low = min(low, ema_value - 0.2)
+        rows.append(
+            {
+                "ot": (BASE_OT + start_offset * HOUR_MS) + index * HOUR_MS,
+                "o": open_value,
+                "h": high,
+                "l": low,
+                "c": close_value,
+                "v": volume,
+                "ema50": ema_value,
+                "atr14": 1.0,
+                "vol_ma20_prev": 100.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+class ReflowStateMachineTests(unittest.TestCase):
+    def test_long_and_short_breakout_expand_then_open_first_return_window(self):
+        for direction in ("LONG", "SHORT"):
+            frame = make_state_machine_frame(direction).iloc[:6]
+            state, candidate = advance_symbol("TESTUSDT", {}, frame)
+            self.assertEqual(state["event"]["state"], "RETURN_WINDOW")
+            self.assertEqual(state["event"]["return_window_index"], 1)
+            self.assertEqual(candidate["direction"], direction)
+            self.assertEqual(candidate["window_index"], 1)
+
+    def test_expansion_can_confirm_on_breakout_or_each_follow_up_candle(self):
+        for expansion_offset in range(4):
+            state, candidate = advance_symbol(
+                "TESTUSDT", {}, make_state_machine_frame("LONG", expansion_offset).iloc[: 5 + expansion_offset]
+            )
+            self.assertEqual(state["event"]["state"], "WAIT_FIRST_RETURN")
+            self.assertEqual(state["event"]["expansion_time"], BASE_OT + (expansion_offset - 1) * HOUR_MS)
+            self.assertIsNone(candidate)
+
+    def test_third_follow_up_without_expansion_invalidates_event(self):
+        state, candidate = advance_symbol("TESTUSDT", {}, make_state_machine_frame("LONG", 99).iloc[:8])
+        self.assertEqual(state["event"]["state"], "INVALIDATED")
+        self.assertEqual(state["event"]["audit_reason"], "expansion_timeout")
+        self.assertIsNone(candidate)
+
+    def test_wait_first_return_has_no_elapsed_time_expiry(self):
+        frame = make_far_frame(offset=100)
+        frame.loc[frame.index[:3], "ot"] = [BASE_OT - 3 * HOUR_MS, BASE_OT - 2 * HOUR_MS, BASE_OT - HOUR_MS]
+        state, candidate = advance_symbol(
+            "TESTUSDT", make_waiting_state("LONG"), frame
+        )
+        self.assertEqual(state["event"]["state"], "WAIT_FIRST_RETURN")
+        self.assertIsNone(candidate)
+
+    def test_slope_reversal_invalidates_before_first_touch(self):
+        frame = make_far_frame()
+        frame.loc[frame.index[:3], "ot"] = [BASE_OT - 3 * HOUR_MS, BASE_OT - 2 * HOUR_MS, BASE_OT - HOUR_MS]
+        frame.loc[:, "ema50"] = [100.3, 100.2, 100.1, 100.0]
+        state, candidate = advance_symbol("TESTUSDT", make_waiting_state("LONG"), frame)
+        self.assertEqual(state["event"]["state"], "INVALIDATED")
+        self.assertEqual(state["event"]["audit_reason"], "ema_slope_reversal")
+        self.assertIsNone(candidate)
+
+    def test_close_may_finish_on_either_side_of_ema(self):
+        for close in (99.70, 100.30):
+            state, candidate = advance_symbol(
+                "TESTUSDT", make_waiting_state("LONG"), make_touch_frame(close=close)
+            )
+            self.assertIsNotNone(candidate)
+            self.assertEqual(state["event"]["state"], "RETURN_WINDOW")
+
+    def test_first_bad_touch_consumes_event(self):
+        state, candidate = advance_symbol(
+            "TESTUSDT", make_waiting_state("LONG"), make_touch_frame(close=100.36)
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(state["event"]["state"], "CONSUMED")
+        self.assertEqual(state["event"]["audit_reason"], "first_touch_close_too_far")
+
+    def test_return_window_is_consecutive_and_capped_at_five(self):
+        state = make_waiting_state("SHORT")
+        for expected_index in range(1, 6):
+            state, candidate = advance_symbol(
+                "TESTUSDT",
+                state,
+                make_touch_frame(close=99.9, offset=expected_index, direction="SHORT"),
+            )
+            self.assertEqual(candidate["window_index"], expected_index)
+        self.assertEqual(state["event"]["state"], "CONSUMED")
+
+    def test_leaving_zone_consumes_and_never_reopens_same_event(self):
+        state, _ = advance_symbol(
+            "TESTUSDT", make_waiting_state("LONG"), make_touch_frame(close=100.1)
+        )
+        state, candidate = advance_symbol("TESTUSDT", state, make_far_frame())
+        self.assertIsNone(candidate)
+        self.assertEqual(state["event"]["state"], "CONSUMED")
+        state, candidate = advance_symbol("TESTUSDT", state, make_touch_frame(close=100.1, offset=3))
+        self.assertIsNone(candidate)
+
+    def test_repeated_scan_returns_active_candidate_without_incrementing_twice(self):
+        frame = make_touch_frame(close=100.1)
+        state, first = advance_symbol("TESTUSDT", make_waiting_state("LONG"), frame)
+        repeated_state, repeated = advance_symbol("TESTUSDT", state, frame)
+        self.assertEqual(repeated_state, state)
+        self.assertEqual(repeated, first)
+
+    def test_later_strong_breakout_replaces_each_terminal_event(self):
+        for terminal_state in ("CONSUMED", "INVALIDATED"):
+            terminal = make_waiting_state("LONG")
+            terminal["event"]["state"] = terminal_state
+            frame = make_state_machine_frame("SHORT", 0, start_offset=1).iloc[:5]
+            state, candidate = advance_symbol("TESTUSDT", terminal, frame)
+            self.assertEqual(state["event"]["direction"], "SHORT")
+            self.assertEqual(state["event"]["state"], "WAIT_FIRST_RETURN")
+            self.assertIsNone(candidate)
+
+    def test_non_finite_indicator_row_does_not_advance_cursor(self):
+        frame = make_touch_frame()
+        frame.loc[frame.index[-1], "atr14"] = float("nan")
+        state, candidate = advance_symbol("TESTUSDT", make_waiting_state("LONG"), frame)
+        self.assertEqual(state["last_processed_open_time"], BASE_OT)
+        self.assertIsNone(candidate)
+
+
+class ReflowLedgerTests(unittest.TestCase):
+    def test_round_trip_preserves_active_event_and_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            ledger = {"version": 1, "symbols": {"TESTUSDT": make_waiting_state("LONG")}}
+            save_ledger(path, ledger)
+            self.assertEqual(load_ledger(path), ledger)
+
+    def test_corrupt_file_is_not_replaced_with_empty_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_ledger(path)
+            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+
+    def test_failed_atomic_replace_preserves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            original = {"version": 1, "symbols": {}}
+            save_ledger(path, original)
+            with patch("momentum_reflow.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(OSError):
+                    save_ledger(path, {"version": 1, "symbols": {"X": {}}})
+            self.assertEqual(load_ledger(path), original)
 
 
 if __name__ == "__main__":

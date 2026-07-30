@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import copy
+import json
 import math
+import os
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
@@ -159,3 +164,191 @@ def daily_confirmation(frame: pd.DataFrame, direction: str) -> dict:
             return _result("top_fractal", 1)
 
     return {"passed": False, "kind": "none", "rank": 0}
+
+
+def _touches_zone(row) -> bool:
+    lower = row["ema50"] - TOUCH_ZONE_ATR * row["atr14"]
+    upper = row["ema50"] + TOUCH_ZONE_ATR * row["atr14"]
+    return row["l"] <= upper and row["h"] >= lower
+
+
+def _close_distance_atr(row) -> float:
+    return abs(row["c"] - row["ema50"]) / row["atr14"]
+
+
+def _slope_aligned(frame: pd.DataFrame, index: int, direction: str) -> bool | None:
+    if index < EMA_SLOPE_BARS:
+        return None
+    now = frame.iloc[index]["ema50"]
+    prior = frame.iloc[index - EMA_SLOPE_BARS]["ema50"]
+    return now > prior if direction == "LONG" else now < prior
+
+
+def _breakout_direction(previous, current) -> str | None:
+    body_ratio = abs(current["c"] - current["o"]) / current["atr14"]
+    volume_ratio = current["v"] / current["vol_ma20_prev"]
+    if body_ratio < BREAKOUT_BODY_ATR or volume_ratio < BREAKOUT_VOLUME_RATIO:
+        return None
+    if previous["c"] <= previous["ema50"] and current["c"] > current["ema50"]:
+        return "LONG"
+    if previous["c"] >= previous["ema50"] and current["c"] < current["ema50"]:
+        return "SHORT"
+    return None
+
+
+def _indicator_row_is_finite(row) -> bool:
+    return all(
+        math.isfinite(float(row[column]))
+        for column in ("ema50", "atr14", "vol_ma20_prev")
+    ) and float(row["atr14"]) > 0.0 and float(row["vol_ma20_prev"]) > 0.0
+
+
+def _new_event(direction: str, row) -> dict:
+    return {
+        "direction": direction,
+        "state": "WAIT_EXPANSION",
+        "breakout_open_time": int(row["ot"]),
+        "breakout_volume_ratio": float(row["v"] / row["vol_ma20_prev"]),
+        "expansion_time": 0,
+        "max_expansion_atr": 0.0,
+        "first_touch_time": 0,
+        "return_window_index": 0,
+        "audit_reason": "breakout_detected",
+        "expansion_followups": 0,
+    }
+
+
+def _expansion_atr(row, direction: str) -> float:
+    sign = 1.0 if direction == "LONG" else -1.0
+    return sign * (float(row["c"]) - float(row["ema50"])) / float(row["atr14"])
+
+
+def _candidate(symbol: str, event: dict) -> dict:
+    return {
+        "symbol": symbol,
+        "direction": event["direction"],
+        "breakout_open_time": event["breakout_open_time"],
+        "expansion_time": event["expansion_time"],
+        "return_open_time": event["return_open_time"],
+        "window_index": event["return_window_index"],
+    }
+
+
+def _confirm_expansion(event: dict, row) -> None:
+    event["state"] = "WAIT_FIRST_RETURN"
+    event["expansion_time"] = int(row["ot"])
+    event["audit_reason"] = "expansion_confirmed"
+
+
+def advance_symbol(symbol: str, symbol_state: dict, frame: pd.DataFrame) -> tuple[dict, dict | None]:
+    """Advance one symbol's closed-candle event lifecycle without double counting."""
+    state = copy.deepcopy(symbol_state) if symbol_state else {}
+    state.setdefault("last_processed_open_time", -1)
+    state.setdefault("event", None)
+    out = frame.sort_values("ot").drop_duplicates("ot", keep="last").reset_index(drop=True)
+    cursor = int(state["last_processed_open_time"])
+    newest_candidate = None
+    processed_any = False
+
+    for index, row in out.iterrows():
+        open_time = int(row["ot"])
+        if open_time <= cursor:
+            continue
+        if not _indicator_row_is_finite(row):
+            break
+
+        processed_any = True
+        newest_candidate = None
+        event = state["event"]
+        direction = None
+        if index > 0 and _indicator_row_is_finite(out.iloc[index - 1]):
+            direction = _breakout_direction(out.iloc[index - 1], row)
+
+        if event is None or event["state"] in {"CONSUMED", "INVALIDATED"}:
+            if direction is not None:
+                event = _new_event(direction, row)
+                state["event"] = event
+            else:
+                cursor = open_time
+                continue
+
+        if event["state"] == "WAIT_EXPANSION":
+            expansion = _expansion_atr(row, event["direction"])
+            event["max_expansion_atr"] = max(event["max_expansion_atr"], expansion)
+            if expansion >= EXPANSION_ATR:
+                _confirm_expansion(event, row)
+                cursor = open_time
+                continue
+            elif open_time != event["breakout_open_time"]:
+                event["expansion_followups"] += 1
+                if event["expansion_followups"] >= EXPANSION_FOLLOW_BARS:
+                    event["state"] = "INVALIDATED"
+                    event["audit_reason"] = "expansion_timeout"
+
+        if event["state"] == "WAIT_FIRST_RETURN":
+            slope = _slope_aligned(out, index, event["direction"])
+            if slope is not None and not slope:
+                event["state"] = "INVALIDATED"
+                event["audit_reason"] = "ema_slope_reversal"
+            elif _touches_zone(row):
+                if _close_distance_atr(row) > CLOSE_DISTANCE_ATR:
+                    event["state"] = "CONSUMED"
+                    event["audit_reason"] = "first_touch_close_too_far"
+                else:
+                    event["state"] = "RETURN_WINDOW"
+                    event["first_touch_time"] = open_time
+                    event["return_window_index"] = 1
+                    event["return_open_time"] = open_time
+                    event["audit_reason"] = "return_window_open"
+                    newest_candidate = _candidate(symbol, event)
+
+        elif event["state"] == "RETURN_WINDOW":
+            if not _touches_zone(row) or _close_distance_atr(row) > CLOSE_DISTANCE_ATR:
+                event["state"] = "CONSUMED"
+                event["audit_reason"] = "return_window_left_zone"
+            else:
+                event["return_window_index"] += 1
+                event["return_open_time"] = open_time
+                newest_candidate = _candidate(symbol, event)
+                if event["return_window_index"] >= RETURN_WINDOW_BARS:
+                    event["state"] = "CONSUMED"
+                    event["audit_reason"] = "return_window_complete"
+
+        cursor = open_time
+
+    state["last_processed_open_time"] = cursor
+    if not processed_any and state["event"] and state["event"]["state"] == "RETURN_WINDOW":
+        return state, _candidate(symbol, state["event"])
+    return state, newest_candidate
+
+
+def load_ledger(path: Path) -> dict:
+    if not path.exists():
+        return {"version": LEDGER_VERSION, "symbols": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("momentum reflow ledger is unreadable") from error
+    if data.get("version") != LEDGER_VERSION or not isinstance(data.get("symbols"), dict):
+        raise ValueError("momentum reflow ledger version or shape is invalid")
+    return data
+
+
+def save_ledger(path: Path, ledger: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(ledger, ensure_ascii=False, separators=(",", ":"))
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
