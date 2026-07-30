@@ -860,10 +860,10 @@ hourly = fetch_klines(
 )
 ```
 
-For an existing symbol, request complete data beginning 60 hours before its cursor so EMA50, ATR14, and volume context are present:
+For an existing symbol, request up to 1000 closed hours before its cursor so EMA50, ATR14, and volume context match initialization:
 
 ```python
-context_start = max(0, last_processed_open_time - 60 * 3_600_000)
+context_start = max(0, last_processed_open_time - 1000 * 3_600_000)
 hourly = fetch_klines_range(
     symbol,
     "1h",

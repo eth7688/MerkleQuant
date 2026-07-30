@@ -14,6 +14,15 @@ def wait_until_idle(web_ui, timeout=2.0):
     return not web_ui.state["scanning"]
 
 
+def wait_until_payload_and_idle(web_ui, payload, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if web_ui.cache.get("reflow_1h") == payload and not web_ui.state["scanning"]:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def render_reflow_payload(payload):
     source = Path("web_ui.py").read_text(encoding="utf-8")
     helpers = source[
@@ -51,6 +60,7 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertIn("reflow_1h:", source)
         self.assertIn("function renderMomentumReflow(", source)
         self.assertIn('mode == "reflow"', source)
+        self.assertIn("Array.isArray(rows.rows)", source)
 
     def test_route_starts_reflow_scan_and_caches_payload(self):
         web_ui = importlib.import_module("web_ui")
@@ -62,9 +72,39 @@ class MomentumReflowUiTests(unittest.TestCase):
             response = web_ui.app.test_client().get("/scan/reflow/1h")
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.get_json()["scanning"])
-            self.assertTrue(wait_until_idle(web_ui))
+            self.assertTrue(wait_until_payload_and_idle(web_ui, payload))
 
         self.assertEqual(web_ui.cache["reflow_1h"], payload)
+
+    def test_reflow_admission_reserves_one_worker_before_thread_start(self):
+        web_ui = importlib.import_module("web_ui")
+        web_ui.state.update(scanning=False, progress="", text="")
+
+        class DeferredThread:
+            starts = 0
+
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                self.started = False
+
+            def start(self):
+                self.started = True
+                type(self).starts += 1
+
+            def is_alive(self):
+                return self.started
+
+        with patch.object(web_ui.threading, "Thread", DeferredThread):
+            first = web_ui.app.test_client().get("/scan/reflow/1h")
+            second = web_ui.app.test_client().get("/scan/reflow/1h")
+
+        self.assertTrue(first.get_json()["scanning"])
+        self.assertTrue(second.get_json()["scanning"])
+        self.assertTrue(web_ui.state["scanning"])
+        self.assertEqual(DeferredThread.starts, 1)
+        setattr(web_ui, "_reflow_worker", None)
+        web_ui.state["scanning"] = False
 
     def test_route_rejects_unsupported_reflow_intervals(self):
         web_ui = importlib.import_module("web_ui")
@@ -84,6 +124,7 @@ class MomentumReflowUiTests(unittest.TestCase):
                     "ema50": 12.1,
                     "close_distance_atr": 0.18,
                     "window_index": 3,
+                    "breakout_time": 0,
                     "max_expansion_atr": 1.25,
                     "daily_kind": '<svg onload="globalThis.pwned=2">',
                     "breakout_volume_ratio": 2.4,
@@ -112,6 +153,9 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertIn("0.18 ATR", rendered)
         self.assertIn("\u5f3a\u52a8\u80fd\u65e5K", rendered)
         self.assertIn("2.4x", rendered)
+        self.assertIn("1970-01-01", rendered)
+        self.assertIn("reflow-long", rendered)
+        self.assertIn("reflow-short", rendered)
         self.assertIn("&lt;img", rendered)
         self.assertIn("&lt;svg", rendered)
         self.assertNotRegex(rendered, r"NaN|Infinity")

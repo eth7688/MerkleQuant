@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
+import momentum_reflow
 
 from momentum_reflow import (
     add_hourly_indicators,
@@ -250,6 +251,14 @@ def make_state_machine_frame(direction, expansion_offset=0, start_offset=-5):
 
 
 class ReflowStateMachineTests(unittest.TestCase):
+    def test_event_persists_breakout_close_time(self):
+        state, _ = advance_symbol("TESTUSDT", {}, make_state_machine_frame("LONG").iloc[:5])
+
+        self.assertEqual(
+            state["event"]["breakout_close_time"],
+            state["event"]["breakout_open_time"] + HOUR_MS,
+        )
+
     def test_long_and_short_breakout_expand_then_open_first_return_window(self):
         for direction in ("LONG", "SHORT"):
             frame = make_state_machine_frame(direction).iloc[:6]
@@ -299,6 +308,28 @@ class ReflowStateMachineTests(unittest.TestCase):
             )
             self.assertIsNotNone(candidate)
             self.assertEqual(state["event"]["state"], "RETURN_WINDOW")
+
+    def test_exact_close_distance_boundary_remains_eligible(self):
+        state, candidate = advance_symbol(
+            "TESTUSDT", make_waiting_state("LONG"), make_touch_frame(close=100.35)
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(state["event"]["state"], "RETURN_WINDOW")
+
+    def test_wait_first_return_keeps_later_maximum_expansion(self):
+        frame = make_state_machine_frame("LONG").iloc[:7].copy()
+        expansion_row = frame.index[5]
+        frame.loc[expansion_row, ["o", "h", "l", "c"]] = [102.3, 102.4, 102.2, 102.3]
+        return_row = frame.index[6]
+        ema50 = frame.loc[return_row, "ema50"]
+        frame.loc[return_row, ["o", "h", "l", "c"]] = [ema50, ema50 + 0.1, ema50 - 0.1, ema50]
+
+        state, candidate = advance_symbol("TESTUSDT", {}, frame)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(state["event"]["state"], "RETURN_WINDOW")
+        self.assertGreaterEqual(state["event"]["max_expansion_atr"], 2.0)
 
     def test_first_bad_touch_consumes_event(self):
         state, candidate = advance_symbol(
@@ -355,6 +386,17 @@ class ReflowStateMachineTests(unittest.TestCase):
 
 
 class ReflowLedgerTests(unittest.TestCase):
+    def test_valid_json_non_objects_are_rejected_without_replacing_file(self):
+        for raw in ("[]", "null", "1", '"ledger"'):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "ledger.json"
+                path.write_text(raw, encoding="utf-8")
+
+                with self.assertRaises(ValueError):
+                    load_ledger(path)
+
+                self.assertEqual(path.read_text(encoding="utf-8"), raw)
+
     def test_round_trip_preserves_active_event_and_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"
@@ -421,6 +463,19 @@ def make_return_window_hourly_history(symbol):
 
 
 class ReflowScanServiceTests(unittest.TestCase):
+    @patch("momentum_reflow.fetch_klines_range")
+    def test_incremental_context_uses_full_ema_initialization_window(self, ranged):
+        cursor = 2_000 * HOUR_MS
+        history = candle_frame(1_000)
+        history["ot"] = cursor - 998 * HOUR_MS + np.arange(len(history)) * HOUR_MS
+        ranged.return_value = history
+
+        momentum_reflow._scan_symbol(
+            "TESTUSDT", {"last_processed_open_time": cursor, "event": None}, True
+        )
+
+        self.assertEqual(ranged.call_args.args[2], cursor - 1_000 * HOUR_MS)
+
     @patch("momentum_reflow.requests.get")
     def test_universe_uses_fapi_usdt_perpetual_contracts(self, get):
         exchange = Mock()
@@ -542,7 +597,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             market_type="futures", testnet=False,
         )
         ranged.assert_called_once_with(
-            "OLDUSDT", "1h", 40 * HOUR_MS, exchange="binance",
+            "OLDUSDT", "1h", 0, exchange="binance",
             market_type="futures", testnet=False,
         )
 

@@ -425,6 +425,9 @@ cache = {"squeeze_4h":[],"squeeze_1h":[],"squeeze_15m":[],"squeeze_1d":[],"squee
          "funding":{"negative":[],"positive":[],"nextTime":0},
          "reflow_1h":{"rows":[],"scanned":0,"errors":0,"initialized":0}}
 state = {"time":"--","text":"就绪","scanning":False,"progress":""}
+_reflow_scan_lock = threading.Lock()
+_reflow_worker = None
+_reflow_generation = 0
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -1618,28 +1621,42 @@ function renderMomentumReflow(payload){
     var n=finiteRNumber(value);
     return n===null?'--':n.toFixed(1)+'x';
   }
+  function breakoutTime(value){
+    var n=finiteRNumber(value);
+    if(n===null) return '--';
+    var date=new Date(n);
+    return isNaN(date.getTime())?'--':date.toISOString().slice(0,16).replace('T',' ');
+  }
+  function renderSection(sectionRows, sectionClass, direction, tone){
+    var h='<section class="reflow-section '+sectionClass+'"><h3 class="'+tone+'">'+direction+' <span class="badge">'+sectionRows.length+'</span></h3>';
+    h+='<table><thead><tr><th>#</th><th>交易对</th><th>价格</th><th>EMA50</th><th>收盘距离</th><th>窗口</th><th>突破时间</th><th>最大扩张</th><th>日线确认</th><th>突破量比</th></tr></thead><tbody>';
+    if(!sectionRows.length){
+      return h+'<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:16px">暂无 '+direction+' 候选</td></tr></tbody></table></section>';
+    }
+    for(var i=0;i<sectionRows.length;i++){
+      var row=sectionRows[i]&&typeof sectionRows[i]==='object'?sectionRows[i]:{};
+      var symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol);
+      var visibleSymbol=escapeRHtml(symbol.replace('USDT',''))||'--';
+      var daily=dailyLabel[row.daily_kind]||row.daily_kind||'--';
+      var windowIndex=finiteRNumber(row.window_index);
+      var window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5';
+      h+='<tr><td>'+(i+1)+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="复制"></span> <b>'+visibleSymbol+'</b></td>';
+      h+='<td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td class="'+tone+'">'+atr(row.close_distance_atr)+'</td><td>'+window+'</td><td>'+breakoutTime(row.breakout_time)+'</td><td>'+atr(row.max_expansion_atr)+'</td><td>'+escapeRHtml(daily)+'</td><td>'+volume(row.breakout_volume_ratio)+'</td></tr>';
+    }
+    return h+'</tbody></table></section>';
+  }
   document.getElementById('stats').innerHTML=
     '<div class="stat-bar"><span class="stat-bar-item"><span class="stat-bar-label">候选</span> <b class="c">'+rows.length+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">扫描</span> <b>'+count(payload.scanned)+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">错误</span> <b class="r">'+count(payload.errors)+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">初始化</span> <b class="g">'+count(payload.initialized)+'</b></span></div>';
   if(!rows.length){
     document.getElementById('main').innerHTML='<div class="empty-state"><div class="ic-empty"></div><h3>暂无首次回流候选</h3><p>等待 EMA50 强势突破、扩张与日线确认后首次回踩。</p></div>';
     return;
   }
-  var h='<table><thead><tr><th>#</th><th>方向</th><th>交易对</th><th>价格</th><th>EMA50</th><th>收盘距离</th><th>窗口</th><th>最大扩张</th><th>日线确认</th><th>突破量比</th></tr></thead><tbody>';
+  var longs=[], shorts=[];
   for(var i=0;i<rows.length;i++){
-    var row=rows[i]&&typeof rows[i]==='object'?rows[i]:{};
-    var isLong=row.direction==='LONG';
-    var direction=isLong?'LONG':row.direction==='SHORT'?'SHORT':'--';
-    var tone=isLong?'g':direction==='SHORT'?'r':'';
-    var symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol);
-    var visibleSymbol=escapeRHtml(symbol.replace('USDT',''))||'--';
-    var daily=dailyLabel[row.daily_kind]||row.daily_kind||'--';
-    var windowIndex=finiteRNumber(row.window_index);
-    var window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5';
-    h+='<tr><td>'+(i+1)+'</td><td class="'+tone+'" style="font-weight:800">'+direction+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="复制"></span> <b>'+visibleSymbol+'</b></td>';
-    h+='<td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td class="'+tone+'">'+atr(row.close_distance_atr)+'</td><td>'+window+'</td><td>'+atr(row.max_expansion_atr)+'</td><td>'+escapeRHtml(daily)+'</td><td>'+volume(row.breakout_volume_ratio)+'</td></tr>';
+    if(rows[i]&&rows[i].direction==='LONG') longs.push(rows[i]);
+    else if(rows[i]&&rows[i].direction==='SHORT') shorts.push(rows[i]);
   }
-  h+='</tbody></table>';
-  document.getElementById('main').innerHTML=h;
+  document.getElementById('main').innerHTML=renderSection(longs,'reflow-long','LONG','g')+renderSection(shorts,'reflow-short','SHORT','r');
 }
 
 // ===== SCANNING =====
@@ -3594,8 +3611,52 @@ def do_funding():
 
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
+    global _reflow_worker, _reflow_generation
     if mode == "reflow" and interval != "1h":
         return jsonify({"error":"reflow only supports 1h"}), 400
+    if mode == "reflow":
+        key = f"{mode}_{interval}"
+        with _reflow_scan_lock:
+            if _reflow_worker is not None and _reflow_worker.is_alive():
+                return jsonify({"scanning":True,"status":"扫描中..."})
+            if state["scanning"]:
+                return jsonify({"scanning":True,"status":"扫描中..."})
+            _reflow_generation += 1
+            generation = _reflow_generation
+            state.update(
+                scanning=True,
+                text=f"{mode} {interval} 扫描中",
+                progress="",
+                _scan_start=time.time(),
+            )
+
+            def progress(completed, total):
+                with _reflow_scan_lock:
+                    if generation == _reflow_generation:
+                        state["progress"] = f"{completed}/{total}"
+
+            def run_reflow():
+                try:
+                    result = scan_momentum_reflow(
+                        MOMENTUM_REFLOW_LEDGER, progress=progress
+                    )
+                    with _reflow_scan_lock:
+                        if generation == _reflow_generation:
+                            cache[key] = result
+                            state["time"] = bj_now().strftime("%H:%M:%S")
+                            state["text"] = f"完成: {len(result.get('rows', []))} 结果"
+                except Exception as e:
+                    with _reflow_scan_lock:
+                        if generation == _reflow_generation:
+                            state["text"] = str(e)[:80]
+                finally:
+                    with _reflow_scan_lock:
+                        if generation == _reflow_generation:
+                            state["scanning"] = False
+
+            _reflow_worker = threading.Thread(target=run_reflow, daemon=True)
+            _reflow_worker.start()
+        return jsonify({"scanning":True})
     # 如果扫描超过120秒, 强制解锁
     if state["scanning"]:
         if time.time() - state.get("_scan_start", 0) > 120:
@@ -3610,16 +3671,9 @@ def do_scan(mode, interval):
             state["scanning"]=True; state["text"]=f"{mode} {interval} 扫描中"
             if mode=="diverge": cache[key]=scan_divergence(interval)
             elif mode=="breakout": cache[key]=scan_breakout(interval)
-            elif mode == "reflow" and interval == "1h":
-                cache[key] = scan_momentum_reflow(
-                    MOMENTUM_REFLOW_LEDGER,
-                    progress=lambda completed, total: state.update(
-                        progress=f"{completed}/{total}"
-                    ),
-                )
             else: cache[key]=scan(interval, mode, 5)
             state["time"]=bj_now().strftime("%H:%M:%S")
-            result_count=len(cache[key].get("rows", [])) if mode == "reflow" else len(cache[key])
+            result_count=len(cache[key])
             state["text"]=f"完成: {result_count} 结果"
         except Exception as e: state["text"]=str(e)[:80]
         finally: state["scanning"]=False

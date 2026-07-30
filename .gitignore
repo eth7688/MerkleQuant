@@ -16,6 +16,7 @@ trades*.jsonl
 signal_events*.jsonl
 rj_*_events*.jsonl
 watchlist*.json
+momentum_reflow_state.json
 
 # Credentials and private keys
 *ed25519

@@ -221,6 +221,7 @@ def _new_event(direction: str, row) -> dict:
         "direction": direction,
         "state": "WAIT_EXPANSION",
         "breakout_open_time": int(row["ot"]),
+        "breakout_close_time": int(row["ot"]) + HOUR_MS,
         "breakout_volume_ratio": float(row["v"] / row["vol_ma20_prev"]),
         "expansion_time": 0,
         "max_expansion_atr": 0.0,
@@ -240,7 +241,9 @@ def _candidate(symbol: str, event: dict) -> dict:
     return {
         "symbol": symbol,
         "direction": event["direction"],
+        "breakout_time": event["breakout_open_time"],
         "breakout_open_time": event["breakout_open_time"],
+        "breakout_close_time": event.get("breakout_close_time"),
         "expansion_time": event["expansion_time"],
         "return_open_time": event["return_open_time"],
         "window_index": event["return_window_index"],
@@ -299,6 +302,10 @@ def advance_symbol(symbol: str, symbol_state: dict, frame: pd.DataFrame) -> tupl
                     event["audit_reason"] = "expansion_timeout"
 
         if event["state"] == "WAIT_FIRST_RETURN":
+            event["max_expansion_atr"] = max(
+                event["max_expansion_atr"],
+                _expansion_atr(row, event["direction"]),
+            )
             slope = _slope_aligned(out, index, event["direction"])
             if slope is not None and not slope:
                 event["state"] = "INVALIDATED"
@@ -342,7 +349,7 @@ def load_ledger(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("momentum reflow ledger is unreadable") from error
-    if data.get("version") != LEDGER_VERSION or not isinstance(data.get("symbols"), dict):
+    if not isinstance(data, dict) or data.get("version") != LEDGER_VERSION or not isinstance(data.get("symbols"), dict):
         raise ValueError("momentum reflow ledger version or shape is invalid")
     return data
 
@@ -427,7 +434,7 @@ def _scan_symbol(
         hourly = fetch_klines_range(
             symbol,
             "1h",
-            max(0, cursor - 60 * HOUR_MS),
+            max(0, cursor - 1_000 * HOUR_MS),
             exchange="binance",
             market_type="futures",
             testnet=False,
@@ -492,6 +499,7 @@ def _scan_symbol(
             "close_distance_atr": float(_close_distance_atr(row)),
             "window_index": int(candidate["window_index"]),
             "breakout_time": int(event["breakout_open_time"]),
+            "breakout_close_time": event.get("breakout_close_time"),
             "max_expansion_atr": float(event["max_expansion_atr"]),
             "daily_kind": confirmation["kind"],
             "daily_rank": int(confirmation["rank"]),
