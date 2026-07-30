@@ -82,13 +82,34 @@ def make_daily_pattern(kind):
 
 class DailyConfirmationTests(unittest.TestCase):
     def test_directional_strong_daily_candle(self):
-        frame = candle_frame(40)
+        frame = candle_frame(40, start=50.0)
         frame.loc[frame.index[-1], ["o", "h", "l", "c", "v"]] = [
             100.0, 112.0, 99.0, 111.0, 300.0
         ]
         result = daily_confirmation(frame, "LONG")
         self.assertEqual(result, {"passed": True, "kind": "strong_momentum", "rank": 3})
         self.assertFalse(daily_confirmation(frame, "SHORT")["passed"])
+
+    def test_large_wick_candle_does_not_pass_strong_momentum(self):
+        frame = make_daily_pattern("hammer")
+        frame.loc[frame.index[-1], ["o", "h", "l", "c", "v"]] = [
+            100.0, 120.0, 99.0, 103.0, 300.0
+        ]
+        self.assertEqual(
+            daily_confirmation(frame, "LONG"),
+            {"passed": False, "kind": "none", "rank": 0},
+        )
+
+    def test_opposite_strong_candle_still_allows_bottom_fractal(self):
+        frame = candle_frame(40)
+        frame.loc[37, "l"], frame.loc[38, "l"] = 90.0, 80.0
+        frame.loc[39, ["o", "h", "l", "c", "v"]] = [
+            111.0, 112.0, 96.0, 100.0, 300.0
+        ]
+        self.assertEqual(
+            daily_confirmation(frame, "LONG"),
+            {"passed": True, "kind": "bottom_fractal", "rank": 1},
+        )
 
     def test_confirmed_bottom_and_top_fractals(self):
         bottom = candle_frame(40)

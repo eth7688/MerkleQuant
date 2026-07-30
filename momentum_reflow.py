@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 EMA_PERIOD = 50
@@ -119,17 +117,20 @@ def daily_confirmation(frame: pd.DataFrame, direction: str) -> dict:
     current = out.iloc[-1]
     atr14 = current["atr14"]
     volume_average = current["vol_ma20_prev"]
+    current_range = float(current["h"]) - float(current["l"])
     if (
         math.isfinite(atr14)
         and math.isfinite(volume_average)
+        and math.isfinite(current_range)
+        and current_range > 0.0
         and _body(current) >= BREAKOUT_BODY_ATR * atr14
+        and _body(current) / current_range >= 0.65
         and current["v"] >= BREAKOUT_VOLUME_RATIO * volume_average
     ):
         if (direction == "LONG" and current["c"] > current["o"]) or (
             direction == "SHORT" and current["c"] < current["o"]
         ):
             return _result("strong_momentum", 3)
-        return {"passed": False, "kind": "none", "rank": 0}
 
     if len(out) >= 3:
         first, middle, third = out.iloc[-3], out.iloc[-2], current
