@@ -2,10 +2,12 @@
 AXIOM QUANT — 独立管理后台
 端口 5001 | 开发者专用 | 不依赖交易引擎
 """
-import account_manager as accounts, json, os
+import account_manager as accounts, json, os, time
+from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, session
 from functools import wraps
 import secrets, os, sys
+from momentum_reflow_dashboard import load_reflow_settings, save_reflow_settings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -133,6 +135,43 @@ def api_reset_password(uid):
 # Proxy to web_ui demo engine APIs
 import requests as _requests
 _WEB_UI = "http://127.0.0.1:5000"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REFLOW_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_settings.json"
+
+@app.route("/api/reflow/settings", methods=["GET", "POST"])
+@admin_required
+def api_reflow_settings():
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        enabled = data.get("auto_scan_enabled") if isinstance(data, dict) else None
+        if type(enabled) is not bool:
+            return jsonify({"error": "auto_scan_enabled must be boolean"}), 400
+        saved = save_reflow_settings(
+            _REFLOW_SETTINGS_PATH,
+            enabled,
+            str(session.get("admin_id", "")),
+            int(time.time() * 1000),
+        )
+        return jsonify({"ok": True, **saved})
+
+    settings = load_reflow_settings(_REFLOW_SETTINGS_PATH)
+    try:
+        response = _requests.get(
+            f"{_WEB_UI}/api/reflow/automation/status", timeout=3
+        )
+        response.raise_for_status()
+        scheduler = response.json()
+        if not isinstance(scheduler, dict):
+            raise ValueError("scheduler status must be an object")
+        status = {
+            "last_auto_scan_at": scheduler.get("last_auto_scan_at", 0),
+            "next_scan_at": scheduler.get("next_scan_at", 0),
+            "last_auto_error": scheduler.get("last_auto_error", ""),
+            "scheduler_status": scheduler.get("scheduler_status", "available"),
+        }
+    except Exception:
+        status = {"scheduler_status": "unavailable"}
+    return jsonify({**settings, **status})
 
 @app.route("/api/admin/demo/status")
 @admin_required
@@ -273,6 +312,7 @@ input:focus,select:focus{outline:none;border-color:var(--brand)}
   <div class="nav-item" data-page="license" onclick="switchPage('license')">🔑 许可管理</div>
   <div class="nav-item" data-page="fuel" onclick="switchPage('fuel')">⛽ 燃料管理</div>
   <div class="nav-item" data-page="demo" onclick="switchPage('demo')">📡 回测参数</div>
+  <div class="nav-item" data-page="reflow" onclick="switchPage('reflow')">↺ 动能回流</div>
   <div class="nav-item" data-page="engine" onclick="switchPage('engine')">⚙ 演示引擎</div>
   <div style="margin-top:auto;padding:20px;border-top:1px solid var(--border)"><span style="font-size:11px;color:var(--muted)" id="loginInfo">未登录</span><br><a href="#" onclick="doLogout()" style="font-size:10px;color:var(--s-red)">退出</a></div>
 </div>
@@ -313,6 +353,7 @@ function switchPage(p){
   else if(p==='license') renderLicense(c);
   else if(p==='fuel') renderFuel(c);
   else if(p==='demo') renderDemoCfg(c);
+  else if(p==='reflow') renderReflow(c);
   else if(p==='engine'){renderEngine(c);_refreshTimer=setInterval(renderDemoPositions,2000);}
 }
 function renderDashboard(el){
@@ -344,6 +385,88 @@ function renderFuel(el){
       h+='<td style="display:flex;gap:4px"><button class="btn" onclick="openFuelTopup('+u.id+',\''+u.username+'\')">充值</button><button class="btn" onclick="openFuelDeduct('+u.id+',\''+u.username+'\')" style="color:var(--s-red)">扣费</button><button class="btn" onclick="viewFuelHistory('+u.id+',\''+u.username+'\')">流水</button></td></tr>';
     });
     h+='</tbody></table></div>';el.innerHTML=h;
+  });
+}
+function formatReflowTime(value){
+  var timestamp=Number(value);
+  if(!Number.isFinite(timestamp)||timestamp<=0) return '--';
+  return new Intl.DateTimeFormat('zh-CN',{
+    timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false
+  }).format(new Date(timestamp));
+}
+function renderReflow(el){
+  el.innerHTML='<div class="card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">动能回流自动扫描</h3>'+
+      '<p style="color:var(--muted);font-size:12px;line-height:1.7">全局扫描开关 · 固定流动性门槛 200万 USDT</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer">'+
+        '<input type="checkbox" id="reflowAutoEnabled" style="width:auto">自动扫描</label>'+
+    '</div>'+
+    '<div id="reflowSaveError" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">'+
+      '<div class="stat-box"><div class="label">当前状态</div><div class="value" id="reflowEnabledState" style="font-size:18px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最后修改时间</div><div id="reflowUpdatedAt" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最后修改人</div><div id="reflowUpdatedBy" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">上次自动扫描</div><div id="reflowLastScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">下次扫描</div><div id="reflowNextScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近错误</div><div id="reflowLastError" style="font-size:12px;color:var(--s-red)">--</div></div>'+
+    '</div>'+
+    '<p style="color:var(--muted);font-size:12px;line-height:1.7;margin-top:18px">关闭自动扫描不会删除历史记录，手动扫描仍可使用。</p>'+
+  '</div>';
+  var box=document.getElementById('reflowAutoEnabled');
+  box.disabled=true;
+  fetch('/api/reflow/settings').then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok) throw new Error(data.error||'读取设置失败');
+      return data;
+    });
+  }).then(function(data){
+    box.checked=Boolean(data.auto_scan_enabled);
+    box.dataset.savedChecked=String(box.checked);
+    box.disabled=false;
+    document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('reflowUpdatedAt').textContent=formatReflowTime(data.updated_at);
+    document.getElementById('reflowUpdatedBy').textContent=data.updated_by||'--';
+    document.getElementById('reflowLastScan').textContent=formatReflowTime(data.last_auto_scan_at);
+    document.getElementById('reflowNextScan').textContent=formatReflowTime(data.next_scan_at);
+    document.getElementById('reflowLastError').textContent=data.last_auto_error||
+      (data.scheduler_status==='unavailable'?'调度状态不可用':'无');
+    box.onchange=saveReflowSetting;
+  }).catch(function(reason){
+    var error=document.getElementById('reflowSaveError');
+    error.style.display='block';
+    error.textContent=reason.message||'读取设置失败';
+  });
+}
+function saveReflowSetting(){
+  var box=document.getElementById('reflowAutoEnabled');
+  var error=document.getElementById('reflowSaveError');
+  var previous=box.dataset.savedChecked==='true';
+  error.style.display='none';
+  error.textContent='';
+  box.disabled=true;
+  fetch('/api/reflow/settings',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({auto_scan_enabled:Boolean(box.checked)})
+  }).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.ok) throw new Error(data.error||'保存失败');
+      return data;
+    });
+  }).then(function(data){
+    box.checked=Boolean(data.auto_scan_enabled);
+    box.dataset.savedChecked=String(box.checked);
+    document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('reflowUpdatedAt').textContent=formatReflowTime(data.updated_at);
+    document.getElementById('reflowUpdatedBy').textContent=data.updated_by||'--';
+  }).catch(function(reason){
+    box.checked=previous;
+    error.style.display='block';
+    error.textContent=reason.message||'保存失败';
+  }).finally(function(){
+    box.disabled=false;
   });
 }
 function openFuelTopup(uid,uname){
