@@ -35,7 +35,7 @@ def render_reflow_payload(payload):
         source.index("function fmtRValue(value,signed)")
     ]
     renderer = source[
-        source.index("function renderMomentumReflow("):
+        source.index("var _reflowFilters="):
         source.index("// ===== SCANNING =====")
     ]
     script = f"""
@@ -45,6 +45,37 @@ global.document={{getElementById:function(id){{return nodes[id];}}}};
 {renderer}
 renderMomentumReflow({json.dumps(payload)});
 process.stdout.write(JSON.stringify(nodes));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(completed.stdout)
+
+
+def render_reflow_filtered_payload(payload, filter_name, filter_value):
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function escapeRHtml(value)"):
+        source.index("function fmtRValue(value,signed)")
+    ]
+    renderer = source[
+        source.index("var _reflowFilters="):
+        source.index("// ===== SCANNING =====")
+    ]
+    script = f"""
+var nodes={{stats:{{innerHTML:''}},main:{{innerHTML:''}}}};
+global.window={{}};
+global.document={{getElementById:function(id){{return nodes[id];}}}};
+{helpers}
+{renderer}
+var payload={json.dumps(payload)};
+renderMomentumReflow(payload);
+setReflowFilter({json.dumps(filter_name)}, {json.dumps(filter_value)});
+process.stdout.write(JSON.stringify({{nodes:nodes,sourceLength:payload.rows.length}}));
 """
     completed = subprocess.run(
         ["node", "-e", script],
@@ -368,6 +399,63 @@ class MomentumReflowUiTests(unittest.TestCase):
 
         self.assertIn("暂无", result["main"]["innerHTML"])
         self.assertIn("首次回流", result["main"]["innerHTML"])
+
+    def test_dashboard_sorts_freshness_and_renders_quality_status_and_type(self):
+        old = candidate()
+        old.update(
+            symbol="OLDUSDT",
+            return_open_time=1000,
+            quality_score=99,
+            quality="HIGH",
+            status="ACTIVE",
+            instrument_type="COMMODITY",
+        )
+        new = candidate()
+        new.update(
+            symbol="NEWUSDT",
+            return_open_time=2000,
+            quality_score=60,
+            quality="STANDARD",
+            status="ACTIVE",
+            instrument_type="COMMODITY",
+        )
+        result = render_reflow_payload({
+            "rows": [old, new],
+            "today_total": 2,
+            "high_quality_count": 1,
+            "automation": {
+                "auto_scan_enabled": True,
+                "last_auto_scan_at": 3000,
+                "next_scan_at": 4000,
+            },
+        })
+        html = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
+
+        self.assertLess(html.index("NEW"), html.index("OLD"))
+        for text in ("高质量", "标准", "商品", "回流有效", "下次扫描"):
+            self.assertIn(text, html)
+
+    def test_dashboard_filters_do_not_mutate_source_rows(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+        self.assertIn("function setReflowFilter(", source)
+        high_long = candidate()
+        high_long.update(symbol="HIGHUSDT", quality="HIGH", quality_score=90)
+        standard_short = candidate()
+        standard_short.update(
+            symbol="STANDARDUSDT", direction="SHORT", quality="STANDARD", quality_score=50
+        )
+        payload = {"rows": [high_long, standard_short]}
+
+        result = render_reflow_filtered_payload(payload, "quality", "HIGH")
+        html = result["nodes"]["main"]["innerHTML"]
+        self.assertIn("HIGH", html)
+        self.assertNotIn("<b>STANDARD</b>", html)
+        self.assertEqual(result["sourceLength"], 2)
+
+    def test_mobile_markup_contains_expandable_details(self):
+        result = render_reflow_payload({"rows": [candidate()]})
+
+        self.assertIn("reflow-mobile-details", result["main"]["innerHTML"])
 
 
     def test_first_use_prompt_normalizes_mixed_cache_shapes(self):

@@ -660,6 +660,25 @@ tr:last-child td{border-bottom:none}
 .empty-state h3{color:var(--text2);font-size:15px;font-weight:550;margin-bottom:var(--u1)}
 .empty-state p{font-size:13px;opacity:0.45;line-height:1.6}
 
+/* ===== MOMENTUM REFLOW PERSISTENT DASHBOARD ===== */
+.reflow-status-grid{display:grid;grid-template-columns:repeat(8,minmax(92px,1fr));gap:var(--u1);margin-bottom:var(--u3)}
+.reflow-status-card{min-width:0;padding:9px 10px;background:var(--card);border:1px solid var(--border);border-radius:7px;box-shadow:var(--shadow-sm)}
+.reflow-status-card span{display:block;color:var(--muted);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:3px}
+.reflow-status-card b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-family:var(--font-mono);font-size:12px;font-weight:620;font-variant-numeric:tabular-nums}
+.reflow-status-card .g{color:var(--s-green)}.reflow-status-card .r{color:var(--s-red)}.reflow-status-card .c{color:var(--s-blue)}
+.reflow-filter-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:var(--u3)}
+.reflow-filter-group{display:flex;align-items:center;gap:3px;padding:3px;background:rgba(255,255,255,.018);border:1px solid var(--border);border-radius:6px}
+.reflow-filter-label{padding:0 4px;color:var(--muted);font-size:9.5px;letter-spacing:.04em}
+.reflow-filter-btn{border:0;border-radius:4px;padding:4px 6px;background:transparent;color:var(--text2);cursor:pointer;font:520 10px var(--font);transition:color var(--spring-fast),background var(--spring-fast)}
+.reflow-filter-btn:hover,.reflow-filter-btn.active{color:var(--text);background:rgba(255,255,255,.07)}
+.reflow-quality,.reflow-status{display:inline-block;padding:2px 6px;border:1px solid transparent;border-radius:4px;font-size:10px;font-family:var(--font);font-weight:600;white-space:nowrap}
+.reflow-quality-high{color:var(--s-green);background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.15)}
+.reflow-quality-standard{color:var(--s-blue);background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.15)}
+.reflow-quality-watch{color:var(--s-yellow);background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.15)}
+.reflow-status-active{color:var(--s-green);background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.15)}
+.reflow-status-window-complete,.reflow-status-invalid{color:var(--muted);background:rgba(148,163,184,.07);border-color:rgba(148,163,184,.12)}
+.reflow-mobile-details{display:none}
+
 /* ═══ FOOTER ═══ */
 .footer{text-align:center;padding:var(--u3);color:var(--muted);font-size:11px;border-top:1px solid var(--border);background:var(--bg2);letter-spacing:0.02em;max-width:1440px;margin:0 auto}
 a{color:var(--brand);text-decoration:none;transition:color var(--spring-fast)}
@@ -873,6 +892,7 @@ a:hover{color:var(--brand2)}
   .stat-bar-item{padding:0 var(--u2)}
   .stat-bar-item b{font-size:14px}
   table{font-size:11px;display:block;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+  .reflow-status-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.reflow-status-card{padding:8px}.reflow-status-card b{font-size:10.5px}.reflow-filter-bar{gap:5px}.reflow-filter-group{width:100%;justify-content:flex-start}.reflow-filter-btn{padding:4px 5px}.reflow-dashboard table th:nth-child(n+7),.reflow-dashboard table td:nth-child(n+7){display:none}.reflow-mobile-details{display:block;white-space:normal;margin-top:5px;color:var(--text2);font:10px/1.6 var(--font)}.reflow-mobile-details summary{cursor:pointer;color:var(--muted);font-size:10px}.reflow-mobile-details div{padding-top:4px}
   th,td{padding:6px 8px}
   tr.row-blast td:first-child::before,tr.row-strong td:first-child::before{display:none}
   tr.row-blast{background:rgba(251,191,36,0.1)!important}
@@ -1389,7 +1409,7 @@ var _desc={
   breakout_1h:'方向性信号扫描（1H周期），灵敏度较高，适合捕捉短线机会。',
   breakout_15m:'方向性信号扫描（15m周期），灵敏度最高。建议结合大周期结构辅助判断。',
   breakout_1d:'方向性信号扫描（日线周期），结构稳定性最高，适合中长线参考。',
-  reflow_1h:'1H 首次回流扫描：EMA50 强势突破并扩张后，捕捉首次回踩窗口，结合日线确认筛选方向性候选。',
+  reflow_1h:'1H 首次回流看板：持续保留当日信号，展示自动扫描状态、最新回流窗口与质量分层，辅助复核而不执行交易。',
   trader:'自动交易引擎。配置API后自动执行：信号扫描→结构止损→动态追踪。内置多级风控与入场验证。',
   squeeze_4h:'波动压缩扫描（4H周期）。监测价格波动收敛状态，压缩越紧=蓄力越充分。',
   squeeze_1h:'波动压缩扫描（1H周期），全市场波动收敛程度排序。',
@@ -1611,7 +1631,59 @@ function renderBreakout(rows){
   document.getElementById('main').innerHTML=h;
 }
 
+var _reflowFilters={quality:'ALL',direction:'ALL',type:'ALL',status:'ALL'};
+var _reflowPayload={rows:[]};
+
+function reflowFreshness(returnCloseTime){
+  var time=finiteRNumber(returnCloseTime);
+  if(time===null) return '--';
+  var minutes=Math.max(0,Math.floor((Date.now()-time)/60000));
+  if(minutes<1) return '\u521a\u521a';
+  if(minutes<60) return minutes+'\u5206\u949f\u524d';
+  return Math.floor(minutes/60)+'\u5c0f\u65f6\u524d';
+}
+
+function setReflowFilter(name,value){
+  if(!Object.prototype.hasOwnProperty.call(_reflowFilters,name)) return;
+  _reflowFilters[name]=String(value||'ALL');
+  renderMomentumReflow(_reflowPayload);
+}
+
 function renderMomentumReflow(payload){
+  payload=payload&&typeof payload==='object'?payload:{};
+  _reflowPayload=payload;
+  var sourceRows=Array.isArray(payload.rows)?payload.rows:[];
+  var rows=sourceRows.slice();
+  var automation=payload.automation&&typeof payload.automation==='object'?payload.automation:{};
+  var dailyLabel={strong_momentum:'\u5f3a\u52a8\u80fd\u65e5K',bullish_engulfing:'\u770b\u6da8\u541e\u6ca1',bearish_engulfing:'\u770b\u8dcc\u541e\u6ca1',hammer:'\u9524\u5b50\u7ebf',shooting_star:'\u6d41\u661f\u7ebf',morning_star:'\u65e9\u6668\u4e4b\u661f',evening_star:'\u9ec4\u660f\u4e4b\u661f',bottom_fractal:'\u5e95\u5206\u578b',top_fractal:'\u9876\u5206\u578b'};
+  var qualityLabel={HIGH:'\u9ad8\u8d28\u91cf',STANDARD:'\u6807\u51c6',WATCH:'\u89c2\u5bdf'};
+  var typeLabel={CRYPTO:'\u52a0\u5bc6',COMMODITY:'\u5546\u54c1',FX:'\u5916\u6c47'};
+  var statusLabel={ACTIVE:'\u56de\u6d41\u6709\u6548',WINDOW_COMPLETE:'\u7a97\u53e3\u7ed3\u675f',INVALID:'\u4e8b\u4ef6\u5931\u6548'};
+  function count(value){var n=finiteRNumber(value);return n===null?'--':String(Math.max(0,Math.trunc(n)));}
+  function atr(value){var n=finiteRNumber(value);return n===null?'--':Math.abs(n).toFixed(2)+' ATR';}
+  function price(value){var n=finiteRNumber(value);return n===null?'--':n.toFixed(6).replace(/\.?(0+)$/,'');}
+  function volume(value){var n=finiteRNumber(value);return n===null?'--':n.toFixed(1)+'x';}
+  function bjTime(value){var n=finiteRNumber(value);if(n===null) return '--';var date=new Date(n);return isNaN(date.getTime())?'--':date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});}
+  function qualityKey(row){var value=String(row.quality_label||row.quality||'WATCH');return qualityLabel[value]?value:'WATCH';}
+  function typeKey(row){var value=String(row.instrument_type||'CRYPTO');return typeLabel[value]?value:'CRYPTO';}
+  function statusKey(row){var value=String(row.status||'ACTIVE');return statusLabel[value]?value:'ACTIVE';}
+  function card(label,value,tone){return '<div class="reflow-status-card"><span>'+label+'</span><b'+(tone?' class="'+tone+'"':'')+'>'+escapeRHtml(value)+'</b></div>';}
+  function filters(){
+    var defs=[['quality','\u8d28\u91cf',[['ALL','\u5168\u90e8'],['HIGH','\u9ad8\u8d28\u91cf'],['STANDARD','\u6807\u51c6'],['WATCH','\u89c2\u5bdf']]],['direction','\u65b9\u5411',[['ALL','\u5168\u90e8'],['LONG','LONG'],['SHORT','SHORT']]],['type','\u7c7b\u578b',[['ALL','\u5168\u90e8'],['CRYPTO','\u52a0\u5bc6'],['COMMODITY','\u5546\u54c1'],['FX','\u5916\u6c47']]],['status','\u72b6\u6001',[['ALL','\u5168\u90e8'],['ACTIVE','\u56de\u6d41\u6709\u6548'],['WINDOW_COMPLETE','\u7a97\u53e3\u7ed3\u675f'],['INVALID','\u4e8b\u4ef6\u5931\u6548']]]],h='<div class="reflow-filter-bar">';
+    for(var i=0;i<defs.length;i++){var group=defs[i];h+='<div class="reflow-filter-group"><span class="reflow-filter-label">'+group[1]+'</span>';for(var j=0;j<group[2].length;j++){var item=group[2][j];h+='<button type="button" class="reflow-filter-btn '+(_reflowFilters[group[0]]===item[0]?'active':'')+'" onclick="setReflowFilter(\''+group[0]+'\',\''+item[0]+'\')">'+item[1]+'</button>';}h+='</div>';}
+    return h+'</div>';
+  }
+  rows.sort(function(a,b){a=a&&typeof a==='object'?a:{};b=b&&typeof b==='object'?b:{};return finiteRNumber(b.return_open_time)-finiteRNumber(a.return_open_time)||finiteRNumber(b.quality_score)-finiteRNumber(a.quality_score)||finiteRNumber(b.breakout_volume_ratio)-finiteRNumber(a.breakout_volume_ratio)||String(a.symbol).localeCompare(String(b.symbol));});
+  rows=rows.filter(function(row){row=row&&typeof row==='object'?row:{};return (_reflowFilters.quality==='ALL'||qualityKey(row)===_reflowFilters.quality)&&(_reflowFilters.direction==='ALL'||row.direction===_reflowFilters.direction)&&(_reflowFilters.type==='ALL'||typeKey(row)===_reflowFilters.type)&&(_reflowFilters.status==='ALL'||statusKey(row)===_reflowFilters.status);});
+  var progress=automation.scanning?(automation.progress?String(automation.progress):'--'):(automation.scanning?'\u626b\u63cf\u4e2d':'\u7a7a\u95f2');
+  document.getElementById('stats').innerHTML='<div class="reflow-status-grid">'+card('\u81ea\u52a8\u626b\u63cf',automation.auto_scan_enabled?'\u5df2\u5f00\u542f':'\u5df2\u5173\u95ed',automation.auto_scan_enabled?'g':'r')+card('\u4e0a\u6b21\u626b\u63cf',bjTime(automation.last_auto_scan_at))+card('\u4e0b\u6b21\u626b\u63cf',bjTime(automation.next_scan_at),'c')+card('\u5f53\u524d\u626b\u63cf',progress,automation.scanning?'c':'')+card('\u5df2\u626b\u63cf',count(payload.scanned))+card('\u9519\u8bef',count(payload.errors),'r')+card('\u4eca\u65e5\u603b\u6570',count(payload.today_total),'c')+card('\u9ad8\u8d28\u91cf',count(payload.high_quality_count),'g')+'</div>';
+  if(!rows.length){document.getElementById('main').innerHTML=filters()+'<div class="empty-state"><div class="ic-empty"></div><h3>\u6682\u65e0\u9996\u6b21\u56de\u6d41\u5019\u9009</h3><p>\u7b49\u5f85 EMA50 \u5f3a\u52bf\u7a81\u7834\u3001\u6269\u5f20\u4e0e\u65e5\u7ebf\u786e\u8ba4\u540e\u9996\u6b21\u56de\u8e29\u3002</p></div>';return;}
+  var h=filters()+'<div class="reflow-dashboard"><table><thead><tr><th>#</th><th>\u4ea4\u6613\u5bf9</th><th>\u65b9\u5411</th><th>\u8d28\u91cf</th><th>\u72b6\u6001</th><th>\u7c7b\u578b</th><th>\u4ef7\u683c</th><th>EMA50</th><th>\u65b0\u9c9c\u5ea6</th><th>\u7a97\u53e3</th><th>\u7a81\u7834\u65f6\u95f4</th><th>\u65e5\u7ebf\u786e\u8ba4</th><th>\u91cf\u6bd4</th></tr></thead><tbody>';
+  for(var i=0;i<rows.length;i++){var row=rows[i]&&typeof rows[i]==='object'?rows[i]:{},symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol),direction=row.direction==='SHORT'?'SHORT':'LONG',tone=direction==='LONG'?'g':'r',q=qualityKey(row),type=typeKey(row),status=statusKey(row),windowIndex=finiteRNumber(row.window_index),window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5',daily=escapeRHtml(dailyLabel[row.daily_kind]||row.daily_kind||'--');h+='<tr><td>'+(i+1)+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="\u590d\u5236"></span> <b>'+(escapeRHtml(symbol.replace('USDT',''))||'--')+'</b></td><td class="'+tone+' reflow-'+direction.toLowerCase()+'">'+direction+'</td><td><span class="reflow-quality reflow-quality-'+q.toLowerCase()+'">'+qualityLabel[q]+'</span></td><td><span class="reflow-status reflow-status-'+status.toLowerCase().replace('_','-')+'">'+statusLabel[status]+'</span></td><td>'+typeLabel[type]+'</td><td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td>'+reflowFreshness(row.return_close_time)+'</td><td>'+window+'</td><td>'+bjTime(row.breakout_time)+'</td><td>'+daily+'</td><td>'+volume(row.breakout_volume_ratio)+'<details class="reflow-mobile-details"><summary>\u66f4\u591a</summary><div>\u6536\u76d8\u8ddd\u79bb '+atr(row.close_distance_atr)+' \u00b7 \u6700\u5927\u6269\u5f20 '+atr(row.max_expansion_atr)+' \u00b7 \u8fd4\u56de '+bjTime(row.return_open_time)+'</div></details></td></tr>';}
+  document.getElementById('main').innerHTML=h+'</tbody></table></div>';
+}
+
+function renderMomentumReflowLegacy(payload){
   payload=payload&&typeof payload==='object'?payload:{};
   var rows=Array.isArray(payload.rows)?payload.rows:[];
   var dailyLabel={
