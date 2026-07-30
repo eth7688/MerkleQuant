@@ -51,6 +51,36 @@ process.stdout.write(JSON.stringify(nodes));
     return json.loads(completed.stdout)
 
 
+def first_use_scan_label(cache):
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    marker = "var firstMenu=document.querySelector('.menu-items');"
+    initial_state = source[source.index(marker):source.index("</script>", source.index(marker))]
+    script = f"""
+var D={json.dumps(cache)};
+var nodes={{scanLabel:{{textContent:''}}}};
+global.document={{
+  querySelector:function(){{return null;}},
+  getElementById:function(id){{return nodes[id];}}
+}};
+{initial_state}
+process.stdout.write(nodes.scanLabel.textContent ? 'prompt' : 'empty');
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout
+
+
+def reset_scan_admission(web_ui):
+    web_ui.state.update(scanning=False, progress="", text="")
+    for worker_name in ("_reflow_worker", "_scan_worker"):
+        setattr(web_ui, worker_name, None)
+
+
 class MomentumReflowUiTests(unittest.TestCase):
     def test_sidebar_description_and_renderer_are_wired(self):
         source = Path("web_ui.py").read_text(encoding="utf-8")
@@ -78,7 +108,8 @@ class MomentumReflowUiTests(unittest.TestCase):
 
     def test_reflow_admission_reserves_one_worker_before_thread_start(self):
         web_ui = importlib.import_module("web_ui")
-        web_ui.state.update(scanning=False, progress="", text="")
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
 
         class DeferredThread:
             starts = 0
@@ -103,8 +134,61 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertTrue(second.get_json()["scanning"])
         self.assertTrue(web_ui.state["scanning"])
         self.assertEqual(DeferredThread.starts, 1)
-        setattr(web_ui, "_reflow_worker", None)
-        web_ui.state["scanning"] = False
+
+    def test_generic_scan_blocks_reflow_admission_after_legacy_timeout(self):
+        web_ui = importlib.import_module("web_ui")
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
+
+        class DeferredThread:
+            starts = 0
+
+            def __init__(self, target=None, args=(), daemon=None):
+                self.started = False
+
+            def start(self):
+                self.started = True
+                type(self).starts += 1
+
+            def is_alive(self):
+                return self.started
+
+        with patch.object(web_ui.threading, "Thread", DeferredThread):
+            first = web_ui.app.test_client().get("/scan/breakout/1h")
+            web_ui.state["_scan_start"] = time.time() - 121
+            second = web_ui.app.test_client().get("/scan/reflow/1h")
+
+        self.assertTrue(first.get_json()["scanning"])
+        self.assertTrue(second.get_json()["scanning"])
+        self.assertTrue(web_ui.state["scanning"])
+        self.assertEqual(DeferredThread.starts, 1)
+
+    def test_funding_scan_blocks_generic_admission(self):
+        web_ui = importlib.import_module("web_ui")
+        reset_scan_admission(web_ui)
+        self.addCleanup(reset_scan_admission, web_ui)
+
+        class DeferredThread:
+            starts = 0
+
+            def __init__(self, target=None, args=(), daemon=None):
+                self.started = False
+
+            def start(self):
+                self.started = True
+                type(self).starts += 1
+
+            def is_alive(self):
+                return self.started
+
+        with patch.object(web_ui.threading, "Thread", DeferredThread):
+            first = web_ui.app.test_client().get("/scan/funding")
+            second = web_ui.app.test_client().get("/scan/breakout/1h")
+
+        self.assertTrue(first.get_json()["scanning"])
+        self.assertTrue(second.get_json()["scanning"])
+        self.assertTrue(web_ui.state["scanning"])
+        self.assertEqual(DeferredThread.starts, 1)
 
     def test_route_rejects_unsupported_reflow_intervals(self):
         web_ui = importlib.import_module("web_ui")
@@ -153,7 +237,7 @@ class MomentumReflowUiTests(unittest.TestCase):
         self.assertIn("0.18 ATR", rendered)
         self.assertIn("\u5f3a\u52a8\u80fd\u65e5K", rendered)
         self.assertIn("2.4x", rendered)
-        self.assertIn("1970-01-01", rendered)
+        self.assertIn("1970-01-01 08:00", rendered)
         self.assertIn("reflow-long", rendered)
         self.assertIn("reflow-short", rendered)
         self.assertIn("&lt;img", rendered)
@@ -166,6 +250,21 @@ class MomentumReflowUiTests(unittest.TestCase):
 
         self.assertIn("暂无", result["main"]["innerHTML"])
         self.assertIn("首次回流", result["main"]["innerHTML"])
+
+
+    def test_first_use_prompt_normalizes_mixed_cache_shapes(self):
+        self.assertEqual(
+            first_use_scan_label({"breakout_1h": [], "reflow_1h": {"rows": []}}),
+            "prompt",
+        )
+        self.assertEqual(
+            first_use_scan_label({"breakout_1h": ["BTCUSDT"], "reflow_1h": {"rows": []}}),
+            "empty",
+        )
+        self.assertEqual(
+            first_use_scan_label({"breakout_1h": [], "reflow_1h": {"rows": ["BTCUSDT"]}}),
+            "empty",
+        )
 
 
 if __name__ == "__main__":

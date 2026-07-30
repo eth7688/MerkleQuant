@@ -425,9 +425,10 @@ cache = {"squeeze_4h":[],"squeeze_1h":[],"squeeze_15m":[],"squeeze_1d":[],"squee
          "funding":{"negative":[],"positive":[],"nextTime":0},
          "reflow_1h":{"rows":[],"scanned":0,"errors":0,"initialized":0}}
 state = {"time":"--","text":"就绪","scanning":False,"progress":""}
-_reflow_scan_lock = threading.Lock()
-_reflow_worker = None
-_reflow_generation = 0
+_scan_lock = threading.Lock()
+_scan_worker = None
+_scan_generation = 0
+_scan_worker_token = None
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -1625,7 +1626,7 @@ function renderMomentumReflow(payload){
     var n=finiteRNumber(value);
     if(n===null) return '--';
     var date=new Date(n);
-    return isNaN(date.getTime())?'--':date.toISOString().slice(0,16).replace('T',' ');
+    return isNaN(date.getTime())?'--':date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
   }
   function renderSection(sectionRows, sectionClass, direction, tone){
     var h='<section class="reflow-section '+sectionClass+'"><h3 class="'+tone+'">'+direction+' <span class="badge">'+sectionRows.length+'</span></h3>';
@@ -3547,7 +3548,7 @@ function renderCryptorank(page){
 // ===== INIT =====
 var firstMenu=document.querySelector('.menu-items');
 if(firstMenu){firstMenu.classList.add('open'); firstMenu.previousElementSibling.classList.add('open');}
-if(Object.values(D).every(function(v){return v.length===0})){
+if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||!Array.isArray(v.rows)||v.rows.length===0)})){
   document.getElementById('scanLabel').textContent='首次使用，点击开始扫描';
 }
 </script></body></html>"""
@@ -3592,92 +3593,91 @@ def get_data():
 
 @app.route("/scan/funding")
 def do_funding():
-    if state["scanning"]:
-        if time.time() - state.get("_scan_start", 0) > 120: state["scanning"] = False
-        else: return jsonify({"scanning":True})
-    state["_scan_start"] = time.time()
-    def run():
-        try:
-            state["scanning"]=True; state["text"]="扫描资金费率"
-            result=scan_funding(50)
-            cache["funding"]=result
-            total=len(result["negative"])+len(result["positive"])
-            state["time"]=bj_now().strftime("%H:%M:%S")
-            state["text"]=f"完成: {total}个"
-        except Exception as e: state["text"]=str(e)[:80]
-        finally: state["scanning"]=False
-    threading.Thread(target=run,daemon=True).start()
+    def apply_result(result):
+        cache["funding"] = result
+        return len(result["negative"]) + len(result["positive"])
+
+    if not _start_scan_worker("扫描资金费率", lambda progress: scan_funding(50), apply_result):
+        return jsonify({"scanning": True, "status": "扫描中..."})
     return jsonify({"scanning":True})
+
+def _start_scan_worker(label, work, apply_result):
+    global _scan_worker, _scan_generation, _scan_worker_token
+    with _scan_lock:
+        if state["scanning"] or (_scan_worker is not None and _scan_worker.is_alive()):
+            return False
+        _scan_generation += 1
+        generation = _scan_generation
+        token = object()
+        state.update(scanning=True, text=label, progress="", _scan_start=time.time())
+
+        worker = None
+
+        def is_current():
+            return (
+                generation == _scan_generation
+                and token is _scan_worker_token
+                and _scan_worker is worker
+            )
+
+        def progress(completed, total):
+            with _scan_lock:
+                if is_current():
+                    state["progress"] = f"{completed}/{total}"
+
+        def run():
+            try:
+                result = work(progress)
+                with _scan_lock:
+                    if is_current():
+                        result_count = apply_result(result)
+                        state["time"] = bj_now().strftime("%H:%M:%S")
+                        state["text"] = f"完成: {result_count} 结果"
+            except Exception as e:
+                with _scan_lock:
+                    if is_current():
+                        state["text"] = str(e)[:80]
+            finally:
+                with _scan_lock:
+                    if is_current():
+                        state["scanning"] = False
+
+        worker = threading.Thread(target=run, daemon=True)
+        _scan_worker = worker
+        _scan_worker_token = token
+        try:
+            worker.start()
+        except Exception:
+            if is_current():
+                _scan_worker = None
+                state["scanning"] = False
+            raise
+    return True
 
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
-    global _reflow_worker, _reflow_generation
     if mode == "reflow" and interval != "1h":
         return jsonify({"error":"reflow only supports 1h"}), 400
-    if mode == "reflow":
-        key = f"{mode}_{interval}"
-        with _reflow_scan_lock:
-            if _reflow_worker is not None and _reflow_worker.is_alive():
-                return jsonify({"scanning":True,"status":"扫描中..."})
-            if state["scanning"]:
-                return jsonify({"scanning":True,"status":"扫描中..."})
-            _reflow_generation += 1
-            generation = _reflow_generation
-            state.update(
-                scanning=True,
-                text=f"{mode} {interval} 扫描中",
-                progress="",
-                _scan_start=time.time(),
-            )
-
-            def progress(completed, total):
-                with _reflow_scan_lock:
-                    if generation == _reflow_generation:
-                        state["progress"] = f"{completed}/{total}"
-
-            def run_reflow():
-                try:
-                    result = scan_momentum_reflow(
-                        MOMENTUM_REFLOW_LEDGER, progress=progress
-                    )
-                    with _reflow_scan_lock:
-                        if generation == _reflow_generation:
-                            cache[key] = result
-                            state["time"] = bj_now().strftime("%H:%M:%S")
-                            state["text"] = f"完成: {len(result.get('rows', []))} 结果"
-                except Exception as e:
-                    with _reflow_scan_lock:
-                        if generation == _reflow_generation:
-                            state["text"] = str(e)[:80]
-                finally:
-                    with _reflow_scan_lock:
-                        if generation == _reflow_generation:
-                            state["scanning"] = False
-
-            _reflow_worker = threading.Thread(target=run_reflow, daemon=True)
-            _reflow_worker.start()
-        return jsonify({"scanning":True})
-    # 如果扫描超过120秒, 强制解锁
-    if state["scanning"]:
-        if time.time() - state.get("_scan_start", 0) > 120:
-            state["scanning"] = False
-        else:
-            return jsonify({"scanning":True,"status":"扫描中..."})
     key = f"{mode}_{interval}"
-    state["_scan_start"] = time.time()
-    state["progress"] = ""
-    def run():
-        try:
-            state["scanning"]=True; state["text"]=f"{mode} {interval} 扫描中"
-            if mode=="diverge": cache[key]=scan_divergence(interval)
-            elif mode=="breakout": cache[key]=scan_breakout(interval)
-            else: cache[key]=scan(interval, mode, 5)
-            state["time"]=bj_now().strftime("%H:%M:%S")
-            result_count=len(cache[key])
-            state["text"]=f"完成: {result_count} 结果"
-        except Exception as e: state["text"]=str(e)[:80]
-        finally: state["scanning"]=False
-    threading.Thread(target=run,daemon=True).start()
+    if mode == "reflow":
+        def work(progress):
+            return scan_momentum_reflow(MOMENTUM_REFLOW_LEDGER, progress=progress)
+
+        def apply_result(result):
+            cache[key] = result
+            return len(result.get("rows", []))
+    else:
+        def work(progress):
+            if mode == "diverge": return scan_divergence(interval)
+            if mode == "breakout": return scan_breakout(interval)
+            return scan(interval, mode, 5)
+
+        def apply_result(result):
+            cache[key] = result
+            return len(result)
+
+    if not _start_scan_worker(f"{mode} {interval} 扫描中", work, apply_result):
+        return jsonify({"scanning":True,"status":"扫描中..."})
     return jsonify({"scanning":True})
 
 @app.route("/rj_indicator")
