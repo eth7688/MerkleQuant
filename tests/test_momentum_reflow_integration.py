@@ -5,6 +5,7 @@ import time
 import unittest
 from threading import Event
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -214,6 +215,35 @@ class MomentumReflowUiTests(unittest.TestCase):
 
         self.assertEqual(web_ui.cache["reflow_1h"], dashboard_payload)
         merge.assert_called_once()
+
+    def test_real_reflow_merge_preserves_scan_counts_and_derives_daily_totals(self):
+        web_ui = importlib.import_module("web_ui")
+        scan_result = {
+            "rows": [candidate()],
+            "scanned": 283,
+            "errors": 2,
+            "initialized": 7,
+        }
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with (
+                patch.object(
+                    web_ui, "MOMENTUM_REFLOW_HISTORY", root / "history.json"
+                ),
+                patch.object(
+                    web_ui, "MOMENTUM_REFLOW_LEDGER", root / "ledger.json"
+                ),
+                patch.object(
+                    web_ui, "scan_momentum_reflow", return_value=scan_result
+                ),
+            ):
+                payload = web_ui._run_reflow_scan(lambda *_: None)
+
+        self.assertEqual(payload["scanned"], 283)
+        self.assertEqual(payload["errors"], 2)
+        self.assertEqual(payload["initialized"], 7)
+        self.assertEqual(payload["today_total"], 1)
+        self.assertEqual(payload["high_quality_count"], 1)
 
     def test_other_scan_running_blocks_auto_reflow(self):
         web_ui = importlib.import_module("web_ui")

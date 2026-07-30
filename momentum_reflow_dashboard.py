@@ -363,9 +363,21 @@ def _sort_rows(rows: list[dict]) -> list[dict]:
     )
 
 
-def _dashboard(history: dict, day: str) -> dict:
+def _dashboard(history: dict, day: str, scan_result: dict | None = None) -> dict:
     signals = history["days"].get(day, {"signals": {}})["signals"]
-    return {"day": day, "rows": _sort_rows(copy.deepcopy(list(signals.values())))}
+    rows = _sort_rows(copy.deepcopy(list(signals.values())))
+    scan_result = scan_result or {}
+    return {
+        "day": day,
+        "rows": rows,
+        "scanned": scan_result.get("scanned", 0),
+        "errors": scan_result.get("errors", 0),
+        "initialized": scan_result.get("initialized", 0),
+        "today_total": len(rows),
+        "high_quality_count": sum(
+            row["quality_label"] == "HIGH" for row in rows
+        ),
+    }
 
 
 def merge_reflow_signals(
@@ -397,7 +409,7 @@ def merge_reflow_signals(
         _set_status_from_event(row, ledger_events.get(key))
 
     _atomic_write_json(history_path, history)
-    return _dashboard(history, day)
+    return _dashboard(history, day, scan_result)
 
 
 def load_reflow_dashboard(history_path: Path, now_ms: int) -> dict:
