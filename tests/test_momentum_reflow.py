@@ -515,62 +515,23 @@ class ReflowScanServiceTests(unittest.TestCase):
         self.assertEqual(ranged.call_args.args[2], cursor - 1_000 * HOUR_MS)
 
     @patch("momentum_reflow.requests.get")
-    def test_reflow_universe_uses_two_million_and_allows_non_equity_tradifi(self, get):
-        exchange = Mock()
-        exchange.raise_for_status.return_value = None
-        exchange.json.return_value = {
-            "symbols": [
-                {
-                    "symbol": "BTCUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "COIN",
-                },
-                {
-                    "symbol": "XAUUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "TRADIFI_PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "COMMODITY",
-                },
-                {
-                    "symbol": "EURUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "TRADIFI_PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "FX",
-                },
-                {
-                    "symbol": "TSLAUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "TRADIFI_PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "EQUITY",
-                },
-                {
-                    "symbol": "OPENAIUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "TRADIFI_PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "PREMARKET",
-                },
-                {
-                    "symbol": "USDCUSDT",
-                    "quoteAsset": "USDT",
-                    "contractType": "PERPETUAL",
-                    "status": "TRADING",
-                    "underlyingType": "COIN",
-                },
-            ]
-        }
-        ticker = Mock()
-        ticker.raise_for_status.return_value = None
-        ticker.json.return_value = [
-            {"symbol": row["symbol"], "quoteVolume": "2000000"}
-            for row in exchange.json.return_value["symbols"]
-        ]
-        get.side_effect = [exchange, ticker]
+    def test_bitget_universe_keeps_crypto_commodity_and_fx_but_rejects_equity_and_unknown_rwa(self, get):
+        contracts = Mock()
+        contracts.raise_for_status.return_value = None
+        contracts.json.return_value = {"data": [
+            {"symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "XAUUSDT", "baseCoin": "XAU", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
+            {"symbol": "EURUSDT", "baseCoin": "EUR", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
+            {"symbol": "TSLAUSDT", "baseCoin": "TSLA", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
+            {"symbol": "UNKNOWNUSDT", "baseCoin": "UNKNOWN", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
+        ]}
+        tickers = Mock()
+        tickers.raise_for_status.return_value = None
+        tickers.json.return_value = {"data": [
+            {"symbol": symbol, "usdtVolume": "2000000"}
+            for symbol in ("BTCUSDT", "XAUUSDT", "EURUSDT", "TSLAUSDT", "UNKNOWNUSDT")
+        ]}
+        get.side_effect = [contracts, tickers]
         symbols, _, types = fetch_futures_universe()
         self.assertEqual(symbols, ["BTCUSDT", "XAUUSDT", "EURUSDT"])
         self.assertEqual(types, {
@@ -578,20 +539,20 @@ class ReflowScanServiceTests(unittest.TestCase):
             "XAUUSDT": "COMMODITY",
             "EURUSDT": "FX",
         })
-        self.assertIn("/fapi/v1/exchangeInfo", get.call_args_list[0].args[0])
+        self.assertIn("api.bitget.com/api/v2/mix/market/contracts", get.call_args_list[0].args[0])
 
     @patch("momentum_reflow.requests.get")
     def test_reflow_volume_boundary_is_inclusive(self, get):
-        exchange = Mock()
-        exchange.raise_for_status.return_value = None
-        exchange.json.return_value = {"symbols": [{
-            "symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL",
-            "status": "TRADING", "underlyingType": "COIN",
+        contracts = Mock()
+        contracts.raise_for_status.return_value = None
+        contracts.json.return_value = {"data": [{
+            "symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT",
+            "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO",
         }]}
-        ticker = Mock()
-        ticker.raise_for_status.return_value = None
-        ticker.json.return_value = [{"symbol": "BTCUSDT", "quoteVolume": "2000000"}]
-        get.side_effect = [exchange, ticker]
+        tickers = Mock()
+        tickers.raise_for_status.return_value = None
+        tickers.json.return_value = {"data": [{"symbol": "BTCUSDT", "quoteVolume": "2000000"}]}
+        get.side_effect = [contracts, tickers]
 
         symbols, _, _ = fetch_futures_universe()
 
@@ -599,30 +560,36 @@ class ReflowScanServiceTests(unittest.TestCase):
 
     @patch("momentum_reflow.requests.get")
     def test_reflow_universe_rejects_blocked_and_leveraged_contracts(self, get):
-        exchange = Mock()
-        exchange.raise_for_status.return_value = None
-        exchange.json.return_value = {"symbols": [
-            {"symbol": "HKUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "HK_EQUITY"},
-            {"symbol": "KRUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "KR_EQUITY"},
-            {"symbol": "UNKNOWNUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "INDEX"},
-            {"symbol": "BULLUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
-            {"symbol": "BEARUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
-            {"symbol": "UPUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
-            {"symbol": "DOWNUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
-            {"symbol": "SUPERUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+        contracts = Mock()
+        contracts.raise_for_status.return_value = None
+        contracts.json.return_value = {"data": [
+            {"symbol": "USDCUSDT", "baseCoin": "USDC", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "BULLUSDT", "baseCoin": "BULL", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "BEARUSDT", "baseCoin": "BEAR", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "UPUSDT", "baseCoin": "UP", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "DOWNUSDT", "baseCoin": "DOWN", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
+            {"symbol": "SUPERUSDT", "baseCoin": "SUPER", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
         ]}
-        ticker = Mock()
-        ticker.raise_for_status.return_value = None
-        ticker.json.return_value = [
+        tickers = Mock()
+        tickers.raise_for_status.return_value = None
+        tickers.json.return_value = {"data": [
             {"symbol": row["symbol"], "quoteVolume": "2000000"}
-            for row in exchange.json.return_value["symbols"]
-        ]
-        get.side_effect = [exchange, ticker]
+            for row in contracts.json.return_value["data"]
+        ]}
+        get.side_effect = [contracts, tickers]
 
         symbols, _, types = fetch_futures_universe()
 
         self.assertEqual(symbols, ["SUPERUSDT"])
         self.assertEqual(types, {"SUPERUSDT": "CRYPTO"})
+
+    def test_legacy_binance_ledger_resets_before_bitget_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {"version": 1, "symbols": {"BTCUSDT": make_waiting_state("LONG")}})
+            ledger = momentum_reflow.prepare_bitget_ledger(load_ledger(path))
+        self.assertEqual(ledger["source"], "bitget_usdt_futures")
+        self.assertEqual(ledger["symbols"], {})
 
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
@@ -641,6 +608,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             path = Path(directory) / "ledger.json"
             save_ledger(path, {
                 "version": 1,
+                "source": "bitget_usdt_futures",
                 "symbols": {"OLDUSDT": make_waiting_state("LONG")},
             })
             payload = scan_momentum_reflow(path, max_workers=1)
@@ -662,6 +630,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             path = Path(directory) / "ledger.json"
             save_ledger(path, {
                 "version": 1,
+                "source": "bitget_usdt_futures",
                 "symbols": {"TESTUSDT": original},
             })
             payload = scan_momentum_reflow(path, max_workers=1)
@@ -681,7 +650,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         latest.return_value = make_closed_daily_history("TESTUSDT")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"
-            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": original}})
+            save_ledger(path, {"version": 1, "source": "bitget_usdt_futures", "symbols": {"TESTUSDT": original}})
             payload = scan_momentum_reflow(path, max_workers=1)
             saved = load_ledger(path)
         self.assertEqual(payload["errors"], 1)
@@ -704,6 +673,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             path = Path(directory) / "ledger.json"
             save_ledger(path, {
                 "version": 1,
+                "source": "bitget_usdt_futures",
                 "symbols": {"OLDUSDT": make_waiting_state("LONG")},
             })
             scan_momentum_reflow(path, max_workers=1)
@@ -745,7 +715,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         original = make_waiting_state("LONG")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"
-            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": original}})
+            save_ledger(path, {"version": 1, "source": "bitget_usdt_futures", "symbols": {"TESTUSDT": original}})
             payload = scan_momentum_reflow(path, max_workers=1)
             saved = load_ledger(path)
         self.assertEqual(payload["errors"], 0)
@@ -764,6 +734,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             path = Path(directory) / "ledger.json"
             save_ledger(path, {
                 "version": 1,
+                "source": "bitget_usdt_futures",
                 "symbols": {"TESTUSDT": original},
             })
             payload = scan_momentum_reflow(path, max_workers=1)
@@ -851,7 +822,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         active = make_waiting_state("LONG")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"
-            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": active}})
+            save_ledger(path, {"version": 1, "source": "bitget_usdt_futures", "symbols": {"TESTUSDT": active}})
             payload = scan_momentum_reflow(path, max_workers=1)
             saved = load_ledger(path)
         self.assertEqual(payload["rows"], [])

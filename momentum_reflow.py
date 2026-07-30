@@ -30,7 +30,9 @@ TOUCH_ZONE_ATR = 0.2
 CLOSE_DISTANCE_ATR = 0.35
 RETURN_WINDOW_BARS = 5
 LEDGER_VERSION = 1
-FUTURES_BASE = "https://fapi.binance.com"
+BITGET_BASE = "https://api.bitget.com"
+BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+BITGET_LEDGER_SOURCE = "bitget_usdt_futures"
 HOUR_MS = 3_600_000
 REFLOW_MIN_VOLUME_USDT = 2_000_000
 STABLE_BASE_ASSETS = {
@@ -41,8 +43,11 @@ STABLE_BASE_ASSETS = {
     "USDS",
 }
 LEVERAGED_MARKERS = ("BULL", "BEAR", "UP", "DOWN")
-ALLOWED_TRADIFI_TYPES = {"COMMODITY": "COMMODITY", "FX": "FX"}
-BLOCKED_EQUITY_TYPES = {"EQUITY", "HK_EQUITY", "KR_EQUITY", "PREMARKET"}
+COMMODITY_BASE_ASSETS = {"XAU", "XAG", "XAUT", "PAXG", "WTI", "BRENT"}
+FX_BASE_ASSETS = {
+    "EUR", "GBP", "AUD", "JPY", "CAD", "CHF", "NZD", "TRY", "BRL",
+    "ZAR", "RUB", "UAH", "PLN", "RON", "ARS",
+}
 
 
 def _true_range(frame: pd.DataFrame) -> pd.Series:
@@ -363,6 +368,16 @@ def load_ledger(path: Path) -> dict:
     return data
 
 
+def prepare_bitget_ledger(ledger: dict) -> dict:
+    if ledger.get("source") == BITGET_LEDGER_SOURCE:
+        return ledger
+    return {
+        "version": LEDGER_VERSION,
+        "source": BITGET_LEDGER_SOURCE,
+        "symbols": {},
+    }
+
+
 def save_ledger(path: Path, ledger: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(ledger, ensure_ascii=False, separators=(",", ":"))
@@ -383,42 +398,53 @@ def save_ledger(path: Path, ledger: dict) -> None:
         raise
 
 
-def classify_futures_contract(row: dict) -> str | None:
-    symbol = str(row.get("symbol", "")).upper()
-    base = str(row.get("baseAsset") or symbol.removesuffix("USDT")).upper()
-    contract_type = row.get("contractType")
-    underlying_type = str(row.get("underlyingType", "")).upper()
-    if row.get("quoteAsset") != "USDT" or row.get("status") != "TRADING":
+def classify_bitget_contract(row: dict) -> str | None:
+    base = str(row.get("baseCoin", "")).upper()
+    if (
+        row.get("quoteCoin") != "USDT"
+        or row.get("symbolType") != "perpetual"
+        or row.get("symbolStatus") != "normal"
+    ):
         return None
     if base in STABLE_BASE_ASSETS or base.endswith(LEVERAGED_MARKERS):
         return None
-    if underlying_type in BLOCKED_EQUITY_TYPES:
-        return None
-    if contract_type == "PERPETUAL":
+    if str(row.get("isRwa", "NO")).upper() != "YES":
         return "CRYPTO"
-    if contract_type == "TRADIFI_PERPETUAL":
-        return ALLOWED_TRADIFI_TYPES.get(underlying_type)
+    if base in COMMODITY_BASE_ASSETS:
+        return "COMMODITY"
+    if base in FX_BASE_ASSETS:
+        return "FX"
     return None
 
 
 def fetch_futures_universe() -> tuple[list[str], dict[str, float], dict[str, str]]:
-    exchange_response = requests.get(
-        f"{FUTURES_BASE}/fapi/v1/exchangeInfo", timeout=10
+    contracts_response = requests.get(
+        f"{BITGET_BASE}/api/v2/mix/market/contracts",
+        params={"productType": BITGET_PRODUCT_TYPE},
+        timeout=10,
     )
-    exchange_response.raise_for_status()
-    ticker_response = requests.get(
-        f"{FUTURES_BASE}/fapi/v1/ticker/24hr", timeout=10
+    contracts_response.raise_for_status()
+    tickers_response = requests.get(
+        f"{BITGET_BASE}/api/v2/mix/market/tickers",
+        params={"productType": BITGET_PRODUCT_TYPE},
+        timeout=10,
     )
-    ticker_response.raise_for_status()
-    volume = {
-        row["symbol"]: float(row["quoteVolume"])
-        for row in ticker_response.json()
-        if row.get("symbol") and row.get("quoteVolume") is not None
-    }
+    tickers_response.raise_for_status()
+    volume = {}
+    for row in tickers_response.json().get("data", []):
+        raw_volume = row.get("usdtVolume")
+        if raw_volume is None:
+            raw_volume = row.get("quoteVolume")
+        if not row.get("symbol") or raw_volume is None:
+            continue
+        try:
+            volume[row["symbol"]] = float(raw_volume)
+        except (TypeError, ValueError):
+            continue
     instrument_types = {
         row["symbol"]: instrument_type
-        for row in exchange_response.json().get("symbols", [])
-        if (instrument_type := classify_futures_contract(row)) is not None
+        for row in contracts_response.json().get("data", [])
+        if (instrument_type := classify_bitget_contract(row)) is not None
     }
     symbols = [
         symbol
@@ -544,7 +570,7 @@ def scan_momentum_reflow(
     progress: Callable[[int, int], None] | None = None,
     max_workers: int = 12,
 ) -> dict:
-    ledger = load_ledger(ledger_path)
+    ledger = prepare_bitget_ledger(load_ledger(ledger_path))
     eligible_symbols, _, instrument_types = fetch_futures_universe()
     symbols = sorted(set(eligible_symbols) | _active_ledger_symbols(ledger))
     rows: list[dict] = []
