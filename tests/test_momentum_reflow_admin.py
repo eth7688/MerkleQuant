@@ -406,6 +406,129 @@ class MomentumReflowAdminTests(unittest.TestCase):
             )
         )
 
+    def test_stale_success_refreshes_current_panel_after_old_snapshot(self):
+        run_admin_javascript(
+            textwrap.dedent(
+                """
+                  renderReflow(content);
+                  requests[0].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:100, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:200,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  const detachedBox = elements.reflowAutoEnabled;
+                  detachedBox.checked = true;
+                  detachedBox.onchange();
+
+                  renderReflow(content);
+                  const oldSnapshotBox = elements.reflowAutoEnabled;
+                  requests[2].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:100, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:200,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  assert.strictEqual(oldSnapshotBox.checked, false);
+
+                  requests[1].resolve(response(true, {
+                    ok:true, auto_scan_enabled:true,
+                    updated_at:300, updated_by:'admin'
+                  }));
+                  await flush();
+
+                  assert.strictEqual(requests.length, 4);
+                  assert.strictEqual(detachedBox.checked, true);
+                  assert.strictEqual(detachedBox.disabled, true);
+                  assert.strictEqual(detachedBox.onchange instanceof Function, true);
+                  const refreshedBox = elements.reflowAutoEnabled;
+                  const refreshedState = elements.reflowEnabledState;
+                  assert.notStrictEqual(refreshedBox, oldSnapshotBox);
+                  requests[3].resolve(response(true, {
+                    auto_scan_enabled:true, updated_at:300, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:400,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+
+                  assert.strictEqual(refreshedBox.checked, true);
+                  assert.strictEqual(refreshedBox.disabled, false);
+                  assert.strictEqual(refreshedState.textContent, '已启用');
+                  await flush();
+                  assert.strictEqual(requests.length, 4);
+                """
+            )
+        )
+
+    def test_overlapping_saves_converge_after_last_completed_save(self):
+        run_admin_javascript(
+            textwrap.dedent(
+                """
+                  renderReflow(content);
+                  requests[0].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:100, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:200,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  const firstBox = elements.reflowAutoEnabled;
+                  firstBox.checked = true;
+                  firstBox.onchange();
+
+                  renderReflow(content);
+                  requests[2].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:100, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:200,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  const secondBox = elements.reflowAutoEnabled;
+                  const secondError = elements.reflowSaveError;
+                  secondBox.checked = false;
+                  secondBox.onchange();
+
+                  requests[1].resolve(response(true, {
+                    ok:true, auto_scan_enabled:true,
+                    updated_at:300, updated_by:'admin'
+                  }));
+                  await flush();
+                  assert.strictEqual(requests.length, 5);
+                  const interimBox = elements.reflowAutoEnabled;
+                  requests[4].resolve(response(true, {
+                    auto_scan_enabled:true, updated_at:300, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:400,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+                  assert.strictEqual(interimBox.checked, true);
+
+                  requests[3].resolve(response(true, {
+                    ok:true, auto_scan_enabled:false,
+                    updated_at:500, updated_by:'admin'
+                  }));
+                  await flush();
+                  assert.strictEqual(requests.length, 6);
+                  assert.strictEqual(secondBox.checked, false);
+                  assert.strictEqual(secondBox.disabled, true);
+                  assert.strictEqual(secondError.style.display, 'none');
+                  const finalBox = elements.reflowAutoEnabled;
+                  const finalState = elements.reflowEnabledState;
+                  requests[5].resolve(response(true, {
+                    auto_scan_enabled:false, updated_at:500, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:600,
+                    last_auto_error:'', scheduler_status:'available'
+                  }));
+                  await flush();
+
+                  assert.strictEqual(finalBox.checked, false);
+                  assert.strictEqual(finalBox.disabled, false);
+                  assert.strictEqual(finalState.textContent, '已关闭');
+                  await flush();
+                  assert.strictEqual(requests.length, 6);
+                """
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

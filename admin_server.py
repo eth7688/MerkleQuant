@@ -416,6 +416,11 @@ function isCurrentReflowRender(generation, box){
   return generation===_reflowRenderGeneration &&
     document.getElementById('reflowAutoEnabled')===box;
 }
+function refreshCurrentReflowPanel(){
+  var box=document.getElementById('reflowAutoEnabled');
+  var content=document.getElementById('content');
+  if(box&&content) renderReflow(content);
+}
 function formatReflowTime(value){
   var timestamp=Number(value);
   if(!Number.isFinite(timestamp)||timestamp<=0) return '--';
@@ -490,7 +495,10 @@ function saveReflowSetting(){
       return data;
     });
   }).then(function(data){
-    if(!isCurrentReflowRender(generation,box)) return;
+    if(!isCurrentReflowRender(generation,box)){
+      refreshCurrentReflowPanel();
+      return;
+    }
     box.checked=Boolean(data.auto_scan_enabled);
     box.dataset.savedChecked=String(box.checked);
     document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
