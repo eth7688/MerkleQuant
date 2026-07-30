@@ -160,6 +160,22 @@ class ReflowQualityScoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_reflow_candidate(row)
 
+    def test_boolean_required_numeric_values_are_rejected(self):
+        valid = {
+            "daily_rank": 3,
+            "breakout_volume_ratio": 3.0,
+            "max_expansion_atr": 3.0,
+            "close_distance_atr": 0.0,
+            "window_index": 1,
+        }
+        for field in valid:
+            with self.subTest(field=field):
+                row = valid.copy()
+                row[field] = True
+
+                with self.assertRaises(ValueError):
+                    score_reflow_candidate(row)
+
 
 def milliseconds(value: str) -> int:
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
@@ -343,6 +359,29 @@ class ReflowDailyHistoryTests(unittest.TestCase):
                     load_reflow_dashboard(history, 1_000)
 
                 self.assertEqual(history.read_bytes(), original)
+
+    def test_mismatched_outer_signal_key_rejects_load_and_merge_without_rewrite(self):
+        with TemporaryDirectory() as folder:
+            history = Path(folder) / "history.json"
+            ledger = Path(folder) / "ledger.json"
+            write_ledger(ledger)
+            row = candidate()
+            merge_reflow_signals(history, ledger, {"rows": [row]}, 1_000)
+            raw = json.loads(history.read_text(encoding="utf-8"))
+            signals = next(iter(raw["days"].values()))["signals"]
+            signal = next(iter(signals.values()))
+            signals["WRONG|KEY|0|0"] = signal
+            del signals[signal["signal_key"]]
+            history.write_text(json.dumps(raw), encoding="utf-8")
+            original = history.read_bytes()
+
+            with self.assertRaises(ValueError):
+                load_reflow_dashboard(history, 1_000)
+            self.assertEqual(history.read_bytes(), original)
+
+            with self.assertRaises(ValueError):
+                merge_reflow_signals(history, ledger, {"rows": [row]}, 1_001)
+            self.assertEqual(history.read_bytes(), original)
 
     def test_next_scan_targets_the_next_beijing_hour_at_minute_three(self):
         before = datetime(2026, 7, 30, 10, 2, tzinfo=timezone.utc)

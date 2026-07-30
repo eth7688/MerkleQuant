@@ -113,6 +113,8 @@ def _linear(value, start, end, start_points, end_points):
 
 
 def _required_finite_float(candidate: dict, field: str) -> float:
+    if type(candidate.get(field)) is bool:
+        raise ValueError(f"{field} is required and must be numeric")
     try:
         value = float(candidate[field])
     except (KeyError, OverflowError, TypeError, ValueError) as error:
@@ -123,6 +125,8 @@ def _required_finite_float(candidate: dict, field: str) -> float:
 
 
 def _required_point(candidate: dict, field: str, points: dict[int, float]) -> float:
+    if type(candidate.get(field)) is bool:
+        raise ValueError(f"{field} is invalid")
     value = _required_finite_float(candidate, field)
     if not value.is_integer() or int(value) not in points:
         raise ValueError(f"{field} is invalid")
@@ -201,6 +205,8 @@ def _read_history(path: Path) -> dict:
                 raise ValueError("momentum reflow history signal shape is invalid")
             try:
                 _validate_persisted_signal(signal)
+                if key != signal["signal_key"]:
+                    raise ValueError("momentum reflow history outer signal key is invalid")
             except ValueError as error:
                 raise ValueError("momentum reflow history signal is invalid") from error
     return history
