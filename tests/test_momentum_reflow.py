@@ -477,7 +477,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         self.assertEqual(ranged.call_args.args[2], cursor - 1_000 * HOUR_MS)
 
     @patch("momentum_reflow.requests.get")
-    def test_universe_uses_fapi_usdt_perpetual_contracts(self, get):
+    def test_reflow_universe_uses_two_million_and_allows_non_equity_tradifi(self, get):
         exchange = Mock()
         exchange.raise_for_status.return_value = None
         exchange.json.return_value = {
@@ -487,23 +487,103 @@ class ReflowScanServiceTests(unittest.TestCase):
                     "quoteAsset": "USDT",
                     "contractType": "PERPETUAL",
                     "status": "TRADING",
+                    "underlyingType": "COIN",
                 },
                 {
-                    "symbol": "BTCUSDC",
-                    "quoteAsset": "USDC",
+                    "symbol": "XAUUSDT",
+                    "quoteAsset": "USDT",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "status": "TRADING",
+                    "underlyingType": "COMMODITY",
+                },
+                {
+                    "symbol": "EURUSDT",
+                    "quoteAsset": "USDT",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "status": "TRADING",
+                    "underlyingType": "FX",
+                },
+                {
+                    "symbol": "TSLAUSDT",
+                    "quoteAsset": "USDT",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "status": "TRADING",
+                    "underlyingType": "EQUITY",
+                },
+                {
+                    "symbol": "OPENAIUSDT",
+                    "quoteAsset": "USDT",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "status": "TRADING",
+                    "underlyingType": "PREMARKET",
+                },
+                {
+                    "symbol": "USDCUSDT",
+                    "quoteAsset": "USDT",
                     "contractType": "PERPETUAL",
                     "status": "TRADING",
+                    "underlyingType": "COIN",
                 },
             ]
         }
         ticker = Mock()
         ticker.raise_for_status.return_value = None
-        ticker.json.return_value = [{"symbol": "BTCUSDT", "quoteVolume": "9000000"}]
+        ticker.json.return_value = [
+            {"symbol": row["symbol"], "quoteVolume": "2000000"}
+            for row in exchange.json.return_value["symbols"]
+        ]
         get.side_effect = [exchange, ticker]
-        symbols, volume = fetch_futures_universe()
-        self.assertEqual(symbols, ["BTCUSDT"])
-        self.assertEqual(volume["BTCUSDT"], 9_000_000.0)
+        symbols, _, types = fetch_futures_universe()
+        self.assertEqual(symbols, ["BTCUSDT", "XAUUSDT", "EURUSDT"])
+        self.assertEqual(types, {
+            "BTCUSDT": "CRYPTO",
+            "XAUUSDT": "COMMODITY",
+            "EURUSDT": "FX",
+        })
         self.assertIn("/fapi/v1/exchangeInfo", get.call_args_list[0].args[0])
+
+    @patch("momentum_reflow.requests.get")
+    def test_reflow_volume_boundary_is_inclusive(self, get):
+        exchange = Mock()
+        exchange.raise_for_status.return_value = None
+        exchange.json.return_value = {"symbols": [{
+            "symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL",
+            "status": "TRADING", "underlyingType": "COIN",
+        }]}
+        ticker = Mock()
+        ticker.raise_for_status.return_value = None
+        ticker.json.return_value = [{"symbol": "BTCUSDT", "quoteVolume": "2000000"}]
+        get.side_effect = [exchange, ticker]
+
+        symbols, _, _ = fetch_futures_universe()
+
+        self.assertEqual(symbols, ["BTCUSDT"])
+
+    @patch("momentum_reflow.requests.get")
+    def test_reflow_universe_rejects_blocked_and_leveraged_contracts(self, get):
+        exchange = Mock()
+        exchange.raise_for_status.return_value = None
+        exchange.json.return_value = {"symbols": [
+            {"symbol": "HKUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "HK_EQUITY"},
+            {"symbol": "KRUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "KR_EQUITY"},
+            {"symbol": "UNKNOWNUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "INDEX"},
+            {"symbol": "BULLUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+            {"symbol": "BEARUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+            {"symbol": "UPUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+            {"symbol": "DOWNUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+        ]}
+        ticker = Mock()
+        ticker.raise_for_status.return_value = None
+        ticker.json.return_value = [
+            {"symbol": row["symbol"], "quoteVolume": "2000000"}
+            for row in exchange.json.return_value["symbols"]
+        ]
+        get.side_effect = [exchange, ticker]
+
+        symbols, _, types = fetch_futures_universe()
+
+        self.assertEqual(symbols, [])
+        self.assertEqual(types, {})
 
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
@@ -511,7 +591,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_active_ledger_symbol_is_scanned_below_current_volume_filter(
         self, universe, latest, ranged
     ):
-        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0}, {"NEWUSDT": "CRYPTO"})
         latest.side_effect = lambda symbol, interval, *args, **kwargs: (
             make_closed_hourly_history(symbol)
             if interval == "1h"
@@ -533,7 +613,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_gap_failure_preserves_symbol_state_and_cursor(self, universe, latest, ranged):
-        universe.return_value = ([], {})
+        universe.return_value = ([], {}, {})
         original = make_waiting_state("LONG")
         gapped = make_closed_hourly_history("TESTUSDT")
         gapped = gapped.drop(gapped.index[-2]).reset_index(drop=True)
@@ -554,7 +634,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_leading_gap_after_cursor_preserves_symbol_state(self, universe, latest, ranged):
-        universe.return_value = ([], {})
+        universe.return_value = ([], {}, {})
         original = make_waiting_state("LONG")
         leading_gap = make_closed_hourly_history("TESTUSDT")
         leading_gap["ot"] = BASE_OT + 2 * HOUR_MS + np.arange(len(leading_gap)) * HOUR_MS
@@ -574,7 +654,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_incremental_fetches_use_futures_mainnet_and_closed_candles(
         self, universe, latest, ranged
     ):
-        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0}, {"NEWUSDT": "CRYPTO"})
         latest.side_effect = lambda symbol, interval, *args, **kwargs: (
             make_closed_hourly_history(symbol)
             if interval == "1h"
@@ -604,7 +684,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_low_price_new_symbol_is_not_initialized(self, universe, latest):
-        universe.return_value = (["LOWUSDT"], {"LOWUSDT": 9_000_000.0})
+        universe.return_value = (["LOWUSDT"], {"LOWUSDT": 9_000_000.0}, {"LOWUSDT": "CRYPTO"})
         low_price = make_closed_hourly_history("LOWUSDT")
         low_price.loc[:, ["o", "h", "l", "c"]] = 0.0005
         latest.return_value = low_price
@@ -620,7 +700,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_no_candidate_advances_state_without_daily_data(self, universe, latest, ranged):
-        universe.return_value = ([], {})
+        universe.return_value = ([], {}, {})
         ranged.return_value = make_closed_hourly_history("TESTUSDT")
         latest.side_effect = AssertionError("daily fetch must not run")
         original = make_waiting_state("LONG")
@@ -637,7 +717,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_daily_outage_preserves_exact_old_state(self, universe, latest, ranged):
-        universe.return_value = ([], {})
+        universe.return_value = ([], {}, {})
         ranged.return_value = make_return_window_hourly_history("TESTUSDT")
         latest.side_effect = OSError("daily unavailable")
         original = make_waiting_state("LONG")
@@ -659,7 +739,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_new_symbol_daily_outage_is_not_initialized_or_persisted(
         self, universe, latest, advance
     ):
-        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0}, {"NEWUSDT": "CRYPTO"})
         latest.side_effect = [make_closed_hourly_history("NEWUSDT"), OSError("daily unavailable")]
         advance.return_value = (
             {"last_processed_open_time": BASE_OT + HOUR_MS, "event": {}},
@@ -679,7 +759,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_progress_reports_each_worker_and_ledger_saves_once(
         self, universe, latest, saved
     ):
-        universe.return_value = (["AAAUSDT", "BBBUSDT"], {})
+        universe.return_value = (["AAAUSDT", "BBBUSDT"], {}, {"AAAUSDT": "CRYPTO", "BBBUSDT": "CRYPTO"})
         latest.return_value = make_closed_hourly_history("ANYUSDT")
         progress = Mock()
         with tempfile.TemporaryDirectory() as directory:
@@ -692,7 +772,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_futures_universe")
     def test_rows_sort_by_required_keys_and_truncate_to_eighty(self, universe, worker):
         symbols = ["AUSDT", "BUSDT", "CUSDT"] + [f"X{index:02d}USDT" for index in range(78)]
-        universe.return_value = (symbols, {})
+        universe.return_value = (symbols, {}, {"AUSDT": "COMMODITY", "BUSDT": "FX"})
         candidates = {
             "AUSDT": {"close_distance_atr": 1.0, "daily_rank": 1, "breakout_volume_ratio": 9.0},
             "BUSDT": {"close_distance_atr": 1.0, "daily_rank": 2, "breakout_volume_ratio": 1.0},
@@ -712,6 +792,10 @@ class ReflowScanServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             payload = scan_momentum_reflow(Path(directory) / "ledger.json", max_workers=1)
         self.assertEqual([row["symbol"] for row in payload["rows"][:3]], ["CUSDT", "BUSDT", "AUSDT"])
+        self.assertEqual(
+            {row["symbol"]: row["instrument_type"] for row in payload["rows"][:3]},
+            {"CUSDT": "CRYPTO", "BUSDT": "FX", "AUSDT": "COMMODITY"},
+        )
         self.assertEqual(len(payload["rows"]), 80)
         self.assertEqual(payload["rows"][-1]["symbol"], "X76USDT")
 
@@ -719,7 +803,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
     def test_failed_daily_confirmation_keeps_active_return_window(self, universe, latest, ranged):
-        universe.return_value = ([], {})
+        universe.return_value = ([], {}, {})
         hourly = make_return_window_hourly_history("TESTUSDT")
         daily = make_closed_daily_history("TESTUSDT")
         daily.loc[daily.index[-1], ["o", "h", "l", "c", "v"]] = [100, 101, 99, 100, 100]

@@ -14,10 +14,8 @@ import requests
 
 from screener import (
     MIN_PRICE,
-    MIN_VOLUME,
     fetch_klines,
     fetch_klines_range,
-    is_tradfi_or_junk,
 )
 
 EMA_PERIOD = 50
@@ -34,6 +32,17 @@ RETURN_WINDOW_BARS = 5
 LEDGER_VERSION = 1
 FUTURES_BASE = "https://fapi.binance.com"
 HOUR_MS = 3_600_000
+REFLOW_MIN_VOLUME_USDT = 2_000_000
+STABLE_BASE_ASSETS = {
+    "USDC", "FDUSD", "USD1", "RLUSD", "TUSD", "DAI", "USDP", "USDD",
+    "PYUSD", "USDY", "CRVUSD", "SUSD", "EUSD", "GHO", "LUSD", "MIM",
+    "FRAX", "USTC", "USDE", "USR", "EURS", "EURC", "XSGD", "USDJ",
+    "USDX", "USDB", "USDZ", "AEUR", "USDF", "STUSD", "USDQ", "XUSD",
+    "USDS",
+}
+LEVERAGED_MARKERS = ("BULL", "BEAR", "UP", "DOWN")
+ALLOWED_TRADIFI_TYPES = {"COMMODITY": "COMMODITY", "FX": "FX"}
+BLOCKED_EQUITY_TYPES = {"EQUITY", "HK_EQUITY", "KR_EQUITY", "PREMARKET"}
 
 
 def _true_range(frame: pd.DataFrame) -> pd.Series:
@@ -374,7 +383,25 @@ def save_ledger(path: Path, ledger: dict) -> None:
         raise
 
 
-def fetch_futures_universe() -> tuple[list[str], dict[str, float]]:
+def classify_futures_contract(row: dict) -> str | None:
+    symbol = str(row.get("symbol", "")).upper()
+    base = str(row.get("baseAsset") or symbol.removesuffix("USDT")).upper()
+    contract_type = row.get("contractType")
+    underlying_type = str(row.get("underlyingType", "")).upper()
+    if row.get("quoteAsset") != "USDT" or row.get("status") != "TRADING":
+        return None
+    if base in STABLE_BASE_ASSETS or any(marker in base for marker in LEVERAGED_MARKERS):
+        return None
+    if underlying_type in BLOCKED_EQUITY_TYPES:
+        return None
+    if contract_type == "PERPETUAL":
+        return "CRYPTO"
+    if contract_type == "TRADIFI_PERPETUAL":
+        return ALLOWED_TRADIFI_TYPES.get(underlying_type)
+    return None
+
+
+def fetch_futures_universe() -> tuple[list[str], dict[str, float], dict[str, str]]:
     exchange_response = requests.get(
         f"{FUTURES_BASE}/fapi/v1/exchangeInfo", timeout=10
     )
@@ -388,16 +415,17 @@ def fetch_futures_universe() -> tuple[list[str], dict[str, float]]:
         for row in ticker_response.json()
         if row.get("symbol") and row.get("quoteVolume") is not None
     }
-    symbols = [
-        row["symbol"]
+    instrument_types = {
+        row["symbol"]: instrument_type
         for row in exchange_response.json().get("symbols", [])
-        if row.get("quoteAsset") == "USDT"
-        and row.get("contractType") == "PERPETUAL"
-        and row.get("status") == "TRADING"
-        and not is_tradfi_or_junk(row.get("symbol", ""))
-        and volume.get(row.get("symbol", ""), 0.0) >= MIN_VOLUME
+        if (instrument_type := classify_futures_contract(row)) is not None
+    }
+    symbols = [
+        symbol
+        for symbol in instrument_types
+        if volume.get(symbol, 0.0) >= REFLOW_MIN_VOLUME_USDT
     ]
-    return symbols, volume
+    return symbols, volume, instrument_types
 
 
 def _validate_hourly_history(
@@ -516,7 +544,7 @@ def scan_momentum_reflow(
     max_workers: int = 12,
 ) -> dict:
     ledger = load_ledger(ledger_path)
-    eligible_symbols, _ = fetch_futures_universe()
+    eligible_symbols, _, instrument_types = fetch_futures_universe()
     symbols = sorted(set(eligible_symbols) | _active_ledger_symbols(ledger))
     rows: list[dict] = []
     errors = 0
@@ -547,6 +575,7 @@ def scan_momentum_reflow(
                 if proposed_state:
                     ledger["symbols"][symbol] = proposed_state
                 if candidate is not None:
+                    candidate["instrument_type"] = instrument_types.get(symbol, "CRYPTO")
                     rows.append(candidate)
             if progress is not None:
                 progress(completed, len(symbols))
