@@ -14,9 +14,12 @@ from rj_indicator import compute_rj_bbkd, RJParams
 import numpy as np
 from trader import TradeConfig, SqueezeBreakoutBot
 import os as _os
+from pathlib import Path
+from momentum_reflow import scan_momentum_reflow
 
 # 交易引擎实例 (全局单例)
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+MOMENTUM_REFLOW_LEDGER = Path(__file__).with_name("momentum_reflow_state.json")
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -419,7 +422,8 @@ cache = {"squeeze_4h":[],"squeeze_1h":[],"squeeze_15m":[],"squeeze_1d":[],"squee
          "diverge_4h":[],"diverge_1h":[],"diverge_15m":[],"diverge_1d":[],"diverge_1w":[],
          "breakout_4h":[],"breakout_1h":[],"breakout_15m":[],"breakout_1d":[],
          "short_4h":[],"short_1h":[],"volume_4h":[],"volume_1h":[],"trader":[],
-         "funding":{"negative":[],"positive":[],"nextTime":0}}
+         "funding":{"negative":[],"positive":[],"nextTime":0},
+         "reflow_1h":{"rows":[],"scanned":0,"errors":0,"initialized":0}}
 state = {"time":"--","text":"就绪","scanning":False,"progress":""}
 
 TABS = [
@@ -1338,6 +1342,7 @@ let groups=[
   ['glow','RJ指标策略',[['rj_indicator','RJ/BBKD','J']]],
   ['glow','演示引擎',[['demo','净值看板','D']]],
   ['breakout','动量突破',[['breakout_4h','4H','6'],['breakout_1h','1H','7'],['breakout_15m','15m','8'],['breakout_1d','日线','9']]],
+  ['reflow','动能回流',[['reflow_1h','1H首次回流','M']]],
   ['trader','自动交易',[['trader','交易面板','T']]],
   ['squeeze','收敛扫选',[['squeeze_4h','4H','1'],['squeeze_1h','1H','2'],['squeeze_15m','15m','3'],['squeeze_1d','日线','4'],['squeeze_1w','周线','5']]],
   ['short','做空扫选',[['short_4h','4H','9'],['short_1h','1H','0']]],
@@ -1361,6 +1366,7 @@ var _desc={
   breakout_1h:'方向性信号扫描（1H周期），灵敏度较高，适合捕捉短线机会。',
   breakout_15m:'方向性信号扫描（15m周期），灵敏度最高。建议结合大周期结构辅助判断。',
   breakout_1d:'方向性信号扫描（日线周期），结构稳定性最高，适合中长线参考。',
+  reflow_1h:'1H 首次回流扫描：EMA50 强势突破并扩张后，捕捉首次回踩窗口，结合日线确认筛选方向性候选。',
   trader:'自动交易引擎。配置API后自动执行：信号扫描→结构止损→动态追踪。内置多级风控与入场验证。',
   squeeze_4h:'波动压缩扫描（4H周期）。监测价格波动收敛状态，压缩越紧=蓄力越充分。',
   squeeze_1h:'波动压缩扫描（1H周期），全市场波动收敛程度排序。',
@@ -1459,8 +1465,9 @@ function show(tab, btn){
   for(var i=0; i<all.length; i++){all[i].classList.remove('active');}
   if(btn) btn.classList.add('active');
   var rows=D[tab]||[];
+  var resultCount=tab==='reflow_1h'&&rows&&Array.isArray(rows.rows)?rows.rows.length:(Array.isArray(rows)?rows.length:0);
   setDesc(tab);
-  document.getElementById('statusCount').textContent=rows.length+' 结果';
+  document.getElementById('statusCount').textContent=resultCount+' 结果';
   if(btn){
     var label=btn.textContent.replace(/\d/g,'').trim();
     document.getElementById('scanLabel').textContent='当前: '+label;
@@ -1481,6 +1488,7 @@ function render(tab, rows){
   if(isRoller){renderRoller(); return;}
   if(isDemo){renderDemo(); return;}
   if(isCR){renderCryptorank(tab.replace('cryptorank_','')); return;}
+  if(tab==='reflow_1h'){renderMomentumReflow(rows); return;}
   if(isF){renderFunding(rows); return;}
   if(isB && rows && rows.length>0){renderBreakout(rows); return;}
 
@@ -1576,6 +1584,60 @@ function renderBreakout(rows){
     h+='<td>'+r.price+'</td></tr>';
   }
   if(top.length===0) h+='<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:20px">暂无动量突破信号</td></tr>';
+  h+='</tbody></table>';
+  document.getElementById('main').innerHTML=h;
+}
+
+function renderMomentumReflow(payload){
+  payload=payload&&typeof payload==='object'?payload:{};
+  var rows=Array.isArray(payload.rows)?payload.rows:[];
+  var dailyLabel={
+    strong_momentum:'\u5f3a\u52a8\u80fd\u65e5K',
+    bullish_engulfing:'\u770b\u6da8\u541e\u6ca1',
+    bearish_engulfing:'\u770b\u8dcc\u541e\u6ca1',
+    hammer:'\u9524\u5b50\u7ebf',
+    shooting_star:'\u6d41\u661f\u7ebf',
+    morning_star:'\u65e9\u6668\u4e4b\u661f',
+    evening_star:'\u9ec4\u660f\u4e4b\u661f',
+    bottom_fractal:'\u5e95\u5206\u578b',
+    top_fractal:'\u9876\u5206\u578b'
+  };
+  function count(value){
+    var n=finiteRNumber(value);
+    return n===null?'--':String(Math.max(0,Math.trunc(n)));
+  }
+  function atr(value){
+    var n=finiteRNumber(value);
+    return n===null?'--':Math.abs(n).toFixed(2)+' ATR';
+  }
+  function price(value){
+    var n=finiteRNumber(value);
+    return n===null?'--':n.toFixed(6).replace(/\.?(0+)$/,'');
+  }
+  function volume(value){
+    var n=finiteRNumber(value);
+    return n===null?'--':n.toFixed(1)+'x';
+  }
+  document.getElementById('stats').innerHTML=
+    '<div class="stat-bar"><span class="stat-bar-item"><span class="stat-bar-label">候选</span> <b class="c">'+rows.length+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">扫描</span> <b>'+count(payload.scanned)+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">错误</span> <b class="r">'+count(payload.errors)+'</b></span><span class="stat-bar-sep"></span><span class="stat-bar-item"><span class="stat-bar-label">初始化</span> <b class="g">'+count(payload.initialized)+'</b></span></div>';
+  if(!rows.length){
+    document.getElementById('main').innerHTML='<div class="empty-state"><div class="ic-empty"></div><h3>暂无首次回流候选</h3><p>等待 EMA50 强势突破、扩张与日线确认后首次回踩。</p></div>';
+    return;
+  }
+  var h='<table><thead><tr><th>#</th><th>方向</th><th>交易对</th><th>价格</th><th>EMA50</th><th>收盘距离</th><th>窗口</th><th>最大扩张</th><th>日线确认</th><th>突破量比</th></tr></thead><tbody>';
+  for(var i=0;i<rows.length;i++){
+    var row=rows[i]&&typeof rows[i]==='object'?rows[i]:{};
+    var isLong=row.direction==='LONG';
+    var direction=isLong?'LONG':row.direction==='SHORT'?'SHORT':'--';
+    var tone=isLong?'g':direction==='SHORT'?'r':'';
+    var symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol);
+    var visibleSymbol=escapeRHtml(symbol.replace('USDT',''))||'--';
+    var daily=dailyLabel[row.daily_kind]||row.daily_kind||'--';
+    var windowIndex=finiteRNumber(row.window_index);
+    var window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5';
+    h+='<tr><td>'+(i+1)+'</td><td class="'+tone+'" style="font-weight:800">'+direction+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="复制"></span> <b>'+visibleSymbol+'</b></td>';
+    h+='<td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td class="'+tone+'">'+atr(row.close_distance_atr)+'</td><td>'+window+'</td><td>'+atr(row.max_expansion_atr)+'</td><td>'+escapeRHtml(daily)+'</td><td>'+volume(row.breakout_volume_ratio)+'</td></tr>';
+  }
   h+='</tbody></table>';
   document.getElementById('main').innerHTML=h;
 }
@@ -3532,6 +3594,8 @@ def do_funding():
 
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
+    if mode == "reflow" and interval != "1h":
+        return jsonify({"error":"reflow only supports 1h"}), 400
     # 如果扫描超过120秒, 强制解锁
     if state["scanning"]:
         if time.time() - state.get("_scan_start", 0) > 120:
@@ -3540,14 +3604,23 @@ def do_scan(mode, interval):
             return jsonify({"scanning":True,"status":"扫描中..."})
     key = f"{mode}_{interval}"
     state["_scan_start"] = time.time()
+    state["progress"] = ""
     def run():
         try:
             state["scanning"]=True; state["text"]=f"{mode} {interval} 扫描中"
             if mode=="diverge": cache[key]=scan_divergence(interval)
             elif mode=="breakout": cache[key]=scan_breakout(interval)
+            elif mode == "reflow" and interval == "1h":
+                cache[key] = scan_momentum_reflow(
+                    MOMENTUM_REFLOW_LEDGER,
+                    progress=lambda completed, total: state.update(
+                        progress=f"{completed}/{total}"
+                    ),
+                )
             else: cache[key]=scan(interval, mode, 5)
             state["time"]=bj_now().strftime("%H:%M:%S")
-            state["text"]=f"完成: {len(cache[key])} 结果"
+            result_count=len(cache[key].get("rows", [])) if mode == "reflow" else len(cache[key])
+            state["text"]=f"完成: {result_count} 结果"
         except Exception as e: state["text"]=str(e)[:80]
         finally: state["scanning"]=False
     threading.Thread(target=run,daemon=True).start()
