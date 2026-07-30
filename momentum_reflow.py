@@ -5,9 +5,20 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
+import requests
+
+from screener import (
+    MIN_PRICE,
+    MIN_VOLUME,
+    fetch_klines,
+    fetch_klines_range,
+    is_tradfi_or_junk,
+)
 
 EMA_PERIOD = 50
 ATR_PERIOD = 14
@@ -21,6 +32,8 @@ TOUCH_ZONE_ATR = 0.2
 CLOSE_DISTANCE_ATR = 0.35
 RETURN_WINDOW_BARS = 5
 LEDGER_VERSION = 1
+FUTURES_BASE = "https://fapi.binance.com"
+HOUR_MS = 3_600_000
 
 
 def _true_range(frame: pd.DataFrame) -> pd.Series:
@@ -352,3 +365,180 @@ def save_ledger(path: Path, ledger: dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def fetch_futures_universe() -> tuple[list[str], dict[str, float]]:
+    exchange_response = requests.get(
+        f"{FUTURES_BASE}/fapi/v1/exchangeInfo", timeout=10
+    )
+    exchange_response.raise_for_status()
+    ticker_response = requests.get(
+        f"{FUTURES_BASE}/fapi/v1/ticker/24hr", timeout=10
+    )
+    ticker_response.raise_for_status()
+    volume = {
+        row["symbol"]: float(row["quoteVolume"])
+        for row in ticker_response.json()
+        if row.get("symbol") and row.get("quoteVolume") is not None
+    }
+    symbols = [
+        row["symbol"]
+        for row in exchange_response.json().get("symbols", [])
+        if row.get("quoteAsset") == "USDT"
+        and row.get("contractType") == "PERPETUAL"
+        and row.get("status") == "TRADING"
+        and not is_tradfi_or_junk(row.get("symbol", ""))
+        and volume.get(row.get("symbol", ""), 0.0) >= MIN_VOLUME
+    ]
+    return symbols, volume
+
+
+def _validate_hourly_history(frame: pd.DataFrame) -> pd.DataFrame:
+    required = {"ot", "o", "h", "l", "c", "v"}
+    if not isinstance(frame, pd.DataFrame) or frame.empty or not required.issubset(frame):
+        raise ValueError("hourly candle history is unavailable")
+    open_times = pd.to_numeric(frame["ot"], errors="raise")
+    if (open_times.diff().iloc[1:] != HOUR_MS).any():
+        raise ValueError("hourly candle history is incomplete")
+    return frame.copy()
+
+
+def _active_ledger_symbols(ledger: dict) -> set[str]:
+    terminal = {"CONSUMED", "INVALIDATED"}
+    return {
+        symbol
+        for symbol, state in ledger["symbols"].items()
+        if isinstance(state.get("event"), dict)
+        and state["event"].get("state") not in terminal
+    }
+
+
+def _scan_symbol(symbol: str, old_state: dict, existing: bool) -> tuple[dict, dict | None, bool]:
+    if existing:
+        cursor = int(old_state.get("last_processed_open_time", -1))
+        hourly = fetch_klines_range(
+            symbol,
+            "1h",
+            max(0, cursor - 60 * HOUR_MS),
+            exchange="binance",
+            market_type="futures",
+            testnet=False,
+        )
+    else:
+        hourly = fetch_klines(
+            symbol,
+            "1h",
+            1000,
+            exchange="binance",
+            closed_only=True,
+            market_type="futures",
+            testnet=False,
+        )
+
+    hourly = _validate_hourly_history(hourly).sort_values("ot").reset_index(drop=True)
+    latest_price = float(hourly.iloc[-1]["c"])
+    if not existing and latest_price < MIN_PRICE:
+        return old_state, None, False
+
+    daily = fetch_klines(
+        symbol,
+        "1d",
+        40,
+        exchange="binance",
+        closed_only=True,
+        market_type="futures",
+        testnet=False,
+    )
+    if not isinstance(daily, pd.DataFrame) or daily.empty:
+        raise ValueError("daily candle history is unavailable")
+
+    indicated = add_hourly_indicators(hourly)
+    indicated = indicated[indicated.apply(_indicator_row_is_finite, axis=1)].reset_index(drop=True)
+    if indicated.empty:
+        raise ValueError("hourly candle history lacks indicator context")
+    proposed_state, candidate = advance_symbol(symbol, old_state, indicated)
+    if candidate is None:
+        return proposed_state, None, not existing
+
+    confirmation = daily_confirmation(daily, candidate["direction"])
+    if not confirmation["passed"]:
+        return proposed_state, None, not existing
+
+    candidate_time = candidate["return_open_time"]
+    current = indicated[indicated["ot"] == candidate_time]
+    if current.empty:
+        raise ValueError("candidate candle is outside hourly context")
+    row = current.iloc[-1]
+    event = proposed_state["event"]
+    return (
+        proposed_state,
+        {
+            "symbol": symbol,
+            "direction": candidate["direction"],
+            "price": float(row["c"]),
+            "ema50": float(row["ema50"]),
+            "close_distance_atr": float(_close_distance_atr(row)),
+            "window_index": int(candidate["window_index"]),
+            "breakout_time": int(event["breakout_open_time"]),
+            "max_expansion_atr": float(event["max_expansion_atr"]),
+            "daily_kind": confirmation["kind"],
+            "daily_rank": int(confirmation["rank"]),
+            "breakout_volume_ratio": float(event["breakout_volume_ratio"]),
+        },
+        not existing,
+    )
+
+
+def scan_momentum_reflow(
+    ledger_path: Path,
+    progress: Callable[[int, int], None] | None = None,
+    max_workers: int = 12,
+) -> dict:
+    ledger = load_ledger(ledger_path)
+    eligible_symbols, _ = fetch_futures_universe()
+    symbols = sorted(set(eligible_symbols) | _active_ledger_symbols(ledger))
+    rows: list[dict] = []
+    errors = 0
+    initialized = 0
+    workers = min(12, max(1, max_workers))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _scan_symbol,
+                symbol,
+                copy.deepcopy(ledger["symbols"].get(symbol, {})),
+                symbol in ledger["symbols"],
+            ): symbol
+            for symbol in symbols
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            symbol = futures[future]
+            try:
+                proposed_state, candidate, was_initialized = future.result()
+            except Exception:
+                errors += 1
+            else:
+                if was_initialized:
+                    initialized += 1
+                if proposed_state:
+                    ledger["symbols"][symbol] = proposed_state
+                if candidate is not None:
+                    rows.append(candidate)
+            if progress is not None:
+                progress(completed, len(symbols))
+
+    rows.sort(
+        key=lambda row: (
+            abs(row["close_distance_atr"]),
+            -row["daily_rank"],
+            -row["breakout_volume_ratio"],
+        )
+    )
+    save_ledger(ledger_path, ledger)
+    return {
+        "rows": rows[:80],
+        "scanned": len(symbols),
+        "errors": errors,
+        "initialized": initialized,
+    }

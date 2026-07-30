@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,9 @@ from momentum_reflow import (
     add_hourly_indicators,
     advance_symbol,
     daily_confirmation,
+    fetch_futures_universe,
     load_ledger,
+    scan_momentum_reflow,
     save_ledger,
 )
 
@@ -377,6 +379,135 @@ class ReflowLedgerTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     save_ledger(path, {"version": 1, "symbols": {"X": {}}})
             self.assertEqual(load_ledger(path), original)
+
+
+def make_closed_hourly_history(symbol):
+    count = 100
+    close = np.linspace(90.0, 100.0, count)
+    return pd.DataFrame({
+        "ot": (BASE_OT + HOUR_MS) - np.arange(count - 1, -1, -1) * HOUR_MS,
+        "o": close - 0.05,
+        "h": close + 0.10,
+        "l": close - 0.10,
+        "c": close,
+        "v": np.full(count, 100.0),
+    })
+
+
+def make_closed_daily_history(symbol):
+    count = 40
+    close = np.full(count, 100.0)
+    frame = pd.DataFrame({
+        "ot": np.arange(count, dtype=np.int64) * 86_400_000,
+        "o": close.copy(),
+        "h": close + 1.0,
+        "l": close - 1.0,
+        "c": close.copy(),
+        "v": np.full(count, 100.0),
+    })
+    frame.loc[frame.index[-1], ["o", "h", "l", "c", "v"]] = [
+        100.0, 112.0, 99.0, 111.0, 300.0
+    ]
+    return frame
+
+
+class ReflowScanServiceTests(unittest.TestCase):
+    @patch("momentum_reflow.requests.get")
+    def test_universe_uses_fapi_usdt_perpetual_contracts(self, get):
+        exchange = Mock()
+        exchange.raise_for_status.return_value = None
+        exchange.json.return_value = {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "quoteAsset": "USDT",
+                    "contractType": "PERPETUAL",
+                    "status": "TRADING",
+                },
+                {
+                    "symbol": "BTCUSDC",
+                    "quoteAsset": "USDC",
+                    "contractType": "PERPETUAL",
+                    "status": "TRADING",
+                },
+            ]
+        }
+        ticker = Mock()
+        ticker.raise_for_status.return_value = None
+        ticker.json.return_value = [{"symbol": "BTCUSDT", "quoteVolume": "9000000"}]
+        get.side_effect = [exchange, ticker]
+        symbols, volume = fetch_futures_universe()
+        self.assertEqual(symbols, ["BTCUSDT"])
+        self.assertEqual(volume["BTCUSDT"], 9_000_000.0)
+        self.assertIn("/fapi/v1/exchangeInfo", get.call_args_list[0].args[0])
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_active_ledger_symbol_is_scanned_below_current_volume_filter(
+        self, universe, latest, ranged
+    ):
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        latest.side_effect = lambda symbol, interval, *args, **kwargs: (
+            make_closed_hourly_history(symbol)
+            if interval == "1h"
+            else make_closed_daily_history(symbol)
+        )
+        ranged.side_effect = lambda symbol, *args, **kwargs: make_closed_hourly_history(symbol)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {
+                "version": 1,
+                "symbols": {"OLDUSDT": make_waiting_state("LONG")},
+            })
+            payload = scan_momentum_reflow(path, max_workers=1)
+        requested = {call.args[0] for call in latest.call_args_list + ranged.call_args_list}
+        self.assertEqual(requested, {"NEWUSDT", "OLDUSDT"})
+        self.assertEqual(payload["scanned"], 2)
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_gap_failure_preserves_symbol_state_and_cursor(self, universe, latest, ranged):
+        universe.return_value = ([], {})
+        original = make_waiting_state("LONG")
+        gapped = make_closed_hourly_history("TESTUSDT")
+        gapped = gapped.drop(gapped.index[-2]).reset_index(drop=True)
+        ranged.return_value = gapped
+        latest.return_value = make_closed_daily_history("TESTUSDT")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {
+                "version": 1,
+                "symbols": {"TESTUSDT": original},
+            })
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["errors"], 1)
+        self.assertEqual(saved["symbols"]["TESTUSDT"], original)
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_failed_daily_confirmation_keeps_active_return_window(self, universe, latest, ranged):
+        universe.return_value = ([], {})
+        hourly = make_closed_hourly_history("TESTUSDT")
+        prior_ema = add_hourly_indicators(hourly.iloc[:-1]).iloc[-1]["ema50"]
+        hourly.loc[hourly.index[-1], ["o", "h", "l", "c"]] = [
+            prior_ema, prior_ema + 0.1, prior_ema - 0.1, prior_ema
+        ]
+        daily = make_closed_daily_history("TESTUSDT")
+        daily.loc[daily.index[-1], ["o", "h", "l", "c", "v"]] = [100, 101, 99, 100, 100]
+        ranged.return_value = hourly
+        latest.return_value = daily
+        active = make_waiting_state("LONG")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": active}})
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["rows"], [])
+        self.assertEqual(saved["symbols"]["TESTUSDT"]["event"]["state"], "RETURN_WINDOW")
 
 
 if __name__ == "__main__":
