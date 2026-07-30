@@ -2,7 +2,7 @@
 AXIOM QUANT — 独立管理后台
 端口 5001 | 开发者专用 | 不依赖交易引擎
 """
-import account_manager as accounts, json, os, time
+import account_manager as accounts, json, math, os, time
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, session
 from functools import wraps
@@ -138,9 +138,40 @@ _WEB_UI = "http://127.0.0.1:5000"
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REFLOW_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_settings.json"
 
+def _normalize_reflow_scheduler_status(scheduler):
+    if not isinstance(scheduler, dict):
+        raise ValueError("scheduler status must be an object")
+    status = {}
+    for field in ("last_auto_scan_at", "next_scan_at"):
+        value = scheduler.get(field, 0)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{field} must be a finite nonnegative number")
+        status[field] = value
+    last_error = scheduler.get("last_auto_error", "")
+    if type(last_error) is not str:
+        raise ValueError("last_auto_error must be a string")
+    scheduler_status = scheduler.get("scheduler_status", "available")
+    if type(scheduler_status) is not str:
+        raise ValueError("scheduler_status must be a string")
+    running = scheduler.get("running", False)
+    if type(running) is not bool:
+        raise ValueError("running must be a boolean")
+    return {
+        **status,
+        "last_auto_error": last_error,
+        "scheduler_status": scheduler_status,
+        "running": running,
+    }
+
 @app.route("/api/reflow/settings", methods=["GET", "POST"])
 @admin_required
 def api_reflow_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
     if request.method == "POST":
         data = request.get_json(silent=True)
         enabled = data.get("auto_scan_enabled") if isinstance(data, dict) else None
@@ -161,14 +192,7 @@ def api_reflow_settings():
         )
         response.raise_for_status()
         scheduler = response.json()
-        if not isinstance(scheduler, dict):
-            raise ValueError("scheduler status must be an object")
-        status = {
-            "last_auto_scan_at": scheduler.get("last_auto_scan_at", 0),
-            "next_scan_at": scheduler.get("next_scan_at", 0),
-            "last_auto_error": scheduler.get("last_auto_error", ""),
-            "scheduler_status": scheduler.get("scheduler_status", "available"),
-        }
+        status = _normalize_reflow_scheduler_status(scheduler)
     except Exception:
         status = {"scheduler_status": "unavailable"}
     return jsonify({**settings, **status})
@@ -387,6 +411,11 @@ function renderFuel(el){
     h+='</tbody></table></div>';el.innerHTML=h;
   });
 }
+var _reflowRenderGeneration=0;
+function isCurrentReflowRender(generation, box){
+  return generation===_reflowRenderGeneration &&
+    document.getElementById('reflowAutoEnabled')===box;
+}
 function formatReflowTime(value){
   var timestamp=Number(value);
   if(!Number.isFinite(timestamp)||timestamp<=0) return '--';
@@ -396,6 +425,7 @@ function formatReflowTime(value){
   }).format(new Date(timestamp));
 }
 function renderReflow(el){
+  var generation=++_reflowRenderGeneration;
   el.innerHTML='<div class="card" style="max-width:760px">'+
     '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
       '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">动能回流自动扫描</h3>'+
@@ -415,6 +445,7 @@ function renderReflow(el){
     '<p style="color:var(--muted);font-size:12px;line-height:1.7;margin-top:18px">关闭自动扫描不会删除历史记录，手动扫描仍可使用。</p>'+
   '</div>';
   var box=document.getElementById('reflowAutoEnabled');
+  box.dataset.renderGeneration=String(generation);
   box.disabled=true;
   fetch('/api/reflow/settings').then(function(response){
     return response.json().then(function(data){
@@ -422,6 +453,7 @@ function renderReflow(el){
       return data;
     });
   }).then(function(data){
+    if(!isCurrentReflowRender(generation,box)) return;
     box.checked=Boolean(data.auto_scan_enabled);
     box.dataset.savedChecked=String(box.checked);
     box.disabled=false;
@@ -434,6 +466,7 @@ function renderReflow(el){
       (data.scheduler_status==='unavailable'?'调度状态不可用':'无');
     box.onchange=saveReflowSetting;
   }).catch(function(reason){
+    if(!isCurrentReflowRender(generation,box)) return;
     var error=document.getElementById('reflowSaveError');
     error.style.display='block';
     error.textContent=reason.message||'读取设置失败';
@@ -442,6 +475,7 @@ function renderReflow(el){
 function saveReflowSetting(){
   var box=document.getElementById('reflowAutoEnabled');
   var error=document.getElementById('reflowSaveError');
+  var generation=Number(box.dataset.renderGeneration);
   var previous=box.dataset.savedChecked==='true';
   error.style.display='none';
   error.textContent='';
@@ -456,16 +490,19 @@ function saveReflowSetting(){
       return data;
     });
   }).then(function(data){
+    if(!isCurrentReflowRender(generation,box)) return;
     box.checked=Boolean(data.auto_scan_enabled);
     box.dataset.savedChecked=String(box.checked);
     document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
     document.getElementById('reflowUpdatedAt').textContent=formatReflowTime(data.updated_at);
     document.getElementById('reflowUpdatedBy').textContent=data.updated_by||'--';
   }).catch(function(reason){
+    if(!isCurrentReflowRender(generation,box)) return;
     box.checked=previous;
     error.style.display='block';
     error.textContent=reason.message||'保存失败';
   }).finally(function(){
+    if(!isCurrentReflowRender(generation,box)) return;
     box.disabled=false;
   });
 }
