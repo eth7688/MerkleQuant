@@ -609,6 +609,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             {"symbol": "BEARUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
             {"symbol": "UPUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
             {"symbol": "DOWNUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
+            {"symbol": "SUPERUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"},
         ]}
         ticker = Mock()
         ticker.raise_for_status.return_value = None
@@ -620,8 +621,8 @@ class ReflowScanServiceTests(unittest.TestCase):
 
         symbols, _, types = fetch_futures_universe()
 
-        self.assertEqual(symbols, [])
-        self.assertEqual(types, {})
+        self.assertEqual(symbols, ["SUPERUSDT"])
+        self.assertEqual(types, {"SUPERUSDT": "CRYPTO"})
 
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")

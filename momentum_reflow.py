@@ -390,7 +390,7 @@ def classify_futures_contract(row: dict) -> str | None:
     underlying_type = str(row.get("underlyingType", "")).upper()
     if row.get("quoteAsset") != "USDT" or row.get("status") != "TRADING":
         return None
-    if base in STABLE_BASE_ASSETS or any(marker in base for marker in LEVERAGED_MARKERS):
+    if base in STABLE_BASE_ASSETS or base.endswith(LEVERAGED_MARKERS):
         return None
     if underlying_type in BLOCKED_EQUITY_TYPES:
         return None
