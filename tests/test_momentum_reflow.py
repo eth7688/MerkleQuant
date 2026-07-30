@@ -411,6 +411,15 @@ def make_closed_daily_history(symbol):
     return frame
 
 
+def make_return_window_hourly_history(symbol):
+    hourly = make_closed_hourly_history(symbol)
+    prior_ema = add_hourly_indicators(hourly.iloc[:-1]).iloc[-1]["ema50"]
+    hourly.loc[hourly.index[-1], ["o", "h", "l", "c"]] = [
+        prior_ema, prior_ema + 0.1, prior_ema - 0.1, prior_ema
+    ]
+    return hourly
+
+
 class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.requests.get")
     def test_universe_uses_fapi_usdt_perpetual_contracts(self, get):
@@ -489,13 +498,153 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
+    def test_leading_gap_after_cursor_preserves_symbol_state(self, universe, latest, ranged):
+        universe.return_value = ([], {})
+        original = make_waiting_state("LONG")
+        leading_gap = make_closed_hourly_history("TESTUSDT")
+        leading_gap["ot"] = BASE_OT + 2 * HOUR_MS + np.arange(len(leading_gap)) * HOUR_MS
+        ranged.return_value = leading_gap
+        latest.return_value = make_closed_daily_history("TESTUSDT")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": original}})
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["errors"], 1)
+        self.assertEqual(saved["symbols"]["TESTUSDT"], original)
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_incremental_fetches_use_futures_mainnet_and_closed_candles(
+        self, universe, latest, ranged
+    ):
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        latest.side_effect = lambda symbol, interval, *args, **kwargs: (
+            make_closed_hourly_history(symbol)
+            if interval == "1h"
+            else make_closed_daily_history(symbol)
+        )
+        ranged.return_value = make_return_window_hourly_history("OLDUSDT")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {
+                "version": 1,
+                "symbols": {"OLDUSDT": make_waiting_state("LONG")},
+            })
+            scan_momentum_reflow(path, max_workers=1)
+        latest.assert_any_call(
+            "NEWUSDT", "1h", 1000, exchange="binance", closed_only=True,
+            market_type="futures", testnet=False,
+        )
+        latest.assert_any_call(
+            "OLDUSDT", "1d", 40, exchange="binance", closed_only=True,
+            market_type="futures", testnet=False,
+        )
+        ranged.assert_called_once_with(
+            "OLDUSDT", "1h", 40 * HOUR_MS, exchange="binance",
+            market_type="futures", testnet=False,
+        )
+
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_low_price_new_symbol_is_not_initialized(self, universe, latest):
+        universe.return_value = (["LOWUSDT"], {"LOWUSDT": 9_000_000.0})
+        low_price = make_closed_hourly_history("LOWUSDT")
+        low_price.loc[:, ["o", "h", "l", "c"]] = 0.0005
+        latest.return_value = low_price
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["initialized"], 0)
+        self.assertEqual(saved["symbols"], {})
+        self.assertEqual(latest.call_count, 1)
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_no_candidate_advances_state_without_daily_data(self, universe, latest, ranged):
+        universe.return_value = ([], {})
+        ranged.return_value = make_closed_hourly_history("TESTUSDT")
+        latest.side_effect = AssertionError("daily fetch must not run")
+        original = make_waiting_state("LONG")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {"version": 1, "symbols": {"TESTUSDT": original}})
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["errors"], 0)
+        self.assertEqual(saved["symbols"]["TESTUSDT"]["last_processed_open_time"], BASE_OT + HOUR_MS)
+        latest.assert_not_called()
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_daily_outage_preserves_proposed_active_state(self, universe, latest, ranged):
+        universe.return_value = ([], {})
+        ranged.return_value = make_return_window_hourly_history("TESTUSDT")
+        latest.side_effect = OSError("daily unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            save_ledger(path, {
+                "version": 1,
+                "symbols": {"TESTUSDT": make_waiting_state("LONG")},
+            })
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["errors"], 1)
+        self.assertEqual(payload["rows"], [])
+        self.assertEqual(saved["symbols"]["TESTUSDT"]["event"]["state"], "RETURN_WINDOW")
+
+    @patch("momentum_reflow.save_ledger", wraps=save_ledger)
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_progress_reports_each_worker_and_ledger_saves_once(
+        self, universe, latest, saved
+    ):
+        universe.return_value = (["AAAUSDT", "BBBUSDT"], {})
+        latest.return_value = make_closed_hourly_history("ANYUSDT")
+        progress = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            scan_momentum_reflow(path, progress=progress, max_workers=1)
+        self.assertEqual(progress.call_args_list, [((1, 2),), ((2, 2),)])
+        saved.assert_called_once()
+
+    @patch("momentum_reflow._scan_symbol")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_rows_sort_by_required_keys_and_truncate_to_eighty(self, universe, worker):
+        symbols = ["AUSDT", "BUSDT", "CUSDT"] + [f"X{index:02d}USDT" for index in range(78)]
+        universe.return_value = (symbols, {})
+        candidates = {
+            "AUSDT": {"close_distance_atr": 1.0, "daily_rank": 1, "breakout_volume_ratio": 9.0},
+            "BUSDT": {"close_distance_atr": 1.0, "daily_rank": 2, "breakout_volume_ratio": 1.0},
+            "CUSDT": {"close_distance_atr": 1.0, "daily_rank": 2, "breakout_volume_ratio": 2.0},
+        }
+        for index in range(78):
+            candidates[f"X{index:02d}USDT"] = {
+                "close_distance_atr": float(index + 2),
+                "daily_rank": 1,
+                "breakout_volume_ratio": 1.0,
+            }
+
+        def result(symbol, old_state, existing):
+            return {}, {"symbol": symbol, **candidates[symbol]}, False, False
+
+        worker.side_effect = result
+        with tempfile.TemporaryDirectory() as directory:
+            payload = scan_momentum_reflow(Path(directory) / "ledger.json", max_workers=1)
+        self.assertEqual([row["symbol"] for row in payload["rows"][:3]], ["CUSDT", "BUSDT", "AUSDT"])
+        self.assertEqual(len(payload["rows"]), 80)
+        self.assertEqual(payload["rows"][-1]["symbol"], "X76USDT")
+
+    @patch("momentum_reflow.fetch_klines_range")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
     def test_failed_daily_confirmation_keeps_active_return_window(self, universe, latest, ranged):
         universe.return_value = ([], {})
-        hourly = make_closed_hourly_history("TESTUSDT")
-        prior_ema = add_hourly_indicators(hourly.iloc[:-1]).iloc[-1]["ema50"]
-        hourly.loc[hourly.index[-1], ["o", "h", "l", "c"]] = [
-            prior_ema, prior_ema + 0.1, prior_ema - 0.1, prior_ema
-        ]
+        hourly = make_return_window_hourly_history("TESTUSDT")
         daily = make_closed_daily_history("TESTUSDT")
         daily.loc[daily.index[-1], ["o", "h", "l", "c", "v"]] = [100, 101, 99, 100, 100]
         ranged.return_value = hourly

@@ -393,13 +393,19 @@ def fetch_futures_universe() -> tuple[list[str], dict[str, float]]:
     return symbols, volume
 
 
-def _validate_hourly_history(frame: pd.DataFrame) -> pd.DataFrame:
+def _validate_hourly_history(
+    frame: pd.DataFrame, cursor: int | None = None
+) -> pd.DataFrame:
     required = {"ot", "o", "h", "l", "c", "v"}
     if not isinstance(frame, pd.DataFrame) or frame.empty or not required.issubset(frame):
         raise ValueError("hourly candle history is unavailable")
     open_times = pd.to_numeric(frame["ot"], errors="raise")
     if (open_times.diff().iloc[1:] != HOUR_MS).any():
         raise ValueError("hourly candle history is incomplete")
+    if cursor is not None:
+        newer = open_times[open_times > cursor]
+        if not newer.empty and int(newer.iloc[0]) != cursor + HOUR_MS:
+            raise ValueError("hourly candle history has a leading gap")
     return frame.copy()
 
 
@@ -413,7 +419,9 @@ def _active_ledger_symbols(ledger: dict) -> set[str]:
     }
 
 
-def _scan_symbol(symbol: str, old_state: dict, existing: bool) -> tuple[dict, dict | None, bool]:
+def _scan_symbol(
+    symbol: str, old_state: dict, existing: bool
+) -> tuple[dict, dict | None, bool, bool]:
     if existing:
         cursor = int(old_state.get("last_processed_open_time", -1))
         hourly = fetch_klines_range(
@@ -435,22 +443,12 @@ def _scan_symbol(symbol: str, old_state: dict, existing: bool) -> tuple[dict, di
             testnet=False,
         )
 
-    hourly = _validate_hourly_history(hourly).sort_values("ot").reset_index(drop=True)
+    hourly = _validate_hourly_history(
+        hourly, cursor if existing else None
+    ).sort_values("ot").reset_index(drop=True)
     latest_price = float(hourly.iloc[-1]["c"])
     if not existing and latest_price < MIN_PRICE:
-        return old_state, None, False
-
-    daily = fetch_klines(
-        symbol,
-        "1d",
-        40,
-        exchange="binance",
-        closed_only=True,
-        market_type="futures",
-        testnet=False,
-    )
-    if not isinstance(daily, pd.DataFrame) or daily.empty:
-        raise ValueError("daily candle history is unavailable")
+        return old_state, None, False, False
 
     indicated = add_hourly_indicators(hourly)
     indicated = indicated[indicated.apply(_indicator_row_is_finite, axis=1)].reset_index(drop=True)
@@ -458,11 +456,25 @@ def _scan_symbol(symbol: str, old_state: dict, existing: bool) -> tuple[dict, di
         raise ValueError("hourly candle history lacks indicator context")
     proposed_state, candidate = advance_symbol(symbol, old_state, indicated)
     if candidate is None:
-        return proposed_state, None, not existing
+        return proposed_state, None, not existing, False
 
-    confirmation = daily_confirmation(daily, candidate["direction"])
+    try:
+        daily = fetch_klines(
+            symbol,
+            "1d",
+            40,
+            exchange="binance",
+            closed_only=True,
+            market_type="futures",
+            testnet=False,
+        )
+        if not isinstance(daily, pd.DataFrame) or daily.empty:
+            raise ValueError("daily candle history is unavailable")
+        confirmation = daily_confirmation(daily, candidate["direction"])
+    except Exception:
+        return proposed_state, None, not existing, True
     if not confirmation["passed"]:
-        return proposed_state, None, not existing
+        return proposed_state, None, not existing, False
 
     candidate_time = candidate["return_open_time"]
     current = indicated[indicated["ot"] == candidate_time]
@@ -486,6 +498,7 @@ def _scan_symbol(symbol: str, old_state: dict, existing: bool) -> tuple[dict, di
             "breakout_volume_ratio": float(event["breakout_volume_ratio"]),
         },
         not existing,
+        False,
     )
 
 
@@ -515,10 +528,12 @@ def scan_momentum_reflow(
         for completed, future in enumerate(as_completed(futures), start=1):
             symbol = futures[future]
             try:
-                proposed_state, candidate, was_initialized = future.result()
+                proposed_state, candidate, was_initialized, worker_error = future.result()
             except Exception:
                 errors += 1
             else:
+                if worker_error:
+                    errors += 1
                 if was_initialized:
                     initialized += 1
                 if proposed_state:
