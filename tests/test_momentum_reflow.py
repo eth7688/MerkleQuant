@@ -581,21 +581,42 @@ class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
-    def test_daily_outage_preserves_proposed_active_state(self, universe, latest, ranged):
+    def test_daily_outage_preserves_exact_old_state(self, universe, latest, ranged):
         universe.return_value = ([], {})
         ranged.return_value = make_return_window_hourly_history("TESTUSDT")
         latest.side_effect = OSError("daily unavailable")
+        original = make_waiting_state("LONG")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"
             save_ledger(path, {
                 "version": 1,
-                "symbols": {"TESTUSDT": make_waiting_state("LONG")},
+                "symbols": {"TESTUSDT": original},
             })
             payload = scan_momentum_reflow(path, max_workers=1)
             saved = load_ledger(path)
         self.assertEqual(payload["errors"], 1)
         self.assertEqual(payload["rows"], [])
-        self.assertEqual(saved["symbols"]["TESTUSDT"]["event"]["state"], "RETURN_WINDOW")
+        self.assertEqual(saved["symbols"]["TESTUSDT"], original)
+
+    @patch("momentum_reflow.advance_symbol")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_new_symbol_daily_outage_is_not_initialized_or_persisted(
+        self, universe, latest, advance
+    ):
+        universe.return_value = (["NEWUSDT"], {"NEWUSDT": 9_000_000.0})
+        latest.side_effect = [make_closed_hourly_history("NEWUSDT"), OSError("daily unavailable")]
+        advance.return_value = (
+            {"last_processed_open_time": BASE_OT + HOUR_MS, "event": {}},
+            {"direction": "LONG", "return_open_time": BASE_OT + HOUR_MS},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+        self.assertEqual(payload["errors"], 1)
+        self.assertEqual(payload["initialized"], 0)
+        self.assertEqual(saved["symbols"], {})
 
     @patch("momentum_reflow.save_ledger", wraps=save_ledger)
     @patch("momentum_reflow.fetch_klines")
@@ -656,6 +677,7 @@ class ReflowScanServiceTests(unittest.TestCase):
             payload = scan_momentum_reflow(path, max_workers=1)
             saved = load_ledger(path)
         self.assertEqual(payload["rows"], [])
+        self.assertEqual(payload["errors"], 0)
         self.assertEqual(saved["symbols"]["TESTUSDT"]["event"]["state"], "RETURN_WINDOW")
 
 

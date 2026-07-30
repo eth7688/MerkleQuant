@@ -472,7 +472,7 @@ def _scan_symbol(
             raise ValueError("daily candle history is unavailable")
         confirmation = daily_confirmation(daily, candidate["direction"])
     except Exception:
-        return proposed_state, None, not existing, True
+        return old_state, None, False, True
     if not confirmation["passed"]:
         return proposed_state, None, not existing, False
 
