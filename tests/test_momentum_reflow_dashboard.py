@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from datetime import datetime, timezone
@@ -45,10 +46,24 @@ class ReflowSettingsTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 save_reflow_settings(path, 1, "admin", 123)
 
+    def test_save_rejects_corrupt_existing_settings_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text("{broken", encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(ValueError):
+                save_reflow_settings(path, False, "admin", 123)
+
+            self.assertEqual(path.read_bytes(), original)
+
     def test_failed_atomic_replace_preserves_old_settings(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"
-            original = b'{"previous":true}'
+            original = (
+                b'{"version":1,"auto_scan_enabled":true,'
+                b'"updated_at":100,"updated_by":"admin"}'
+            )
             path.write_bytes(original)
 
             with patch("momentum_reflow_dashboard.os.replace", side_effect=OSError("disk error")):
@@ -133,6 +148,18 @@ class ReflowQualityScoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_reflow_candidate({})
 
+    def test_extremely_large_integer_is_rejected_as_invalid_value(self):
+        row = {
+            "daily_rank": 3,
+            "breakout_volume_ratio": 10 ** 10_000,
+            "max_expansion_atr": 3.0,
+            "close_distance_atr": 0.0,
+            "window_index": 1,
+        }
+
+        with self.assertRaises(ValueError):
+            score_reflow_candidate(row)
+
 
 def milliseconds(value: str) -> int:
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
@@ -142,9 +169,14 @@ def candidate(**overrides) -> dict:
     row = {
         "symbol": "BTCUSDT",
         "direction": "LONG",
+        "instrument_type": "CRYPTO",
         "breakout_time": 100,
+        "breakout_close_time": 3_600_100,
         "return_open_time": 1_000,
+        "price": 100.0,
+        "ema50": 99.0,
         "window_index": 1,
+        "daily_kind": "strong_momentum",
         "daily_rank": 3,
         "breakout_volume_ratio": 3.0,
         "max_expansion_atr": 3.0,
@@ -157,7 +189,7 @@ def candidate(**overrides) -> dict:
 def write_ledger(path: Path, event: dict | None = None) -> None:
     symbols = {} if event is None else {"BTCUSDT": {"event": event}}
     path.write_text(
-        __import__("json").dumps({"version": 1, "symbols": symbols}),
+        json.dumps({"version": 1, "symbols": symbols}),
         encoding="utf-8",
     )
 
@@ -253,7 +285,7 @@ class ReflowDailyHistoryTests(unittest.TestCase):
             merge_reflow_signals(history, ledger, {"rows": []}, day_two)
 
             self.assertEqual(load_reflow_dashboard(history, day_two)["rows"], [])
-            raw = __import__("json").loads(history.read_text(encoding="utf-8"))
+            raw = json.loads(history.read_text(encoding="utf-8"))
             self.assertEqual(len(raw["days"]), 2)
 
     def test_corrupt_history_is_preserved_without_rewrite(self):
@@ -268,6 +300,49 @@ class ReflowDailyHistoryTests(unittest.TestCase):
                 merge_reflow_signals(history, ledger, {"rows": [candidate()]}, 1_000)
 
             self.assertEqual(history.read_bytes(), original)
+
+    def test_incomplete_persisted_signal_is_rejected_without_rewrite(self):
+        with TemporaryDirectory() as folder:
+            history = Path(folder) / "history.json"
+            ledger = Path(folder) / "ledger.json"
+            write_ledger(ledger)
+            merge_reflow_signals(history, ledger, {"rows": [candidate()]}, 1_000)
+            raw = json.loads(history.read_text(encoding="utf-8"))
+            stored = next(iter(raw["days"].values()))["signals"]
+            next(iter(stored.values())).pop("price")
+            history.write_text(json.dumps(raw), encoding="utf-8")
+            original = history.read_bytes()
+
+            with self.assertRaises(ValueError):
+                load_reflow_dashboard(history, 1_000)
+
+            self.assertEqual(history.read_bytes(), original)
+
+    def test_invalid_persisted_enums_and_types_are_rejected_without_rewrite(self):
+        invalid_values = (
+            ("direction", "SIDEWAYS"),
+            ("instrument_type", "BOND"),
+            ("quality_label", "BEST"),
+            ("status", "PENDING"),
+            ("price", "100.0"),
+            ("score_components", []),
+        )
+        for field, value in invalid_values:
+            with self.subTest(field=field), TemporaryDirectory() as folder:
+                history = Path(folder) / "history.json"
+                ledger = Path(folder) / "ledger.json"
+                write_ledger(ledger)
+                merge_reflow_signals(history, ledger, {"rows": [candidate()]}, 1_000)
+                raw = json.loads(history.read_text(encoding="utf-8"))
+                stored = next(iter(raw["days"].values()))["signals"]
+                next(iter(stored.values()))[field] = value
+                history.write_text(json.dumps(raw), encoding="utf-8")
+                original = history.read_bytes()
+
+                with self.assertRaises(ValueError):
+                    load_reflow_dashboard(history, 1_000)
+
+                self.assertEqual(history.read_bytes(), original)
 
     def test_next_scan_targets_the_next_beijing_hour_at_minute_three(self):
         before = datetime(2026, 7, 30, 10, 2, tzinfo=timezone.utc)

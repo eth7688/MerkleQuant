@@ -22,6 +22,23 @@ DAILY_POINTS = {3: 30.0, 2: 24.0, 1: 18.0}
 WINDOW_POINTS = {1: 10.0, 2: 8.0, 3: 6.0, 4: 4.0, 5: 2.0}
 HOUR_MS = 3_600_000
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+INSTRUMENT_TYPES = {"CRYPTO", "COMMODITY", "FX"}
+DIRECTIONS = {"LONG", "SHORT"}
+DAILY_KINDS = {
+    3: {"strong_momentum"},
+    2: {
+        "morning_star",
+        "evening_star",
+        "bullish_engulfing",
+        "bearish_engulfing",
+        "hammer",
+        "shooting_star",
+    },
+    1: {"bottom_fractal", "top_fractal"},
+}
+QUALITY_LABELS = {"HIGH", "STANDARD", "WATCH"}
+SIGNAL_STATUSES = {"ACTIVE", "WINDOW_COMPLETE", "INVALID"}
+SCORE_COMPONENTS = {"daily", "volume", "expansion", "distance", "window"}
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -77,6 +94,8 @@ def save_reflow_settings(
         raise TypeError("updated_by must be a string")
     if type(now_ms) is not int:
         raise TypeError("now_ms must be an integer")
+    if path.exists():
+        _read_settings(path)
     settings = {
         "version": SETTINGS_VERSION,
         "auto_scan_enabled": enabled,
@@ -96,7 +115,7 @@ def _linear(value, start, end, start_points, end_points):
 def _required_finite_float(candidate: dict, field: str) -> float:
     try:
         value = float(candidate[field])
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(f"{field} is required and must be numeric") from error
     if not math.isfinite(value):
         raise ValueError(f"{field} must be finite")
@@ -181,10 +200,7 @@ def _read_history(path: Path) -> dict:
             if not isinstance(key, str) or not isinstance(signal, dict):
                 raise ValueError("momentum reflow history signal shape is invalid")
             try:
-                _require_identity(signal)
-                if key != reflow_signal_key(signal):
-                    raise ValueError("momentum reflow history signal key is invalid")
-                score_reflow_candidate(signal)
+                _validate_persisted_signal(signal)
             except ValueError as error:
                 raise ValueError("momentum reflow history signal is invalid") from error
     return history
@@ -212,10 +228,81 @@ def _require_identity(row: dict) -> None:
     for field in ("symbol", "direction"):
         if not isinstance(row.get(field), str) or not row[field]:
             raise ValueError(f"{field} is required")
+    if row["direction"] not in DIRECTIONS:
+        raise ValueError("direction is invalid")
     for field in ("breakout_time", "return_open_time"):
         value = _required_finite_float(row, field)
         if not value.is_integer():
             raise ValueError(f"{field} must be an integer")
+
+
+def _stored_integer(row: dict, field: str) -> int:
+    value = row.get(field)
+    if type(value) is not int:
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
+def _stored_finite_number(row: dict, field: str) -> float:
+    value = row.get(field)
+    if type(value) not in {int, float} or not math.isfinite(float(value)):
+        raise ValueError(f"{field} must be a finite number")
+    return float(value)
+
+
+def _validate_scan_candidate(row: dict) -> None:
+    _require_identity(row)
+    if row.get("instrument_type") not in INSTRUMENT_TYPES:
+        raise ValueError("instrument_type is invalid")
+    for field in ("breakout_time", "breakout_close_time", "return_open_time"):
+        _stored_integer(row, field)
+    if row["breakout_close_time"] != row["breakout_time"] + HOUR_MS:
+        raise ValueError("breakout_close_time is invalid")
+    for field in (
+        "price",
+        "ema50",
+        "close_distance_atr",
+        "max_expansion_atr",
+        "breakout_volume_ratio",
+    ):
+        _stored_finite_number(row, field)
+    if type(row.get("daily_rank")) is not int or row["daily_rank"] not in DAILY_POINTS:
+        raise ValueError("daily_rank is invalid")
+    if row.get("daily_kind") not in DAILY_KINDS[row["daily_rank"]]:
+        raise ValueError("daily_kind is invalid")
+    if type(row.get("window_index")) is not int or row["window_index"] not in WINDOW_POINTS:
+        raise ValueError("window_index is invalid")
+
+
+def _validate_persisted_signal(row: dict) -> None:
+    _validate_scan_candidate(row)
+    if row.get("signal_key") != reflow_signal_key(row):
+        raise ValueError("signal_key is invalid")
+    if _stored_integer(row, "return_close_time") != row["return_open_time"] + HOUR_MS:
+        raise ValueError("return_close_time is invalid")
+    first_seen_at = _stored_integer(row, "first_seen_at")
+    last_seen_at = _stored_integer(row, "last_seen_at")
+    if first_seen_at > last_seen_at:
+        raise ValueError("signal timestamps are invalid")
+    if type(row.get("quality_score")) is not int or not 0 <= row["quality_score"] <= 100:
+        raise ValueError("quality_score is invalid")
+    if row.get("quality_label") not in QUALITY_LABELS:
+        raise ValueError("quality_label is invalid")
+    components = row.get("score_components")
+    if not isinstance(components, dict) or set(components) != SCORE_COMPONENTS:
+        raise ValueError("score_components are invalid")
+    for name, value in components.items():
+        if type(value) not in {int, float} or not math.isfinite(float(value)):
+            raise ValueError(f"score component {name} is invalid")
+    if row.get("status") not in SIGNAL_STATUSES or not isinstance(row.get("status_reason"), str):
+        raise ValueError("signal status is invalid")
+    expected = score_reflow_candidate(row)
+    if (
+        row["quality_score"] != expected["quality_score"]
+        or row["quality_label"] != expected["quality_label"]
+        or row["score_components"] != expected["score_components"]
+    ):
+        raise ValueError("persisted score is invalid")
 
 
 def _event_keys(ledger: dict) -> dict[str, dict]:
@@ -286,7 +373,7 @@ def merge_reflow_signals(
     signals = history["days"].setdefault(day, {"signals": {}})["signals"]
 
     for candidate in scan_result["rows"]:
-        _require_identity(candidate)
+        _validate_scan_candidate(candidate)
         key = reflow_signal_key(candidate)
         existing = signals.get(key)
         scored = score_reflow_candidate(candidate)
