@@ -578,18 +578,27 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_reflow_volume_boundary_is_inclusive(self, get):
         contracts = Mock()
         contracts.raise_for_status.return_value = None
-        contracts.json.return_value = {"data": [{
-            "symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT",
-            "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO",
-        }]}
+        contracts.json.return_value = {"data": [
+            {
+                "symbol": "PASSUSDT", "baseCoin": "PASS", "quoteCoin": "USDT",
+                "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO",
+            },
+            {
+                "symbol": "FAILUSDT", "baseCoin": "FAIL", "quoteCoin": "USDT",
+                "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO",
+            },
+        ]}
         tickers = Mock()
         tickers.raise_for_status.return_value = None
-        tickers.json.return_value = {"data": [{"symbol": "BTCUSDT", "quoteVolume": "2000000"}]}
+        tickers.json.return_value = {"data": [
+            {"symbol": "PASSUSDT", "quoteVolume": "500000"},
+            {"symbol": "FAILUSDT", "quoteVolume": "499999"},
+        ]}
         get.side_effect = [contracts, tickers]
 
         symbols, _, _ = fetch_futures_universe()
 
-        self.assertEqual(symbols, ["BTCUSDT"])
+        self.assertEqual(symbols, ["PASSUSDT"])
 
     @patch("momentum_reflow.requests.get")
     def test_reflow_universe_rejects_blocked_and_leveraged_contracts(self, get):
