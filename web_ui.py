@@ -3738,9 +3738,14 @@ def _run_reflow_scan(progress):
 def _update_reflow_automation_success(trigger, payload):
     if trigger != "auto":
         return
+    scanned = max(0, int(payload.get("scanned", 0) or 0))
+    errors = max(0, int(payload.get("errors", 0) or 0))
+    high_failure_rate = scanned > 0 and errors >= 3 and errors * 2 >= scanned
     with _reflow_automation_lock:
         _reflow_automation["last_auto_scan_at"] = int(time.time() * 1000)
-        _reflow_automation["last_auto_error"] = ""
+        _reflow_automation["last_auto_error"] = (
+            f"扫描任务失败 {errors}/{scanned}" if high_failure_rate else ""
+        )
 
 def _update_reflow_automation_error(trigger, error):
     if trigger != "auto":

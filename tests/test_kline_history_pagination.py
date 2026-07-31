@@ -81,7 +81,7 @@ class KlineHistoryPaginationTest(unittest.TestCase):
         self.assertEqual(starts[0], first_ms)
         self.assertTrue(all(left < right for left, right in zip(starts, starts[1:])))
 
-    def test_bitget_paginates_backward_and_deduplicates_boundaries(self):
+    def test_bitget_paginates_backward_with_exclusive_end_time(self):
         step_ms = 60_000
         first_ms = 1_699_999_980_000
         candles = [
@@ -94,7 +94,7 @@ class KlineHistoryPaginationTest(unittest.TestCase):
             calls.append((url, dict(params)))
             end_ms = int(params["endTime"])
             limit = int(params["limit"])
-            eligible = [row for row in candles if int(row[0]) <= end_ms]
+            eligible = [row for row in candles if int(row[0]) < end_ms]
             page = list(reversed(eligible[-limit:]))
             return FakeResponse({"code": "00000", "data": page})
 
@@ -116,6 +116,7 @@ class KlineHistoryPaginationTest(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertTrue(all("/history-candles" in call[0] for call in calls))
         ends = [int(call[1]["endTime"]) for call in calls]
+        self.assertEqual(ends[0], int(candles[-1][0]) + step_ms)
         self.assertTrue(all(left > right for left, right in zip(ends, ends[1:])))
 
     def test_bitget_stalled_page_fails_closed_instead_of_returning_partial_data(self):

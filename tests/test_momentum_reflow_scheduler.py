@@ -22,6 +22,31 @@ def milliseconds(value):
 
 
 class ReflowSchedulerStepTests(unittest.TestCase):
+    def test_high_worker_failure_rate_sets_automation_error(self):
+        with web_ui._reflow_automation_lock:
+            web_ui._reflow_automation["last_auto_error"] = ""
+            web_ui._reflow_automation["last_auto_scan_at"] = 0
+
+        with patch.object(web_ui.time, "time", return_value=123.0):
+            web_ui._update_reflow_automation_success(
+                "auto", {"scanned": 71, "errors": 69}
+            )
+
+        with web_ui._reflow_automation_lock:
+            self.assertEqual(web_ui._reflow_automation["last_auto_scan_at"], 123000)
+            self.assertIn("69/71", web_ui._reflow_automation["last_auto_error"])
+
+    def test_small_worker_failure_rate_does_not_mark_whole_scan_failed(self):
+        with web_ui._reflow_automation_lock:
+            web_ui._reflow_automation["last_auto_error"] = "stale"
+
+        web_ui._update_reflow_automation_success(
+            "auto", {"scanned": 71, "errors": 1}
+        )
+
+        with web_ui._reflow_automation_lock:
+            self.assertEqual(web_ui._reflow_automation["last_auto_error"], "")
+
     def test_enabled_scheduler_runs_immediately_then_at_next_hh03(self):
         starts = []
         state = web_ui._new_reflow_scheduler_state()

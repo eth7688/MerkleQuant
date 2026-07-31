@@ -294,7 +294,10 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,
             }.get(interval)
             if not granularity:
                 return None
-            cursor = end_ms
+            # Bitget history-candles treats endTime as exclusive. Request the
+            # next candle boundary so the requested last closed candle is
+            # included in the first page.
+            cursor = end_ms + step_ms
             page_limit = 200
             for page_index in range(max_pages):
                 response = requests.get(
@@ -335,11 +338,7 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,
                     return None
                 newest = ordered_times[-1]
                 boundary_gap = cursor - newest
-                if (
-                    boundary_gap < 0
-                    or boundary_gap > step_ms
-                    or (page_index == 0 and boundary_gap >= step_ms)
-                ):
+                if boundary_gap < 0 or boundary_gap > step_ms:
                     return None
                 for item, open_time in zip(valid, open_times):
                     if start_ms <= open_time <= end_ms:
