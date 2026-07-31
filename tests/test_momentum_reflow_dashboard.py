@@ -261,6 +261,63 @@ class ReflowDailyHistoryTests(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "WINDOW_COMPLETE")
             self.assertEqual(rows[0]["status_reason"], "return_window_complete")
 
+    def test_terminal_ledger_updates_earlier_return_window_for_same_breakout(self):
+        with TemporaryDirectory() as folder:
+            history = Path(folder) / "history.json"
+            ledger = Path(folder) / "ledger.json"
+            event = {
+                "direction": "LONG",
+                "breakout_open_time": 100,
+                "return_open_time": 1_000,
+                "state": "RETURN_WINDOW",
+                "audit_reason": "return_window_open",
+            }
+            write_ledger(ledger, event)
+            merge_reflow_signals(
+                history, ledger, {"rows": [candidate(return_open_time=1_000)]}, 1_000
+            )
+            event.update(
+                return_open_time=2_000,
+                state="CONSUMED",
+                audit_reason="return_window_complete",
+            )
+            write_ledger(ledger, event)
+
+            merge_reflow_signals(history, ledger, {"rows": []}, 2_001)
+
+            rows = load_reflow_dashboard(history, 2_001)["rows"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["return_open_time"], 1_000)
+            self.assertEqual(rows[0]["status"], "WINDOW_COMPLETE")
+            self.assertEqual(rows[0]["status_reason"], "return_window_complete")
+
+    def test_active_ledger_does_not_relabel_earlier_return_window(self):
+        with TemporaryDirectory() as folder:
+            history = Path(folder) / "history.json"
+            ledger = Path(folder) / "ledger.json"
+            event = {
+                "direction": "LONG",
+                "breakout_open_time": 100,
+                "return_open_time": 1_000,
+                "state": "RETURN_WINDOW",
+                "audit_reason": "return_window_open",
+            }
+            write_ledger(ledger, event)
+            merge_reflow_signals(
+                history, ledger, {"rows": [candidate(return_open_time=1_000)]}, 1_000
+            )
+            event.update(
+                return_open_time=2_000,
+                audit_reason="return_window_second_candle",
+            )
+            write_ledger(ledger, event)
+
+            merge_reflow_signals(history, ledger, {"rows": []}, 2_001)
+
+            stored = load_reflow_dashboard(history, 2_001)["rows"][0]
+            self.assertEqual(stored["status"], "ACTIVE")
+            self.assertEqual(stored["status_reason"], "return_window_open")
+
     def test_invalid_terminal_state_and_freshness_fields_are_persisted(self):
         with TemporaryDirectory() as folder:
             history = Path(folder) / "history.json"

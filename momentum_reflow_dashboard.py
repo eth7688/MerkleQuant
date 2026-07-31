@@ -177,6 +177,10 @@ def reflow_signal_key(row: dict) -> str:
     ])
 
 
+def _event_identity(row: dict) -> tuple[str, str, int]:
+    return row["symbol"], row["direction"], int(row["breakout_time"])
+
+
 def _load_json_object(path: Path, description: str) -> dict:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -311,7 +315,7 @@ def _validate_persisted_signal(row: dict) -> None:
         raise ValueError("persisted score is invalid")
 
 
-def _event_keys(ledger: dict) -> dict[str, dict]:
+def _event_keys(ledger: dict) -> dict[tuple[str, str, int], dict]:
     events = {}
     for symbol, state in ledger["symbols"].items():
         if not isinstance(symbol, str) or not isinstance(state, dict):
@@ -327,7 +331,7 @@ def _event_keys(ledger: dict) -> dict[str, dict]:
         }
         try:
             _require_identity(row)
-            events[reflow_signal_key(row)] = event
+            events[_event_identity(row)] = event
         except ValueError:
             continue
     return events
@@ -341,6 +345,10 @@ def _set_status_from_event(row: dict, event: dict | None) -> None:
     state = event.get("state")
     reason = event.get("audit_reason", "")
     if state == "RETURN_WINDOW":
+        if int(event["return_open_time"]) != int(row["return_open_time"]):
+            row.setdefault("status", "ACTIVE")
+            row.setdefault("status_reason", "")
+            return
         row["status"] = "ACTIVE"
         row["status_reason"] = reason
     elif state == "CONSUMED" and reason == "return_window_complete":
@@ -402,11 +410,11 @@ def merge_reflow_signals(
             "first_seen_at": existing.get("first_seen_at", now_ms) if existing else now_ms,
             "last_seen_at": now_ms,
         }
-        _set_status_from_event(row, ledger_events.get(key))
+        _set_status_from_event(row, ledger_events.get(_event_identity(row)))
         signals[key] = row
 
-    for key, row in signals.items():
-        _set_status_from_event(row, ledger_events.get(key))
+    for row in signals.values():
+        _set_status_from_event(row, ledger_events.get(_event_identity(row)))
 
     _atomic_write_json(history_path, history)
     return _dashboard(history, day, scan_result)

@@ -551,7 +551,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_bitget_universe_keeps_crypto_commodity_and_fx_but_rejects_equity_and_unknown_rwa(self, get):
         contracts = Mock()
         contracts.raise_for_status.return_value = None
-        contracts.json.return_value = {"data": [
+        contracts.json.return_value = {"code": "00000", "data": [
             {"symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
             {"symbol": "XAUUSDT", "baseCoin": "XAU", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
             {"symbol": "EURUSDT", "baseCoin": "EUR", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "YES"},
@@ -560,7 +560,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         ]}
         tickers = Mock()
         tickers.raise_for_status.return_value = None
-        tickers.json.return_value = {"data": [
+        tickers.json.return_value = {"code": "00000", "data": [
             {"symbol": symbol, "usdtVolume": "2000000"}
             for symbol in ("BTCUSDT", "XAUUSDT", "EURUSDT", "TSLAUSDT", "UNKNOWNUSDT")
         ]}
@@ -578,7 +578,7 @@ class ReflowScanServiceTests(unittest.TestCase):
     def test_reflow_volume_boundary_is_inclusive(self, get):
         contracts = Mock()
         contracts.raise_for_status.return_value = None
-        contracts.json.return_value = {"data": [
+        contracts.json.return_value = {"code": "00000", "data": [
             {
                 "symbol": "PASSUSDT", "baseCoin": "PASS", "quoteCoin": "USDT",
                 "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO",
@@ -590,7 +590,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         ]}
         tickers = Mock()
         tickers.raise_for_status.return_value = None
-        tickers.json.return_value = {"data": [
+        tickers.json.return_value = {"code": "00000", "data": [
             {"symbol": "PASSUSDT", "quoteVolume": "500000"},
             {"symbol": "FAILUSDT", "quoteVolume": "499999"},
         ]}
@@ -601,10 +601,33 @@ class ReflowScanServiceTests(unittest.TestCase):
         self.assertEqual(symbols, ["PASSUSDT"])
 
     @patch("momentum_reflow.requests.get")
+    def test_reflow_universe_rejects_contracts_business_failure(self, get):
+        contracts = Mock()
+        contracts.raise_for_status.return_value = None
+        contracts.json.return_value = {"code": "42900", "data": []}
+        get.return_value = contracts
+
+        with self.assertRaises(ValueError):
+            fetch_futures_universe()
+
+    @patch("momentum_reflow.requests.get")
+    def test_reflow_universe_rejects_tickers_business_failure(self, get):
+        contracts = Mock()
+        contracts.raise_for_status.return_value = None
+        contracts.json.return_value = {"code": "00000", "data": []}
+        tickers = Mock()
+        tickers.raise_for_status.return_value = None
+        tickers.json.return_value = {"code": "42900", "data": []}
+        get.side_effect = [contracts, tickers]
+
+        with self.assertRaises(ValueError):
+            fetch_futures_universe()
+
+    @patch("momentum_reflow.requests.get")
     def test_reflow_universe_rejects_blocked_and_leveraged_contracts(self, get):
         contracts = Mock()
         contracts.raise_for_status.return_value = None
-        contracts.json.return_value = {"data": [
+        contracts.json.return_value = {"code": "00000", "data": [
             {"symbol": "USDCUSDT", "baseCoin": "USDC", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
             {"symbol": "BULLUSDT", "baseCoin": "BULL", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
             {"symbol": "BEARUSDT", "baseCoin": "BEAR", "quoteCoin": "USDT", "symbolType": "perpetual", "symbolStatus": "normal", "isRwa": "NO"},
@@ -614,7 +637,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         ]}
         tickers = Mock()
         tickers.raise_for_status.return_value = None
-        tickers.json.return_value = {"data": [
+        tickers.json.return_value = {"code": "00000", "data": [
             {"symbol": row["symbol"], "quoteVolume": "2000000"}
             for row in contracts.json.return_value["data"]
         ]}

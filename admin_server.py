@@ -436,7 +436,7 @@ function renderReflow(el){
   el.innerHTML='<div class="card" style="max-width:760px">'+
     '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
       '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">动能回流自动扫描</h3>'+
-      '<p style="color:var(--muted);font-size:12px;line-height:1.7">全局扫描开关 · 固定流动性门槛 200万 USDT</p></div>'+
+      '<p style="color:var(--muted);font-size:12px;line-height:1.7">全局扫描开关 · 固定流动性门槛 50万 USDT</p></div>'+
       '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer">'+
         '<input type="checkbox" id="reflowAutoEnabled" style="width:auto">自动扫描</label>'+
     '</div>'+

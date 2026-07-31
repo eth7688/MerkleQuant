@@ -303,7 +303,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
             "reflowSaveError",
         ):
             self.assertIn(f'id="{element_id}"', html)
-        self.assertIn("200万 USDT", html)
+        self.assertIn("50万 USDT", html)
         self.assertIn("不会删除历史记录", html)
         self.assertIn("手动扫描仍可使用", html)
 

@@ -424,14 +424,28 @@ def fetch_futures_universe() -> tuple[list[str], dict[str, float], dict[str, str
         timeout=10,
     )
     contracts_response.raise_for_status()
+    contracts_payload = contracts_response.json()
+    if (
+        not isinstance(contracts_payload, dict)
+        or contracts_payload.get("code") != "00000"
+        or not isinstance(contracts_payload.get("data"), list)
+    ):
+        raise ValueError("Bitget contracts payload is invalid")
     tickers_response = requests.get(
         f"{BITGET_BASE}/api/v2/mix/market/tickers",
         params={"productType": BITGET_PRODUCT_TYPE},
         timeout=10,
     )
     tickers_response.raise_for_status()
+    tickers_payload = tickers_response.json()
+    if (
+        not isinstance(tickers_payload, dict)
+        or tickers_payload.get("code") != "00000"
+        or not isinstance(tickers_payload.get("data"), list)
+    ):
+        raise ValueError("Bitget tickers payload is invalid")
     volume = {}
-    for row in tickers_response.json().get("data", []):
+    for row in tickers_payload["data"]:
         raw_volume = row.get("usdtVolume")
         if raw_volume is None:
             raw_volume = row.get("quoteVolume")
@@ -443,7 +457,7 @@ def fetch_futures_universe() -> tuple[list[str], dict[str, float], dict[str, str
             continue
     instrument_types = {
         row["symbol"]: instrument_type
-        for row in contracts_response.json().get("data", [])
+        for row in contracts_payload["data"]
         if (instrument_type := classify_bitget_contract(row)) is not None
     }
     symbols = [
