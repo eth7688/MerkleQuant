@@ -576,7 +576,7 @@ def scan_momentum_reflow(
     rows: list[dict] = []
     errors = 0
     initialized = 0
-    workers = min(12, max(1, max_workers))
+    workers = min(3, max(1, max_workers))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {

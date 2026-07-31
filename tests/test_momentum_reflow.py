@@ -463,6 +463,15 @@ def make_return_window_hourly_history(symbol):
 
 
 class ReflowScanServiceTests(unittest.TestCase):
+    @patch("momentum_reflow.ThreadPoolExecutor")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_bitget_scan_caps_parallel_workers_to_three(self, universe, pool):
+        universe.return_value = ([], {}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            scan_momentum_reflow(Path(directory) / "ledger.json")
+
+        pool.assert_called_once_with(max_workers=3)
+
     @patch("momentum_reflow.daily_confirmation")
     @patch("momentum_reflow.advance_symbol")
     @patch("momentum_reflow.fetch_klines")
