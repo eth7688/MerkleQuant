@@ -524,7 +524,7 @@ def _scan_symbol(
     indicated = add_hourly_indicators(hourly)
     indicated = indicated[indicated.apply(_indicator_row_is_finite, axis=1)].reset_index(drop=True)
     if indicated.empty:
-        raise ValueError("hourly candle history lacks indicator context")
+        return old_state, None, False, False
     proposed_state, candidate = advance_symbol(symbol, old_state, indicated)
     if candidate is None:
         return proposed_state, None, not existing, False

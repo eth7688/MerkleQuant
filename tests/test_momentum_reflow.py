@@ -738,6 +738,24 @@ class ReflowScanServiceTests(unittest.TestCase):
         self.assertEqual(saved["symbols"], {})
         self.assertEqual(latest.call_count, 1)
 
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_futures_universe")
+    def test_short_history_new_symbol_is_skipped_without_worker_error(
+        self, universe, latest
+    ):
+        universe.return_value = (
+            ["NEWUSDT"], {"NEWUSDT": 9_000_000.0}, {"NEWUSDT": "CRYPTO"}
+        )
+        latest.return_value = make_closed_hourly_history("NEWUSDT").tail(10)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            payload = scan_momentum_reflow(path, max_workers=1)
+            saved = load_ledger(path)
+
+        self.assertEqual(payload["errors"], 0)
+        self.assertEqual(payload["initialized"], 0)
+        self.assertEqual(saved["symbols"], {})
+
     @patch("momentum_reflow.fetch_klines_range")
     @patch("momentum_reflow.fetch_klines")
     @patch("momentum_reflow.fetch_futures_universe")
