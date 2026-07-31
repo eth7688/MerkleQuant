@@ -493,6 +493,16 @@ def _scan_symbol(
             market_type="futures",
             testnet=False,
         )
+        if hourly is None:
+            hourly = fetch_klines(
+                symbol,
+                "1h",
+                1000,
+                exchange="bitget",
+                closed_only=True,
+                market_type="futures",
+                testnet=False,
+            )
     else:
         hourly = fetch_klines(
             symbol,

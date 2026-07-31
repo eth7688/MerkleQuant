@@ -523,6 +523,30 @@ class ReflowScanServiceTests(unittest.TestCase):
 
         self.assertEqual(ranged.call_args.args[2], cursor - 1_000 * HOUR_MS)
 
+    @patch("momentum_reflow.advance_symbol")
+    @patch("momentum_reflow.fetch_klines")
+    @patch("momentum_reflow.fetch_klines_range")
+    def test_incremental_short_listing_falls_back_to_recent_history(
+        self, ranged, latest, advance
+    ):
+        old_state = make_waiting_state("LONG")
+        ranged.return_value = None
+        latest.return_value = make_closed_hourly_history("NEWUSDT")
+        advance.return_value = (old_state, None)
+
+        proposed, candidate, initialized, worker_error = momentum_reflow._scan_symbol(
+            "NEWUSDT", old_state, True
+        )
+
+        self.assertEqual(proposed, old_state)
+        self.assertIsNone(candidate)
+        self.assertFalse(initialized)
+        self.assertFalse(worker_error)
+        latest.assert_called_once_with(
+            "NEWUSDT", "1h", 1000, exchange="bitget", closed_only=True,
+            market_type="futures", testnet=False,
+        )
+
     @patch("momentum_reflow.requests.get")
     def test_bitget_universe_keeps_crypto_commodity_and_fx_but_rejects_equity_and_unknown_rwa(self, get):
         contracts = Mock()
