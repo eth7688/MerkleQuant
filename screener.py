@@ -300,23 +300,33 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,
             cursor = end_ms + step_ms
             page_limit = 200
             for page_index in range(max_pages):
-                response = requests.get(
-                    "https://api.bitget.com/api/v2/mix/market/history-candles",
-                    params={
-                        "symbol": symbol,
-                        "granularity": granularity,
-                        "productType": "USDT-FUTURES",
-                        "endTime": str(cursor),
-                        "limit": str(page_limit),
-                    },
-                    timeout=5,
-                )
-                if response.status_code != 200:
-                    return None
-                payload = response.json()
-                if payload.get("code") != "00000":
-                    return None
-                batch = payload.get("data") or []
+                batch = None
+                for attempt in range(3):
+                    try:
+                        response = requests.get(
+                            "https://api.bitget.com/api/v2/mix/market/history-candles",
+                            params={
+                                "symbol": symbol,
+                                "granularity": granularity,
+                                "productType": "USDT-FUTURES",
+                                "endTime": str(cursor),
+                                "limit": str(page_limit),
+                            },
+                            timeout=5,
+                        )
+                        payload = response.json()
+                        if (
+                            response.status_code == 200
+                            and isinstance(payload, dict)
+                            and payload.get("code") == "00000"
+                        ):
+                            batch = payload.get("data") or None
+                    except (requests.RequestException, ValueError):
+                        batch = None
+                    if batch:
+                        break
+                    if attempt < 2:
+                        time.sleep(max(pause_seconds, 0.2 * (2 ** attempt)))
                 if not batch:
                     return None
                 valid = [item for item in batch if len(item) >= 6]

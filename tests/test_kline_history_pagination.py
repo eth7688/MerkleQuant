@@ -119,6 +119,41 @@ class KlineHistoryPaginationTest(unittest.TestCase):
         self.assertEqual(ends[0], int(candles[-1][0]) + step_ms)
         self.assertTrue(all(left > right for left, right in zip(ends, ends[1:])))
 
+    def test_bitget_retries_transient_page_failures_before_failing_closed(self):
+        step_ms = 60_000
+        first_ms = 1_699_999_980_000
+        candles = [bitget_row(first_ms + index * step_ms) for index in range(10)]
+
+        for transient in (
+            FakeResponse({"code": "42900", "data": []}, status_code=429),
+            FakeResponse({"code": "00000", "data": []}),
+        ):
+            calls = []
+
+            def fake_get(url, params, timeout):
+                calls.append(dict(params))
+                if len(calls) == 1:
+                    return transient
+                return FakeResponse({"code": "00000", "data": list(reversed(candles))})
+
+            with self.subTest(status=transient.status_code), patch(
+                "screener.requests.get", side_effect=fake_get
+            ), patch("screener.time.sleep") as sleep:
+                frame = self.history_fetcher()(
+                    "BTCUSDT",
+                    "1m",
+                    first_ms,
+                    int(candles[-1][0]),
+                    exchange="bitget",
+                    market_type="futures",
+                    pause_seconds=0,
+                )
+
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame["ot"].tolist(), [int(row[0]) for row in candles])
+            self.assertEqual(len(calls), 2)
+            sleep.assert_called_once()
+
     def test_bitget_stalled_page_fails_closed_instead_of_returning_partial_data(self):
         step_ms = 60_000
         first_ms = 1_699_999_980_000
