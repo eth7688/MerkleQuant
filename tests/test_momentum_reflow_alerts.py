@@ -95,6 +95,51 @@ class ReflowAlertLedgerTests(unittest.TestCase):
                 observe_reflow_alerts(path, [row()], 2_000)
             self.assertEqual(path.read_bytes(), original)
 
+    def test_uninitialized_ledger_with_observed_state_fails_closed_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            path.write_text(json.dumps({
+                "version": 1, "initialized": False, "next_alert_id": 1,
+                "wechat_cursor": 0,
+                "observed": {"BTC-LONG-1": {
+                    "ever_high": True, "last_quality_label": "HIGH",
+                }},
+                "events": [],
+            }), encoding="utf-8")
+            original = path.read_bytes()
+            with self.assertRaises(ValueError):
+                observe_reflow_alerts(path, [row()], 2_000)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_snapshot_with_extra_webhook_key_fails_closed_without_secret_response(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            secret = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-1234"
+            snapshot = {
+                "symbol": "BTCUSDT", "direction": "LONG", "price": 100.0,
+                "ema50": 99.0, "daily_kind": "strong_momentum", "window_index": 1,
+                "breakout_volume_ratio": 3.0, "first_seen_at": 100,
+                "wechat_webhook": secret,
+            }
+            path.write_text(json.dumps({
+                "version": 1, "initialized": True, "next_alert_id": 2,
+                "wechat_cursor": 0,
+                "observed": {"BTC-LONG-1": {
+                    "ever_high": True, "last_quality_label": "HIGH",
+                }},
+                "events": [{
+                    "alert_id": 1, "signal_key": "BTC-LONG-1", "created_at": 1,
+                    "trigger": "new_signal", "snapshot": snapshot, "wechat": {
+                        "status": "pending", "attempts": 0, "last_attempt_at": 0,
+                        "next_attempt_at": 1, "last_error": "",
+                    },
+                }],
+            }), encoding="utf-8")
+            original = path.read_bytes()
+            with self.assertRaises(ValueError):
+                read_public_alerts(path, 0)
+            self.assertEqual(path.read_bytes(), original)
+
     def test_webhook_is_masked_and_blank_save_preserves_secret(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"

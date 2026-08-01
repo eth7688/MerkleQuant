@@ -84,6 +84,10 @@ def _validate_ledger(value: dict) -> dict:
             or not isinstance(value.get("observed"), dict)
             or not isinstance(value.get("events"), list)):
         raise ValueError("reflow alert ledger version or shape is invalid")
+    if (not value["initialized"]
+            and (value["next_alert_id"] != 1 or value["wechat_cursor"] != 0
+                 or value["observed"] or value["events"])):
+        raise ValueError("reflow alert uninitialized ledger is invalid")
     for key, observed in value["observed"].items():
         if (not isinstance(key, str) or not isinstance(observed, dict)
                 or type(observed.get("ever_high")) is not bool
@@ -108,6 +112,8 @@ def _validate_ledger(value: dict) -> dict:
         observed = value["observed"].get(event["signal_key"])
         if not observed or not observed["ever_high"]:
             raise ValueError("reflow alert event observation is invalid")
+        if set(event["snapshot"]) != set(SNAPSHOT_FIELDS):
+            raise ValueError("reflow alert event snapshot is invalid")
     last_alert_id = len(value["events"])
     if (value["next_alert_id"] != last_alert_id + 1
             or not 0 <= value["wechat_cursor"] <= last_alert_id):
