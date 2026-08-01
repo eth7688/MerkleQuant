@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from btc_stage import evaluate_btc_gate
+from strategy_filters import evaluate_daily_pattern_state
 
 
 RULE_VERSION = "rj_strategy_core_v1"
@@ -30,6 +31,7 @@ class StrategySnapshot:
     decision_time: int
     candles_30m: pd.DataFrame
     btc_stage: dict[str, Any]
+    candles_1d: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,17 @@ def evaluate_rj_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
     evidence = dict(signal)
     evidence["btc_coin_reversal_pass"] = reversal
     evidence["btc_gate_reason"] = reason
+    daily_mode = str(getattr(cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+    if daily_mode in ("log_only", "soft"):
+        daily_pattern = evaluate_daily_pattern_state(
+            snapshot.candles_1d,
+            direction,
+            decision_time=snapshot.decision_time,
+        )
+        daily_pattern["mode"] = daily_mode
+        evidence["daily_pattern"] = daily_pattern
+        if allowed and daily_mode == "soft" and daily_pattern.get("would_block"):
+            allowed, reason = False, "daily_pattern_opposed"
     return EntryDecision(
         allowed=bool(allowed),
         reason="pass" if allowed else reason,

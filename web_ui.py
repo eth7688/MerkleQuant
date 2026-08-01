@@ -52,6 +52,7 @@ class UserBotManager:
         cfg.testnet = True
         cfg.fuel_enabled = False
         cfg.mode = "live"
+        cfg.rj_daily_pattern_filter_mode = "log_only"
         return cfg
 
     def _user_path(self, uid, filename):
@@ -2200,6 +2201,28 @@ function choppyTradeTag(a){
   var title=meta?' title="'+meta+'"':'';
   return '<span class="'+choppyAuditClass(a)+'"'+title+'>'+choppyAuditText(a)+'</span>';
 }
+function dailyPatternText(a){
+  if(!a||!a.recorded) return '未记录';
+  var labels={strong_momentum:'强动能',morning_star:'早晨之星',evening_star:'黄昏之星',bullish_engulfing:'看涨吞没',bearish_engulfing:'看跌吞没',hammer:'锤子线',shooting_star:'射击之星',bottom_fractal:'底分型',top_fractal:'顶分型',mixed:'混合形态',none:'无明确形态'};
+  var kind=String(a.kind||'none').replace(/[<>]/g,'').slice(0,40);
+  var align=a.alignment==='aligned'?'同向':(a.alignment==='opposed'?'反向':(a.alignment==='mixed'?'混合':'中性'));
+  var day='';
+  if(a.candle_open_time!==null&&a.candle_open_time!==undefined){
+    var dt=new Date(Number(a.candle_open_time));
+    if(!isNaN(dt.getTime())) day=dt.toISOString().slice(0,10)+' UTC收盘';
+  }
+  return (labels[kind]||kind)+' · '+align+(day?' · '+day:'');
+}
+function dailyPatternClass(a){
+  if(!a||!a.recorded||a.alignment==='none') return 'neu';
+  return a.alignment==='aligned'?'g':(a.alignment==='opposed'?'r':'y');
+}
+function dailyPatternLine(a){
+  return '<div class="pc-data"><span class="pc-label">昨日收盘</span><span class="pc-val '+dailyPatternClass(a)+'">'+dailyPatternText(a)+'</span></div>';
+}
+function dailyPatternTradeTag(a){
+  return '<span class="'+dailyPatternClass(a)+'">昨日日K '+dailyPatternText(a)+'</span>';
+}
 function setEqValue(id, value, signed){
   var el=document.getElementById(id);
   if(!el) return;
@@ -2639,6 +2662,7 @@ function refreshTraderData(){
           posHTML+='<div class="pc-data"><span class="pc-label">目标区</span><span class="pc-val">'+fmtTargetType(p.target_zone_type)+' '+Number(p.target_zone_price||0).toFixed(6)+' / '+pTargetR.toFixed(2)+'R</span></div>';
         }
         posHTML+=choppyLine(p.choppy_filter);
+        posHTML+=dailyPatternLine(p.daily_pattern);
         posHTML+=hermesLine(p.hermes_confirm,p.direction);
         posHTML+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+(p.value||0).toFixed(2)+'</span></div>';
         posHTML+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(isProfit?'+':'')+p.pnl.toFixed(2)+' USDT</div><button class="pc-btn" onclick="closeOne(\''+p.symbol+'\')">平仓</button></div>';
@@ -2690,7 +2714,7 @@ function refreshTraderData(){
         logHTML+='<div class=\"tl-item '+(isWin?'tl-win':'tl-loss')+'\" onclick=\"this.classList.toggle(\'expanded\')\">';
         logHTML+='<div class=\"tl-time\">'+dt+'</div>';
         logHTML+='<div class=\"tl-body\"><div class=\"tl-head\"><span class=\"tl-sym\">'+t.symbol.replace('USDT','')+'</span><span class=\"tl-dir '+(t.direction==='LONG'?'g':'r')+'\">'+(t.direction==='LONG'?'多':'空')+'</span><span class=\"tl-reason\">'+t.reason+'</span></div>';
-        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+'<span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
+        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+dailyPatternTradeTag(t.daily_pattern)+'<span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
         logHTML+='<div class=\"tl-pnl\"><span class=\"tl-pnl-val '+(isWin?'g':'r')+'\">'+(isWin?'+':'')+pnlVal.toFixed(2)+'</span><span class=\"tl-pnl-pct '+(isWin?'g':'r')+'\">'+(t.pnl_pct>=0?'+':'')+(t.pnl_pct||0).toFixed(2)+'%</span></div>';
         logHTML+='</div>';
       }
@@ -3383,6 +3407,7 @@ function renderDemoPositionCards(d){
     h+='<div class="pc-data"><span class="pc-label">止损价</span><span class="pc-val">'+p.sl+'</span></div>';
     h+='<div class="pc-data"><span class="pc-label">MFE</span><span class="pc-val">'+Number(p.max_favorable_r||0).toFixed(2)+'R</span></div>';
     h+=choppyLine(p.choppy_filter);
+    h+=dailyPatternLine(p.daily_pattern);
     h+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+Number(p.value||0).toFixed(2)+'</span></div>';
     h+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(ip?'+':'')+Number(p.pnl||0).toFixed(2)+' USDT</div></div>';
     if(p.breakeven) h+='<div class="pc-trail-shimmer">保护止损已启动</div>';
@@ -3419,7 +3444,7 @@ function renderDemoTradeList(d){
       var targetR=Number(t.target_r||0);
       var targetText=targetR>0?('目标 '+targetR.toFixed(2)+'R'):'目标 --';
       h+='<div class="tl-item '+(tw?'tl-win':'tl-loss')+'"><div class="tl-time">'+String(t.time||'').slice(5,16).replace('T',' ')+'</div><div class="tl-body"><div class="tl-head"><span class="tl-sym">'+String(t.symbol||'').replace('USDT','')+'</span><span class="tl-dir '+(t.direction==='LONG'?'g':'r')+'">'+(t.direction==='LONG'?'多':'空')+'</span><span class="tl-reason">'+(t.reason||'')+'</span></div>';
-      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+'</div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
+      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+dailyPatternTradeTag(t.daily_pattern)+'</div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
     }
     h+='</div>';
   }

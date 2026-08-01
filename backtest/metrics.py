@@ -10,12 +10,16 @@ def summarize_positions(events: list[dict]) -> dict:
         position_id = str(event.get("position_id", ""))
         if not position_id:
             continue
-        row = positions.setdefault(position_id, {"risk": 0.0, "pnl": 0.0, "fees": 0.0, "mfe": 0.0, "mae": 0.0})
+        row = positions.setdefault(position_id, {
+            "risk": 0.0, "pnl": 0.0, "fees": 0.0, "mfe": 0.0, "mae": 0.0,
+            "daily_pattern": {},
+        })
         if event.get("type") == "entry_fill":
             row["risk"] = float(event.get("risk_usdt", 0) or 0)
             entry_fee = float(event.get("fee", 0) or 0)
             row["fees"] += entry_fee
             row["pnl"] -= entry_fee
+            row["daily_pattern"] = event.get("daily_pattern", {}) or {}
         elif event.get("type") == "exit_fill":
             row["pnl"] += float(event.get("net_pnl", 0) or 0)
             row["fees"] += float(event.get("fee", 0) or 0)
@@ -34,6 +38,24 @@ def summarize_positions(events: list[dict]) -> dict:
         equity += value
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)
+    daily_groups = {}
+    for row in complete:
+        pattern = row.get("daily_pattern", {}) or {}
+        alignment = (
+            str(pattern.get("alignment", "none") or "none")
+            if pattern.get("recorded") else "unavailable"
+        )
+        values = daily_groups.setdefault(alignment, [])
+        values.append(row["pnl"] / row["risk"])
+    daily_breakdown = {
+        alignment: {
+            "trades": len(values),
+            "win_rate": round(sum(value > 0 for value in values) * 100 / len(values), 4),
+            "sum_r": round(sum(values), 6),
+            "mean_r": round(statistics.mean(values), 6),
+        }
+        for alignment, values in sorted(daily_groups.items())
+    }
     return {
         "trades": len(r_values),
         "wins": len(wins),
@@ -49,4 +71,5 @@ def summarize_positions(events: list[dict]) -> dict:
         "mean_mfe_r": round(statistics.mean(row["mfe"] for row in complete), 6) if complete else 0.0,
         "mean_mae_r": round(statistics.mean(row["mae"] for row in complete), 6) if complete else 0.0,
         "total_fees": round(sum(row["fees"] for row in complete), 8),
+        "daily_pattern_breakdown": daily_breakdown,
     }

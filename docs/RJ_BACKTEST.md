@@ -28,9 +28,24 @@ python replay_engine.py download --root backtest_data --symbol BTCUSDT --interva
 python replay_engine.py download --root backtest_data --symbol BTCUSDT --interval 30m --start <ms> --end <ms> --data-version <version>
 python replay_engine.py download --root backtest_data --symbol BTCUSDT --interval 1h --start <ms> --end <ms> --data-version <version>
 python replay_engine.py download --root backtest_data --symbol BTCUSDT --interval 4h --start <ms> --end <ms> --data-version <version>
+python replay_engine.py download --root backtest_data --symbol BTCUSDT --interval 1d --start <ms> --end <ms> --data-version <version>
 ```
 
 The downloader reports every missing interval. It never fills gaps silently.
+Bitget daily downloads use `1Dutc`; replay exposes each candle only after its
+UTC close.
+If an optional daily file is absent, replay records a deterministic
+`unavailable` input marker and continues fail-open. A present but malformed
+daily dataset or manifest remains a hard error.
+
+For daily-pattern comparison, use
+`rj_daily_pattern_filter_mode: log_only` for the baseline shadow sample and
+`rj_daily_pattern_filter_mode: soft` for the counterfactual that rejects only
+explicit opposed rank-2/rank-3 patterns. `metrics.json` includes
+`daily_pattern_breakdown` with trade count, win rate, sum R, and mean R for
+each observed alignment group. Successfully observed candles with no pattern
+are grouped as `none`; missing or invalid daily data is grouped separately as
+`unavailable`.
 
 ## Run A Frozen Experiment
 

@@ -44,9 +44,14 @@ class ReplayEngine:
         candles_1m: pd.DataFrame,
         btc_stage_provider: Callable[[int], dict],
         entry_start_ms: int | None = None,
+        candles_1d: pd.DataFrame | None = None,
     ) -> ReplayResult:
         frame30 = candles_30m.sort_values("ot").reset_index(drop=True)
         frame1 = candles_1m.sort_values("ot").reset_index(drop=True)
+        frame_daily = (
+            candles_1d.sort_values("ot").reset_index(drop=True)
+            if isinstance(candles_1d, pd.DataFrame) else pd.DataFrame()
+        )
         if len(frame30) < self.warmup_bars or frame1.empty:
             return ReplayResult([], summarize_positions([]), self.initial_equity, set())
 
@@ -101,12 +106,14 @@ class ReplayEngine:
                     decision_time=decision_time,
                     candles_30m=window,
                     btc_stage=btc_stage_provider(decision_time),
+                    candles_1d=frame_daily,
                 )
                 decision = evaluate_entry(self.bot, snapshot)
                 if not decision.allowed:
                     events.append({
                         "type": "signal_reject", "symbol": symbol, "time": decision_time,
                         "reason": decision.reason, "signal_key": decision.signal_key,
+                        "daily_pattern": decision.evidence.get("daily_pattern", {}),
                     })
                     continue
                 if not decision.signal_key or decision.signal_key in used_keys or state is not None:
@@ -126,6 +133,7 @@ class ReplayEngine:
                     "quantity": fill.quantity, "fee": fill.fee, "risk_usdt": self.risk_usdt,
                     "signal_key": decision.signal_key, "trigger_source": decision.trigger_source,
                     "initial_stop": decision.stop,
+                    "daily_pattern": decision.evidence.get("daily_pattern", {}),
                     "equity": broker.equity,
                 })
                 apply_exit(bar)
@@ -174,9 +182,14 @@ class PortfolioReplayEngine:
         btc_stage_provider: Callable[[int], dict],
         entry_start_ms: int,
         precomputed: dict[str, dict[int, object]] | None = None,
+        candles_1d: dict[str, pd.DataFrame] | None = None,
     ) -> ReplayResult:
         frames30 = {key: value.sort_values("ot").reset_index(drop=True) for key, value in candles_30m.items()}
         frames1 = {key: value.sort_values("ot").reset_index(drop=True) for key, value in candles_1m.items()}
+        frames_daily = {
+            key: value.sort_values("ot").reset_index(drop=True)
+            for key, value in (candles_1d or {}).items()
+        }
         decision_times = sorted({
             int(row) + 1_800_000
             for frame in frames30.values()
@@ -267,13 +280,17 @@ class PortfolioReplayEngine:
                 else:
                     decision = evaluate_entry(
                         self.bot,
-                        StrategySnapshot(symbol, "30m", decision_time, closed, stage),
+                        StrategySnapshot(
+                            symbol, "30m", decision_time, closed, stage,
+                            candles_1d=frames_daily.get(symbol),
+                        ),
                     )
                 if not decision.allowed:
                     if decision.reason not in ("no_rj_signal", "no_predicta_signal"):
                         events.append({
                             "type": "signal_reject", "symbol": symbol, "time": decision_time,
                             "reason": decision.reason, "signal_key": decision.signal_key,
+                            "daily_pattern": decision.evidence.get("daily_pattern", {}),
                         })
                     continue
                 if decision.signal_key and decision.signal_key not in used_keys:
@@ -314,7 +331,9 @@ class PortfolioReplayEngine:
                     "direction": decision.direction, "time": fill.time, "price": fill.price,
                     "quantity": fill.quantity, "fee": fill.fee, "risk_usdt": self.risk_usdt,
                     "signal_key": decision.signal_key, "trigger_source": decision.trigger_source,
-                    "initial_stop": decision.stop, "equity": broker.equity,
+                    "initial_stop": decision.stop,
+                    "daily_pattern": decision.evidence.get("daily_pattern", {}),
+                    "equity": broker.equity,
                 })
 
         final_time = max((int(frame["ot"].iloc[-1]) for frame in frames1.values() if not frame.empty), default=processed_until)

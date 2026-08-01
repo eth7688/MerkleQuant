@@ -28,7 +28,11 @@ import pandas as pd
 import numpy as np
 
 from btc_stage import classify_btc_stage, evaluate_btc_gate
-from strategy_filters import evaluate_choppy_market_adaptive, evaluate_predicta_choppy_market
+from strategy_filters import (
+    evaluate_choppy_market_adaptive,
+    evaluate_daily_pattern_state,
+    evaluate_predicta_choppy_market,
+)
 from predicta_indicator import (
     PredictaParams,
     compute_predicta,
@@ -176,6 +180,7 @@ class TradeConfig:
     rj_only_setup_near_pct: float = 0.15        # 距离触发价多少%内写near日志
     rj_only_setup_max_pool: int = 40            # RJ候选池最大数量
     rj_choppy_filter_mode: str = "off"          # off / log_only / hard
+    rj_daily_pattern_filter_mode: str = "off"  # off / log_only / soft
 
     # Predicta V4 + EWO entry path (closed candles only)
     predicta_confirm_bars: int = 6
@@ -1126,6 +1131,7 @@ class Position:
     excursion_price_source: str = ""
     choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
     stop_replace_state: str = ""  # durable protective-stop transaction state
+    daily_pattern: dict = field(default_factory=dict)  # entry-time closed 1Dutc snapshot
 
     def __post_init__(self):
         if float(self.initial_entry_price or 0.0) <= 0:
@@ -1672,6 +1678,72 @@ class SqueezeBreakoutBot:
                 "efficiency_ratio", "choppy_efficiency_ratio"
             ),
         }
+
+    def _position_daily_pattern(self, state: Optional[dict]) -> dict:
+        state = state or {}
+        if not bool(state.get("recorded", False)):
+            return {
+                "recorded": False,
+                "kind": "none",
+                "pattern_direction": "NONE",
+                "alignment": "unavailable",
+                "rank": 0,
+                "would_block": False,
+                "candle_open_time": None,
+                "candle_close_time": None,
+                "reason": str(state.get("reason", "not_recorded") or "not_recorded")[:40],
+                "mode": str(state.get("mode", "") or "")[:16],
+            }
+
+        def optional_int(name):
+            value = state.get(name)
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            rank = int(state.get("rank", 0) or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        return {
+            "recorded": True,
+            "kind": str(state.get("kind", "none") or "none")[:40],
+            "pattern_direction": str(state.get("pattern_direction", "NONE") or "NONE")[:8],
+            "alignment": str(state.get("alignment", "none") or "none")[:16],
+            "rank": rank,
+            "would_block": bool(state.get("would_block", False)),
+            "candle_open_time": optional_int("candle_open_time"),
+            "candle_close_time": optional_int("candle_close_time"),
+            "reason": str(state.get("reason", "") or "")[:40],
+            "mode": str(state.get("mode", "") or "")[:16],
+        }
+
+    def _daily_pattern_state_for_entry(self, symbol: str, direction: str) -> dict:
+        mode = str(getattr(self.cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+        if mode not in ("off", "log_only", "soft"):
+            mode = "log_only"
+        if mode == "off":
+            return self._position_daily_pattern({"reason": "disabled", "mode": mode})
+        try:
+            daily = fetch_klines(
+                symbol, "1d", 50,
+                exchange="bitget",
+                closed_only=True,
+                bitget_granularity="1Dutc",
+            )
+        except Exception:
+            return self._position_daily_pattern({
+                "reason": "daily_fetch_failed",
+                "mode": mode,
+            })
+        state = evaluate_daily_pattern_state(
+            daily,
+            direction,
+            decision_time=int(time.time() * 1000),
+        )
+        state["mode"] = mode
+        return self._position_daily_pattern(state)
 
     def _entry_choppy_audit_map(self) -> dict:
         """从成交事件恢复旧持仓缺失的入场快照，不用当前行情补算。"""
@@ -4739,6 +4811,7 @@ class SqueezeBreakoutBot:
             "squeeze_start", "squeeze_end", "first_fractal_bar", "confirm_fractal_bar",
             "target_zone_type", "target_zone_price", "target_zone_low", "target_zone_high",
             "target_r", "target_distance_pct", "target_zone_bars_ago",
+            "daily_pattern",
             "predicta_entry_path", "predicta_key_time", "predicta_key_high", "predicta_key_low",
             "predicta_signal_ewo", "predicta_confirm_time", "predicta_confirm_ewo",
             "predicta_confirm_reason", "predicta_confirm_age_bars", "predicta_confirm_bars",
@@ -5574,6 +5647,7 @@ class SqueezeBreakoutBot:
                     "target_zone_bars_ago": getattr(p, "target_zone_bars_ago", 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
                     "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                     "active_stop_id": stop_ids.get(p.symbol, ""),
                     "stop_replace_state": str(getattr(p, "stop_replace_state", "") or ""),
                 }
@@ -5665,6 +5739,7 @@ class SqueezeBreakoutBot:
                 pos.target_zone_bars_ago = int(d.get('target_zone_bars_ago', 0) or 0)
                 pos.hermes_confirm = self._public_hermes_confirm(d.get('hermes_confirm', {}))
                 pos.choppy_filter = self._position_choppy_filter(d.get('choppy_filter', {}))
+                pos.daily_pattern = self._position_daily_pattern(d.get('daily_pattern', {}))
                 if not pos.choppy_filter.get("recorded"):
                     pos.choppy_filter = entry_choppy_audits.get(
                         (pos.symbol, pos.signal_key),
@@ -5858,6 +5933,9 @@ class SqueezeBreakoutBot:
                             pos.target_zone_bars_ago = getattr(matched_local, 'target_zone_bars_ago', 0) if matched_local else 0
                             self._refresh_target_metrics(pos)
                             pos.hermes_confirm = self._public_hermes_confirm(getattr(matched_local, 'hermes_confirm', {}) if matched_local else {})
+                            pos.daily_pattern = self._position_daily_pattern(
+                                getattr(matched_local, 'daily_pattern', {}) if matched_local else {}
+                            )
                             pos.time_stop_armed = True
                             pos.time_stop_armed_at = getattr(matched_local, 'time_stop_armed_at', None) if matched_local else None
                             pos.time_stop_watch = getattr(matched_local, 'time_stop_watch', False) if matched_local else False
@@ -6412,6 +6490,23 @@ class SqueezeBreakoutBot:
                     "interval": signal_interval,
                 }))
                 return None
+        if source_strategy == "rj_only":
+            daily_pattern = self._daily_pattern_state_for_entry(symbol, direction)
+            signal["daily_pattern"] = daily_pattern
+            self._append_signal_event(
+                "rj_daily_pattern_shadow",
+                symbol,
+                self._signal_snapshot(signal, {"daily_pattern": daily_pattern}),
+            )
+            if (
+                daily_pattern.get("mode") == "soft"
+                and daily_pattern.get("would_block")
+            ):
+                self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                    "reason": "daily_pattern_opposed",
+                    "daily_pattern": daily_pattern,
+                }))
+                return None
         entry_price = float(signal.get("price") or df["c"].iloc[-1])
         stop_field = "rj_only_stop_price" if source_strategy == "rj_only" else "predicta_stop_price"
         stop_raw = signal.get(stop_field)
@@ -6655,6 +6750,7 @@ class SqueezeBreakoutBot:
             target_zone_bars_ago=int(target_zone.get("target_zone_bars_ago", 0) or 0),
             hermes_confirm=self._public_hermes_confirm(hermes_state),
             choppy_filter=self._position_choppy_filter(signal),
+            daily_pattern=self._position_daily_pattern(signal.get("daily_pattern", {})),
         )
         pos.time_stop_armed = True
         pos.time_stop_armed_at = pos.entry_time
@@ -8279,6 +8375,7 @@ class SqueezeBreakoutBot:
             'target_zone_bars_ago': int(getattr(pos, 'target_zone_bars_ago', 0) or 0),
             'hermes_confirm': self._public_hermes_confirm(getattr(pos, 'hermes_confirm', {})),
             'choppy_filter': self._position_choppy_filter(getattr(pos, 'choppy_filter', {})),
+            'daily_pattern': self._position_daily_pattern(getattr(pos, 'daily_pattern', {})),
             **self._position_btc_fields(pos),
         }
         if raw_exit_reason != reason:
@@ -9260,6 +9357,7 @@ class SqueezeBreakoutBot:
                     "target_r": round(float(getattr(p, "target_r", 0.0) or 0.0), 4),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
                     "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                 }
                 for p in self.positions
             ],
@@ -9451,6 +9549,7 @@ class SqueezeBreakoutBot:
                     "target_zone_bars_ago": int(getattr(p, "target_zone_bars_ago", 0) or 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
                     "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                 }
                 for p in self.positions
             ],

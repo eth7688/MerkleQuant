@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 
+import pandas as pd
+
 from backtest.bitget_history import BitgetHistorySource
 from backtest.data_store import HistoricalStore
 from backtest.engine import PortfolioReplayEngine, ReplayEngine
@@ -19,6 +21,11 @@ from strategy_core import StrategySnapshot, evaluate_entry
 def build_run_id(manifest_hash: str, symbol: str, data_fingerprints: list[str]) -> str:
     raw = "|".join([manifest_hash, symbol.upper(), *data_fingerprints])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _daily_pattern_enabled(rules: dict) -> bool:
+    mode = str(rules.get("rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+    return mode in ("log_only", "soft")
 
 
 def _write_result(output: Path, manifest: dict, result, rules: dict, status: str) -> None:
@@ -48,6 +55,13 @@ def _manifest_fingerprint(store: HistoricalStore, symbol: str, interval: str) ->
     path = store._candle_path("bitget", symbol, interval).with_suffix(".manifest.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
     return str(payload["sha256"])
+
+
+def _load_optional_daily_history(store: HistoricalStore, symbol: str) -> tuple[pd.DataFrame, str]:
+    path = store._candle_path("bitget", symbol, "1d")
+    if not path.exists():
+        return pd.DataFrame(), f"unavailable:bitget:{symbol.upper()}:1d"
+    return store.read_candles("bitget", symbol, "1d"), _manifest_fingerprint(store, symbol, "1d")
 
 
 def _load_experiment(path: Path) -> tuple[ExperimentSpec, dict]:
@@ -81,7 +95,7 @@ def _precompute_worker(payload):
     os.environ.setdefault("AXIOM_DISABLE_AUTOSTART", "1")
     from trader import SqueezeBreakoutBot, TradeConfig
 
-    symbol, frame, btc1, btc4, rules, start, end = payload
+    symbol, frame, daily, btc1, btc4, rules, start, end = payload
     signal_source = str(rules.get("entry_signal_source", "rj_only") or "rj_only")
     cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget", entry_signal_source=signal_source, scan_interval="30m")
     for key, value in rules.items():
@@ -107,7 +121,10 @@ def _precompute_worker(payload):
         four = btc4[(btc4["ot"] + 14_400_000) <= decision_time].tail(220)
         stage = classify_btc_stage(one, four)
         decisions[decision_time] = evaluate_entry(
-            bot, StrategySnapshot(symbol, "30m", decision_time, frame.iloc[:index + 1], stage)
+            bot, StrategySnapshot(
+                symbol, "30m", decision_time, frame.iloc[:index + 1], stage,
+                candles_1d=daily,
+            )
         )
     return symbol, decisions
 
@@ -119,7 +136,7 @@ def download(args) -> int:
     if frame.empty:
         raise SystemExit("no historical candles returned")
     path = store.write_candles("bitget", args.symbol, args.interval, frame, args.data_version)
-    gaps = store.find_gaps(frame, {"1m": 60_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}[args.interval])
+    gaps = store.find_gaps(frame, {"1m": 60_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}[args.interval])
     print(json.dumps({"path": str(path), "rows": len(frame), "gaps": gaps}, ensure_ascii=False))
     return 0
 
@@ -142,9 +159,16 @@ def run(args) -> int:
     bot = SqueezeBreakoutBot(cfg)
     frame30 = store.read_candles("bitget", args.symbol, "30m")
     frame1 = store.read_candles("bitget", args.symbol, "1m")
+    daily_enabled = _daily_pattern_enabled(rules)
+    frame1d, daily_fingerprint = (
+        _load_optional_daily_history(store, args.symbol)
+        if daily_enabled else (pd.DataFrame(), None)
+    )
     start, end = spec.test
     frame30 = frame30[frame30["ot"] < end].reset_index(drop=True)
     frame1 = frame1[(frame1["ot"] >= start) & (frame1["ot"] < end)].reset_index(drop=True)
+    if daily_enabled:
+        frame1d = frame1d[frame1d["ot"] < end].reset_index(drop=True)
     engine = ReplayEngine(
         bot=bot,
         initial_equity=float(rules.get("initial_equity", 5000.0)),
@@ -162,7 +186,8 @@ def run(args) -> int:
         warmup_bars=int(rules.get("warmup_bars", 60)),
     )
     result = engine.run_symbol(
-        args.symbol.upper(), frame30, frame1, _btc_provider(store), entry_start_ms=start
+        args.symbol.upper(), frame30, frame1, _btc_provider(store),
+        entry_start_ms=start, candles_1d=frame1d,
     )
     status = "READY" if result.metrics["trades"] >= spec.minimum_core_trades else "SAMPLE_NOT_READY"
     fingerprints = [
@@ -171,6 +196,8 @@ def run(args) -> int:
         _manifest_fingerprint(store, "BTCUSDT", "1h"),
         _manifest_fingerprint(store, "BTCUSDT", "4h"),
     ]
+    if daily_enabled:
+        fingerprints.append(daily_fingerprint)
     run_id = build_run_id(spec.manifest_hash(), args.symbol, fingerprints)
     output = Path(args.output or "backtest_runs") / run_id
     output.mkdir(parents=True, exist_ok=True)
@@ -228,16 +255,26 @@ def run_portfolio(args) -> int:
     start, end = spec.test
     frames30 = {}
     frames1 = {}
+    frames1d = {}
     fingerprints = []
+    daily_enabled = _daily_pattern_enabled(rules)
     for symbol in symbols:
         frames30[symbol] = store.read_candles("bitget", symbol, "30m")
         frames30[symbol] = frames30[symbol][frames30[symbol]["ot"] < end].reset_index(drop=True)
         frames1[symbol] = store.read_candles("bitget", symbol, "1m")
         frames1[symbol] = frames1[symbol][(frames1[symbol]["ot"] >= start) & (frames1[symbol]["ot"] < end)].reset_index(drop=True)
+        frames1d[symbol], daily_fingerprint = (
+            _load_optional_daily_history(store, symbol)
+            if daily_enabled else (pd.DataFrame(), None)
+        )
+        if daily_enabled:
+            frames1d[symbol] = frames1d[symbol][frames1d[symbol]["ot"] < end].reset_index(drop=True)
         fingerprints.extend([
             _manifest_fingerprint(store, symbol, "30m"),
             _manifest_fingerprint(store, symbol, "1m"),
         ])
+        if daily_enabled:
+            fingerprints.append(daily_fingerprint)
     fingerprints.extend([
         _manifest_fingerprint(store, "BTCUSDT", "1h"),
         _manifest_fingerprint(store, "BTCUSDT", "4h"),
@@ -262,14 +299,18 @@ def run_portfolio(args) -> int:
     btc1 = store.read_candles("bitget", "BTCUSDT", "1h")
     btc4 = store.read_candles("bitget", "BTCUSDT", "4h")
     precomputed = {}
-    payloads = [(symbol, frames30[symbol], btc1, btc4, rules, start, end) for symbol in symbols]
+    payloads = [
+        (symbol, frames30[symbol], frames1d[symbol], btc1, btc4, rules, start, end)
+        for symbol in symbols
+    ]
     with ProcessPoolExecutor(max_workers=max(1, int(args.workers))) as pool:
         futures = [pool.submit(_precompute_worker, payload) for payload in payloads]
         for future in as_completed(futures):
             symbol, decisions = future.result()
             precomputed[symbol] = decisions
     result = engine.run(
-        frames30, frames1, _btc_provider(store), entry_start_ms=start, precomputed=precomputed
+        frames30, frames1, _btc_provider(store), entry_start_ms=start,
+        precomputed=precomputed, candles_1d=frames1d,
     )
     status = "READY" if result.metrics["trades"] >= spec.minimum_core_trades else "SAMPLE_NOT_READY"
     run_id = build_run_id(spec.manifest_hash(), ",".join(symbols), fingerprints)
@@ -287,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch = sub.add_parser("download")
     fetch.add_argument("--root", default="backtest_data")
     fetch.add_argument("--symbol", required=True)
-    fetch.add_argument("--interval", choices=("1m", "30m", "1h", "4h"), required=True)
+    fetch.add_argument("--interval", choices=("1m", "30m", "1h", "4h", "1d"), required=True)
     fetch.add_argument("--start", type=int, required=True)
     fetch.add_argument("--end", type=int, required=True)
     fetch.add_argument("--data-version", required=True)

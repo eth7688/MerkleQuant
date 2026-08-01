@@ -8,6 +8,93 @@ import numpy as np
 import pandas as pd
 
 
+DAY_MS = 86_400_000
+
+
+def _empty_daily_pattern(reason: str) -> dict[str, Any]:
+    return {
+        "recorded": False,
+        "kind": "none",
+        "pattern_direction": "NONE",
+        "alignment": "unavailable",
+        "rank": 0,
+        "would_block": False,
+        "candle_open_time": None,
+        "candle_close_time": None,
+        "reason": reason,
+    }
+
+
+def evaluate_daily_pattern_state(
+    frame: pd.DataFrame,
+    direction: str,
+    decision_time: int,
+) -> dict[str, Any]:
+    """Evaluate the latest fully closed Bitget UTC daily candle without lookahead."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return _empty_daily_pattern("daily_history_unavailable")
+    trade_direction = str(direction or "").upper()
+    if trade_direction not in ("LONG", "SHORT"):
+        return _empty_daily_pattern("invalid_direction")
+    try:
+        daily = frame.copy()
+        daily["ot"] = pd.to_numeric(daily["ot"], errors="raise").astype("int64")
+        daily = daily[(daily["ot"] + DAY_MS) <= int(decision_time)]
+        daily = daily.sort_values("ot").drop_duplicates("ot", keep="last").reset_index(drop=True)
+        if daily.empty:
+            return _empty_daily_pattern("no_closed_daily_candle")
+
+        from momentum_reflow import daily_confirmation
+
+        bullish = daily_confirmation(daily, "LONG")
+        bearish = daily_confirmation(daily, "SHORT")
+        candidates = []
+        if bullish.get("passed"):
+            candidates.append(("LONG", bullish))
+        if bearish.get("passed"):
+            candidates.append(("SHORT", bearish))
+
+        candle_open = int(daily["ot"].iloc[-1])
+        if not candidates:
+            return {
+                **_empty_daily_pattern("no_pattern"),
+                "recorded": True,
+                "alignment": "none",
+                "candle_open_time": candle_open,
+                "candle_close_time": candle_open + DAY_MS,
+            }
+
+        best_rank = max(int(item[1].get("rank", 0) or 0) for item in candidates)
+        strongest = [item for item in candidates if int(item[1].get("rank", 0) or 0) == best_rank]
+        if len(strongest) != 1:
+            return {
+                "recorded": True,
+                "kind": "mixed",
+                "pattern_direction": "MIXED",
+                "alignment": "mixed",
+                "rank": best_rank,
+                "would_block": False,
+                "candle_open_time": candle_open,
+                "candle_close_time": candle_open + DAY_MS,
+                "reason": "mixed_same_rank",
+            }
+        pattern_direction, result = strongest[0]
+        alignment = "aligned" if pattern_direction == trade_direction else "opposed"
+        return {
+            "recorded": True,
+            "kind": str(result.get("kind", "none") or "none"),
+            "pattern_direction": pattern_direction,
+            "alignment": alignment,
+            "rank": best_rank,
+            "would_block": alignment == "opposed" and best_rank >= 2,
+            "candle_open_time": candle_open,
+            "candle_close_time": candle_open + DAY_MS,
+            "reason": alignment,
+        }
+    except (KeyError, TypeError, ValueError, IndexError):
+        return _empty_daily_pattern("invalid_daily_history")
+
+
 def _column(frame: pd.DataFrame, short_name: str, long_name: str) -> pd.Series:
     name = short_name if short_name in frame.columns else long_name
     if name not in frame.columns:
