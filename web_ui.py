@@ -1680,7 +1680,12 @@ var _reflowAlertPollPromise=null,_reflowAlertBaselinePromise=null,_reflowAlertGe
 function updateReflowSoundControls(){
   var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
   var state=document.getElementById('reflowSoundState');
+  var toggle=document.getElementById('reflowSoundToggle');
   if(state) state.textContent=_reflowSoundNeedsGesture?'需要点击恢复声音':(enabled?'已开启':'已关闭');
+  if(toggle){
+    toggle.textContent=enabled?'关闭声音提醒':'开启声音提醒';
+    toggle.onclick=function(){return setReflowSoundEnabled(!enabled);};
+  }
 }
 function activateReflowAudio(){
   var AudioCtor=window.AudioContext||window.webkitAudioContext;
@@ -1690,11 +1695,12 @@ function activateReflowAudio(){
     _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
   }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
 }
-function playReflowCoinSound(){
+function playReflowCoinSound(playGuard){
   var AudioCtor=window.AudioContext||window.webkitAudioContext;
   if(!AudioCtor) return Promise.resolve(false);
   _reflowAudioContext=_reflowAudioContext||new AudioCtor();
   return Promise.resolve(_reflowAudioContext.resume()).then(function(){
+    if(playGuard&&!playGuard()) return false;
     var now=_reflowAudioContext.currentTime;
     [880,1175,1568].forEach(function(frequency,index){
       var start=now+index*0.18,osc=_reflowAudioContext.createOscillator(),gain=_reflowAudioContext.createGain();
@@ -1753,7 +1759,8 @@ function pollReflowAlerts(){
     if(!result||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return;
     var data=result.data;
     if(!Array.isArray(data.events)||!data.events.length) return;
-    return playReflowCoinSound().then(function(played){
+    var canPlay=function(){return generation===_reflowAlertGeneration&&localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';};
+    return playReflowCoinSound(canPlay).then(function(played){
       if(played&&generation===_reflowAlertGeneration&&localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1'){
         storeReflowAlertCursor(data.latest_alert_id||result.cursor);
       }
@@ -1774,7 +1781,7 @@ function initReflowAlertSound(){
 function reflowSoundControls(){
   var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
   return '<div class="reflow-sound-controls">'
-    +'<button type="button" onclick="setReflowSoundEnabled('+(!enabled)+')">'
+    +'<button id="reflowSoundToggle" type="button">'
     +(enabled?'关闭声音提醒':'开启声音提醒')+'</button>'
     +'<button type="button" onclick="testReflowCoinSound()">测试声音</button>'
     +'<span id="reflowSoundState"></span></div>';

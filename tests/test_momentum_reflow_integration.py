@@ -416,6 +416,55 @@ assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'7');process.stdout.write('ok');})
 """
         self.assertEqual(run_alert_sound_javascript(body), "ok")
 
+    def test_test_sound_remains_available_while_formal_alerts_are_disabled(self):
+        body = """
+let starts=0;storage[REFLOW_ALERT_SOUND_KEY]='0';storage[REFLOW_ALERT_CURSOR_KEY]='7';
+class FakeAudioContext{
+  constructor(){this.currentTime=10;this.destination={};}resume(){return Promise.resolve();}
+  createOscillator(){return {frequency:{setValueAtTime:()=>{}},connect:()=>{},start:()=>{starts++;},stop:()=>{}};}
+  createGain(){return {gain:{setValueAtTime:()=>{},exponentialRampToValueAtTime:()=>{}},connect:()=>{}};}
+}
+window.AudioContext=FakeAudioContext;
+(async()=>{assert.equal(await testReflowCoinSound(),true);assert.equal(starts,3);
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'7');process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_disable_during_delayed_resume_starts_no_alert_tones(self):
+        body = """
+let resolveResume,starts=0;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+class DelayedAudioContext{
+  constructor(){this.currentTime=10;this.destination={};}
+  resume(){return new Promise(resolve=>{resolveResume=resolve;});}
+  createOscillator(){return {frequency:{setValueAtTime:()=>{}},connect:()=>{},start:()=>{starts++;},stop:()=>{}};}
+  createGain(){return {gain:{setValueAtTime:()=>{},exponentialRampToValueAtTime:()=>{}},connect:()=>{}};}
+}
+window.AudioContext=DelayedAudioContext;fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};
+(async()=>{let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
+await setReflowSoundEnabled(false);resolveResume();await polling;
+assert.equal(starts,0);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_sound_toggle_markup_has_stable_id(self):
+        body = """
+assert.ok(reflowSoundControls().includes('id="reflowSoundToggle"'));process.stdout.write('ok');
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_sound_toggle_updates_label_and_click_action_without_rerender(self):
+        body = """
+let toggle={textContent:'',onclick:null},state={textContent:''},calls=[];
+document.getElementById=id=>id==='reflowSoundToggle'?toggle:id==='reflowSoundState'?state:null;
+setReflowSoundEnabled=enabled=>{calls.push(enabled);return Promise.resolve();};
+(async()=>{storage[REFLOW_ALERT_SOUND_KEY]='1';updateReflowSoundControls();
+assert.equal(toggle.textContent,'关闭声音提醒');await toggle.onclick();assert.deepEqual(calls,[false]);
+storage[REFLOW_ALERT_SOUND_KEY]='0';updateReflowSoundControls();
+assert.equal(toggle.textContent,'开启声音提醒');await toggle.onclick();assert.deepEqual(calls,[false,true]);
+process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
     def test_blocked_playback_keeps_cursor_and_requests_user_gesture(self):
         body = """
 let state={textContent:''};document.getElementById=id=>id==='reflowSoundState'?state:null;
