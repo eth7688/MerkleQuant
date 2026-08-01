@@ -397,6 +397,73 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(json.loads(ledger.read_text(encoding="utf-8"))["wechat_cursor"], 1)
 
+    def test_inflight_delivery_cannot_regress_reenabled_baseline_cursor(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret"
+            save_alert_settings(
+                settings, wechat_enabled=True, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row("first")], 2)
+            observe_reflow_alerts(ledger, [row("second")], 3)
+            http_started = threading.Event()
+            release_http = threading.Event()
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"errcode": 0}
+            calls = []
+            delivery_results = []
+            delivery_errors = []
+
+            def post(*args, **kwargs):
+                calls.append((args, kwargs))
+                if len(calls) == 1:
+                    http_started.set()
+                    if not release_http.wait(5):
+                        raise AssertionError("HTTP test was not released")
+                return response
+
+            def deliver_first():
+                try:
+                    delivery_results.append(
+                        deliver_due_wechat(settings, ledger, 3, post=post)
+                    )
+                except BaseException as error:
+                    delivery_errors.append(error)
+
+            delivery = threading.Thread(target=deliver_first)
+            try:
+                delivery.start()
+                self.assertTrue(http_started.wait(1))
+                save_alert_settings(
+                    settings, wechat_enabled=False, wechat_webhook="",
+                    updated_by="7", now_ms=4,
+                )
+                alerts.enable_wechat_alerts(
+                    settings, ledger, wechat_webhook="", updated_by="7",
+                    now_ms=5,
+                )
+                baseline = json.loads(ledger.read_text(encoding="utf-8"))
+                self.assertEqual(baseline["wechat_cursor"], 2)
+            finally:
+                release_http.set()
+                delivery.join(2)
+
+            self.assertFalse(delivery.is_alive())
+            self.assertEqual(delivery_errors, [])
+            self.assertEqual(delivery_results[0]["status"], "delivered")
+            after_delivery = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(after_delivery["wechat_cursor"], 2)
+            self.assertEqual(
+                deliver_due_wechat(settings, ledger, 6, post=post)["status"],
+                "idle",
+            )
+            self.assertEqual(len(calls), 1)
+
     def test_delivery_http_does_not_hold_general_state_lock(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)

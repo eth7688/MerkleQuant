@@ -433,11 +433,15 @@ def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
         delivery["last_error"] = error_text
         if outcome == "delivered":
             delivery["status"] = "delivered"
-            ledger["wechat_cursor"] = current["alert_id"]
+            ledger["wechat_cursor"] = max(
+                ledger["wechat_cursor"], current["alert_id"]
+            )
         elif delivery["attempts"] >= MAX_ATTEMPTS:
             delivery["status"] = "failed"
             delivery["next_attempt_at"] = 0
-            ledger["wechat_cursor"] = current["alert_id"]
+            ledger["wechat_cursor"] = max(
+                ledger["wechat_cursor"], current["alert_id"]
+            )
             outcome = "failed"
         else:
             delivery["status"] = "pending"
