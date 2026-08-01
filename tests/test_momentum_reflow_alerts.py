@@ -77,6 +77,24 @@ class ReflowAlertLedgerTests(unittest.TestCase):
                 read_public_alerts(path, 0)
             self.assertEqual(path.read_bytes(), original)
 
+    def test_semantically_inconsistent_ledger_fails_closed_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            path.write_text(json.dumps({
+                "version": 1, "initialized": True, "next_alert_id": 2,
+                "wechat_cursor": 0, "observed": {}, "events": [{
+                    "alert_id": 1, "signal_key": "BTC-LONG-1", "created_at": 1,
+                    "trigger": "new_signal", "snapshot": {}, "wechat": {
+                        "status": "pending", "attempts": 0, "last_attempt_at": 0,
+                        "next_attempt_at": 1, "last_error": "",
+                    },
+                }],
+            }), encoding="utf-8")
+            original = path.read_bytes()
+            with self.assertRaises(ValueError):
+                observe_reflow_alerts(path, [row()], 2_000)
+            self.assertEqual(path.read_bytes(), original)
+
     def test_webhook_is_masked_and_blank_save_preserves_secret(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"

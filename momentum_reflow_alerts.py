@@ -89,10 +89,11 @@ def _validate_ledger(value: dict) -> dict:
                 or type(observed.get("ever_high")) is not bool
                 or type(observed.get("last_quality_label")) is not str):
             raise ValueError("reflow alert observed entry is invalid")
-    for event in value["events"]:
+    for expected_alert_id, event in enumerate(value["events"], start=1):
         delivery = event.get("wechat") if isinstance(event, dict) else None
         if (not isinstance(event, dict)
                 or type(event.get("alert_id")) is not int
+                or event["alert_id"] != expected_alert_id
                 or type(event.get("signal_key")) is not str
                 or event.get("trigger") not in {"new_signal", "upgraded_high"}
                 or type(event.get("created_at")) is not int
@@ -104,6 +105,13 @@ def _validate_ledger(value: dict) -> dict:
                 or type(delivery.get("next_attempt_at")) is not int
                 or type(delivery.get("last_error")) is not str):
             raise ValueError("reflow alert event entry is invalid")
+        observed = value["observed"].get(event["signal_key"])
+        if not observed or not observed["ever_high"]:
+            raise ValueError("reflow alert event observation is invalid")
+    last_alert_id = len(value["events"])
+    if (value["next_alert_id"] != last_alert_id + 1
+            or not 0 <= value["wechat_cursor"] <= last_alert_id):
+        raise ValueError("reflow alert ledger sequence is invalid")
     return value
 
 
