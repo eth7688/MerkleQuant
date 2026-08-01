@@ -31,13 +31,16 @@ def run_admin_javascript(test_body):
         const ids = [
           'reflowAutoEnabled', 'reflowEnabledState', 'reflowUpdatedAt',
           'reflowUpdatedBy', 'reflowLastScan', 'reflowNextScan',
-          'reflowLastError', 'reflowSaveError'
+          'reflowLastError', 'reflowSaveError',
+          'reflowWechatEnabled', 'reflowWebhook', 'reflowWebhookMask',
+          'reflowWechatState', 'reflowWechatTest', 'reflowWechatTestState',
+          'reflowWechatDeliveryState', 'reflowAlertSaveError'
         ];
         let elements = {};
         function newElement(id) {
           return {
             id:id, checked:false, disabled:false, dataset:{},
-            style:{display:'none'}, textContent:'', onchange:null
+            style:{display:'none'}, textContent:'', value:'', onchange:null
           };
         }
         function replacePanelElements() {
@@ -69,6 +72,7 @@ def run_admin_javascript(test_body):
         const requests = [];
         global.fetch = function(){
           const request = deferred();
+          request.args = Array.prototype.slice.call(arguments);
           requests.push(request);
           return request.promise;
         };
@@ -344,7 +348,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(currentBox.disabled, true);
                   assert.strictEqual(currentState.textContent, '');
 
-                  requests[1].resolve(response(true, {
+                  requests[2].resolve(response(true, {
                     auto_scan_enabled:false, updated_at:400, updated_by:'current',
                     last_auto_scan_at:500, next_scan_at:600,
                     last_auto_error:'', scheduler_status:'available'
@@ -378,7 +382,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   renderReflow(content);
                   const currentBox = elements.reflowAutoEnabled;
                   const currentError = elements.reflowSaveError;
-                  requests[1].resolve(response(false, {error:'stale failure'}));
+                  requests[2].resolve(response(false, {error:'stale failure'}));
                   await flush();
 
                   assert.strictEqual(detachedBox.checked, true);
@@ -388,7 +392,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(currentBox.disabled, true);
                   assert.strictEqual(currentError.style.display, 'none');
 
-                  requests[2].resolve(response(true, {
+                  requests[3].resolve(response(true, {
                     auto_scan_enabled:false, updated_at:300, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:400,
                     last_auto_error:'', scheduler_status:'available'
@@ -396,7 +400,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   await flush();
                   currentBox.checked = true;
                   currentBox.onchange();
-                  requests[3].resolve(response(false, {error:'current failure'}));
+                  requests[5].resolve(response(false, {error:'current failure'}));
                   await flush();
 
                   assert.strictEqual(currentBox.checked, false);
@@ -424,7 +428,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
 
                   renderReflow(content);
                   const oldSnapshotBox = elements.reflowAutoEnabled;
-                  requests[2].resolve(response(true, {
+                  requests[3].resolve(response(true, {
                     auto_scan_enabled:false, updated_at:100, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:200,
                     last_auto_error:'', scheduler_status:'available'
@@ -432,20 +436,20 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   await flush();
                   assert.strictEqual(oldSnapshotBox.checked, false);
 
-                  requests[1].resolve(response(true, {
+                  requests[2].resolve(response(true, {
                     ok:true, auto_scan_enabled:true,
                     updated_at:300, updated_by:'admin'
                   }));
                   await flush();
 
-                  assert.strictEqual(requests.length, 4);
+                  assert.strictEqual(requests.length, 7);
                   assert.strictEqual(detachedBox.checked, true);
                   assert.strictEqual(detachedBox.disabled, true);
                   assert.strictEqual(detachedBox.onchange instanceof Function, true);
                   const refreshedBox = elements.reflowAutoEnabled;
                   const refreshedState = elements.reflowEnabledState;
                   assert.notStrictEqual(refreshedBox, oldSnapshotBox);
-                  requests[3].resolve(response(true, {
+                  requests[5].resolve(response(true, {
                     auto_scan_enabled:true, updated_at:300, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:400,
                     last_auto_error:'', scheduler_status:'available'
@@ -456,7 +460,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(refreshedBox.disabled, false);
                   assert.strictEqual(refreshedState.textContent, '已启用');
                   await flush();
-                  assert.strictEqual(requests.length, 4);
+                  assert.strictEqual(requests.length, 7);
                 """
             )
         )
@@ -477,7 +481,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   firstBox.onchange();
 
                   renderReflow(content);
-                  requests[2].resolve(response(true, {
+                  requests[3].resolve(response(true, {
                     auto_scan_enabled:false, updated_at:100, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:200,
                     last_auto_error:'', scheduler_status:'available'
@@ -488,14 +492,14 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   secondBox.checked = false;
                   secondBox.onchange();
 
-                  requests[1].resolve(response(true, {
+                  requests[2].resolve(response(true, {
                     ok:true, auto_scan_enabled:true,
                     updated_at:300, updated_by:'admin'
                   }));
                   await flush();
-                  assert.strictEqual(requests.length, 5);
+                  assert.strictEqual(requests.length, 8);
                   const interimBox = elements.reflowAutoEnabled;
-                  requests[4].resolve(response(true, {
+                  requests[6].resolve(response(true, {
                     auto_scan_enabled:true, updated_at:300, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:400,
                     last_auto_error:'', scheduler_status:'available'
@@ -503,18 +507,18 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   await flush();
                   assert.strictEqual(interimBox.checked, true);
 
-                  requests[3].resolve(response(true, {
+                  requests[5].resolve(response(true, {
                     ok:true, auto_scan_enabled:false,
                     updated_at:500, updated_by:'admin'
                   }));
                   await flush();
-                  assert.strictEqual(requests.length, 6);
+                  assert.strictEqual(requests.length, 10);
                   assert.strictEqual(secondBox.checked, false);
                   assert.strictEqual(secondBox.disabled, true);
                   assert.strictEqual(secondError.style.display, 'none');
                   const finalBox = elements.reflowAutoEnabled;
                   const finalState = elements.reflowEnabledState;
-                  requests[5].resolve(response(true, {
+                  requests[8].resolve(response(true, {
                     auto_scan_enabled:false, updated_at:500, updated_by:'admin',
                     last_auto_scan_at:0, next_scan_at:600,
                     last_auto_error:'', scheduler_status:'available'
@@ -525,7 +529,7 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(finalBox.disabled, false);
                   assert.strictEqual(finalState.textContent, '已关闭');
                   await flush();
-                  assert.strictEqual(requests.length, 6);
+                  assert.strictEqual(requests.length, 10);
                 """
             )
         )
@@ -548,15 +552,15 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   detachedBox.onchange();
 
                   switchPage('dashboard');
-                  assert.strictEqual(requests.length, 3);
+                  assert.strictEqual(requests.length, 4);
                   assert.strictEqual(elements.reflowAutoEnabled, detachedBox);
-                  requests[1].resolve(response(true, {
+                  requests[2].resolve(response(true, {
                     ok:true, auto_scan_enabled:true,
                     updated_at:300, updated_by:'admin'
                   }));
                   await flush();
 
-                  assert.strictEqual(requests.length, 3);
+                  assert.strictEqual(requests.length, 4);
                   assert.strictEqual(elements.reflowAutoEnabled, detachedBox);
                   assert.strictEqual(detachedBox.checked, true);
                   assert.strictEqual(detachedBox.disabled, true);
@@ -564,6 +568,199 @@ class MomentumReflowAdminTests(unittest.TestCase):
                   assert.strictEqual(detachedState.textContent, '已关闭');
                   assert.strictEqual(detachedError.style.display, 'none');
                   assert.strictEqual(detachedError.textContent, '');
+                """
+            )
+        )
+
+
+class MomentumReflowAlertAdminTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.settings = root / "alert_settings.json"
+        self.ledger = root / "alerts.json"
+        self.patches = [
+            patch.object(
+                admin_server, "_REFLOW_ALERT_SETTINGS_PATH", self.settings, create=True
+            ),
+            patch.object(
+                admin_server, "_REFLOW_ALERT_LEDGER_PATH", self.ledger, create=True
+            ),
+        ]
+        for item in self.patches:
+            item.start()
+        admin_server.app.config.update(TESTING=True)
+        self.client = admin_server.app.test_client()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp_dir.cleanup()
+
+    def test_alert_settings_require_admin(self):
+        self.assertEqual(
+            self.client.get("/api/reflow/alert-settings").status_code, 403
+        )
+        self.assertEqual(
+            self.client.post("/api/reflow/alert-settings", json={}).status_code, 403
+        )
+        self.assertEqual(
+            self.client.post("/api/reflow/alert-settings/test").status_code, 403
+        )
+
+    def test_admin_saves_secret_but_response_only_contains_mask(self):
+        login_admin(self.client)
+        url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret-1234"
+
+        response = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": False, "wechat_webhook": url},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            url in response.get_data(as_text=True),
+            "response leaked configured webhook",
+        )
+        self.assertNotIn("wechat_webhook", response.get_json())
+        self.assertEqual(response.get_json()["webhook_mask"], "****1234")
+        self.assertEqual(
+            admin_server.load_alert_settings(self.settings)["wechat_webhook"], url
+        )
+
+    def test_blank_input_preserves_saved_secret(self):
+        login_admin(self.client)
+        url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret-1234"
+        first = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": False, "wechat_webhook": url},
+        )
+        self.assertEqual(first.status_code, 200)
+
+        response = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": False, "wechat_webhook": ""},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["webhook_mask"], "****1234")
+        self.assertEqual(
+            admin_server.load_alert_settings(self.settings)["wechat_webhook"], url
+        )
+
+    def test_enabling_without_webhook_is_rejected(self):
+        login_admin(self.client)
+
+        response = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": True, "wechat_webhook": ""},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_enable_transition_baselines_existing_events_while_disabled(self):
+        login_admin(self.client)
+        url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret"
+
+        def baseline_while_disabled(path):
+            self.assertFalse(
+                admin_server.load_alert_settings(self.settings)["wechat_enabled"]
+            )
+            return 7
+
+        with patch.object(
+            admin_server,
+            "baseline_wechat_delivery",
+            side_effect=baseline_while_disabled,
+        ) as baseline:
+            response = self.client.post(
+                "/api/reflow/alert-settings",
+                json={"wechat_enabled": True, "wechat_webhook": url},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        baseline.assert_called_once_with(self.ledger)
+
+    def test_invalid_webhook_is_rejected_before_baseline(self):
+        login_admin(self.client)
+        with patch.object(admin_server, "baseline_wechat_delivery") as baseline:
+            response = self.client.post(
+                "/api/reflow/alert-settings",
+                json={"wechat_enabled": True, "wechat_webhook": "https://invalid.test"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        baseline.assert_not_called()
+        saved = admin_server.load_alert_settings(self.settings)
+        self.assertFalse(saved["wechat_enabled"])
+        self.assertEqual(saved["wechat_webhook"], "")
+
+    def test_corrupt_ledger_is_reported_unavailable_without_secret(self):
+        login_admin(self.client)
+        self.ledger.write_text("{broken", encoding="utf-8")
+
+        response = self.client.get("/api/reflow/alert-settings")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["last_delivery_status"], "unavailable")
+        self.assertNotIn("webhook/send?key=", response.get_data(as_text=True))
+
+    def test_test_route_uses_saved_webhook_without_returning_it(self):
+        login_admin(self.client)
+        with patch.object(
+            admin_server,
+            "test_wechat_webhook",
+            return_value={"last_test_ok": True, "webhook_mask": "****1234"},
+        ) as send:
+            response = self.client.post("/api/reflow/alert-settings/test")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["last_test_ok"])
+        self.assertNotIn("wechat_webhook", response.get_json())
+        send.assert_called_once()
+
+    def test_alert_controls_keep_mask_on_blank_save_and_call_test_route(self):
+        run_admin_javascript(
+            textwrap.dedent(
+                """
+                  renderReflow(content);
+                  requests[0].resolve(response(true, {
+                    auto_scan_enabled:true, updated_at:1, updated_by:'admin',
+                    last_auto_scan_at:0, next_scan_at:2, last_auto_error:'',
+                    scheduler_status:'available'
+                  }));
+                  requests[1].resolve(response(true, {
+                    wechat_enabled:false, webhook_configured:true,
+                    webhook_mask:'****1234', last_test_at:0,
+                    last_test_ok:false, last_test_error:'',
+                    last_delivery_at:0, last_delivery_status:'none',
+                    last_delivery_alert_id:0, last_delivery_error:''
+                  }));
+                  await flush();
+                  assert.strictEqual(elements.reflowWebhookMask.textContent, '****1234');
+                  elements.reflowWechatEnabled.checked=true;
+                  elements.reflowWebhook.value='';
+                  saveReflowAlertSetting();
+                  assert.strictEqual(
+                    JSON.parse(requests[2].args[1].body).wechat_webhook, ''
+                  );
+                  requests[2].resolve(response(true, {
+                    ok:true, wechat_enabled:true, webhook_configured:true,
+                    webhook_mask:'****1234'
+                  }));
+                  await flush();
+                  assert.strictEqual(elements.reflowWebhookMask.textContent, '****1234');
+                  testReflowWechat();
+                  assert.strictEqual(
+                    requests[3].args[0], '/api/reflow/alert-settings/test'
+                  );
+                  requests[3].resolve(response(true, {
+                    last_test_ok:true, webhook_mask:'****1234'
+                  }));
+                  await flush();
+                  assert.strictEqual(
+                    elements.reflowWechatTestState.textContent, '测试消息已发送'
+                  );
                 """
             )
         )

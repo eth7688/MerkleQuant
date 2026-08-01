@@ -8,6 +8,15 @@ from flask import Flask, render_template_string, jsonify, request, session
 from functools import wraps
 import secrets, os, sys
 from momentum_reflow_dashboard import load_reflow_settings, save_reflow_settings
+from momentum_reflow_alerts import (
+    baseline_wechat_delivery,
+    load_alert_settings,
+    public_alert_settings,
+    read_delivery_status,
+    save_alert_settings,
+    test_wechat_webhook,
+    validate_wechat_webhook,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -137,6 +146,8 @@ import requests as _requests
 _WEB_UI = "http://127.0.0.1:5000"
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REFLOW_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_settings.json"
+_REFLOW_ALERT_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_alert_settings.json"
+_REFLOW_ALERT_LEDGER_PATH = Path(_BASE_DIR) / "momentum_reflow_alerts.json"
 
 def _normalize_reflow_scheduler_status(scheduler):
     if not isinstance(scheduler, dict):
@@ -196,6 +207,71 @@ def api_reflow_settings():
     except Exception:
         status = {"scheduler_status": "unavailable"}
     return jsonify({**settings, **status})
+
+
+@app.route("/api/reflow/alert-settings", methods=["GET", "POST"])
+@admin_required
+def api_reflow_alert_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    if request.method == "GET":
+        try:
+            public = public_alert_settings(
+                load_alert_settings(_REFLOW_ALERT_SETTINGS_PATH)
+            )
+        except (TypeError, ValueError):
+            return jsonify({"error": "警报设置不可读"}), 500
+        try:
+            public.update(read_delivery_status(_REFLOW_ALERT_LEDGER_PATH))
+        except ValueError:
+            public.update(
+                last_delivery_at=0,
+                last_delivery_status="unavailable",
+                last_delivery_alert_id=0,
+                last_delivery_error="警报账本不可读，已停止发送",
+            )
+        return jsonify(public)
+
+    data = request.get_json(silent=True)
+    enabled = data.get("wechat_enabled") if isinstance(data, dict) else None
+    webhook = data.get("wechat_webhook") if isinstance(data, dict) else None
+    if type(enabled) is not bool or (
+        webhook is not None and not isinstance(webhook, str)
+    ):
+        return jsonify({"error": "invalid alert settings"}), 400
+    try:
+        previous = load_alert_settings(_REFLOW_ALERT_SETTINGS_PATH)
+        candidate = (webhook or previous["wechat_webhook"]).strip()
+        if enabled:
+            validate_wechat_webhook(candidate)
+        if enabled and not previous["wechat_enabled"]:
+            baseline_wechat_delivery(_REFLOW_ALERT_LEDGER_PATH)
+        saved = save_alert_settings(
+            _REFLOW_ALERT_SETTINGS_PATH,
+            wechat_enabled=enabled,
+            wechat_webhook=webhook,
+            updated_by=str(session["admin_id"]),
+            now_ms=int(time.time() * 1000),
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid alert settings"}), 400
+    return jsonify({"ok": True, **public_alert_settings(saved)})
+
+
+@app.route("/api/reflow/alert-settings/test", methods=["POST"])
+@admin_required
+def api_reflow_alert_test():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    try:
+        result = test_wechat_webhook(
+            _REFLOW_ALERT_SETTINGS_PATH, int(time.time() * 1000)
+        )
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "last_test_ok": False,
+                        "last_test_error": "警报设置不可读"}), 400
+    status = 200 if result["last_test_ok"] else 502
+    return jsonify({"ok": bool(result["last_test_ok"]), **result}), status
 
 @app.route("/api/admin/demo/status")
 @admin_required
@@ -450,6 +526,27 @@ function renderReflow(el){
       '<div class="stat-box"><div class="label">最近错误</div><div id="reflowLastError" style="font-size:12px;color:var(--s-red)">--</div></div>'+
     '</div>'+
     '<p style="color:var(--muted);font-size:12px;line-height:1.7;margin-top:18px">关闭自动扫描不会删除历史记录，手动扫描仍可使用。</p>'+
+  '</div>'+
+  '<div class="card reflow-alert-card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">企业微信警报</h3>'+
+      '<p style="color:var(--muted);font-size:12px;line-height:1.7">仅发送新出现或升级的高质量信号</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer">'+
+        '<input id="reflowWechatEnabled" type="checkbox" style="width:auto">企业微信高质量警报</label>'+
+    '</div>'+
+    '<div id="reflowAlertSaveError" role="alert" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div class="field"><label>Webhook</label><input id="reflowWebhook" type="password" autocomplete="off" placeholder="粘贴企业微信群机器人 Webhook"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:14px 0">'+
+      '<div class="stat-box"><div class="label">已保存凭证</div><div id="reflowWebhookMask" style="font:12px var(--font-mono)">未配置</div></div>'+
+      '<div class="stat-box"><div class="label">警报状态</div><div id="reflowWechatState" style="font-size:12px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近测试</div><div id="reflowWechatTestState" style="font-size:12px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近正式发送</div><div id="reflowWechatDeliveryState" style="font-size:12px">--</div></div>'+
+    '</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+      '<button type="button" class="btn btn-primary" onclick="saveReflowAlertSetting()">保存警报设置</button>'+
+      '<button id="reflowWechatTest" type="button" class="btn" onclick="testReflowWechat()">发送测试消息</button>'+
+    '</div>'+
+    '<small style="display:block;color:var(--muted);font-size:11px;line-height:1.6;margin-top:14px">网络超时可能造成企业微信已收到、服务器未收到回执，有限重试时存在极低概率重复。</small>'+
   '</div>';
   var box=document.getElementById('reflowAutoEnabled');
   box.dataset.renderGeneration=String(generation);
@@ -477,6 +574,42 @@ function renderReflow(el){
     var error=document.getElementById('reflowSaveError');
     error.style.display='block';
     error.textContent=reason.message||'读取设置失败';
+  });
+  var wechatBox=document.getElementById('reflowWechatEnabled');
+  var testButton=document.getElementById('reflowWechatTest');
+  wechatBox.disabled=true;
+  testButton.disabled=true;
+  fetch('/api/reflow/alert-settings').then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok) throw new Error(data.error||'读取警报设置失败');
+      return data;
+    });
+  }).then(function(data){
+    if(_currentPage!=='reflow'||generation!==_reflowRenderGeneration||
+       document.getElementById('reflowWechatEnabled')!==wechatBox) return;
+    wechatBox.checked=Boolean(data.wechat_enabled);
+    wechatBox.disabled=false;
+    testButton.disabled=false;
+    document.getElementById('reflowWechatState').textContent=
+      wechatBox.checked?'已启用':'已关闭';
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+    document.getElementById('reflowWechatTestState').textContent=
+      data.last_test_at?
+        ((data.last_test_ok?'成功 · ':'失败 · ')+formatReflowTime(data.last_test_at)+
+         (data.last_test_error?' · '+data.last_test_error:'')):'尚未测试';
+    var deliveryLabels={none:'尚无发送记录',pending:'等待发送',
+      delivered:'发送成功',failed:'发送失败',unavailable:'状态不可用'};
+    var delivery=deliveryLabels[data.last_delivery_status]||'状态不可用';
+    if(data.last_delivery_at) delivery+=' · '+formatReflowTime(data.last_delivery_at);
+    if(data.last_delivery_error) delivery+=' · '+data.last_delivery_error;
+    document.getElementById('reflowWechatDeliveryState').textContent=delivery;
+  }).catch(function(reason){
+    if(_currentPage!=='reflow'||generation!==_reflowRenderGeneration||
+       document.getElementById('reflowWechatEnabled')!==wechatBox) return;
+    var error=document.getElementById('reflowAlertSaveError');
+    error.style.display='block';
+    error.textContent=reason.message||'读取警报设置失败';
   });
 }
 function saveReflowSetting(){
@@ -514,6 +647,54 @@ function saveReflowSetting(){
   }).finally(function(){
     if(!isCurrentReflowRender(generation,box)) return;
     box.disabled=false;
+  });
+}
+function saveReflowAlertSetting(){
+  var enabled=document.getElementById('reflowWechatEnabled');
+  var webhook=document.getElementById('reflowWebhook');
+  var error=document.getElementById('reflowAlertSaveError');
+  error.style.display='none';
+  error.textContent='';
+  fetch('/api/reflow/alert-settings',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({wechat_enabled:Boolean(enabled.checked),wechat_webhook:webhook.value})
+  }).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.ok) throw new Error(data.error||'保存失败');
+      return data;
+    });
+  }).then(function(data){
+    webhook.value='';
+    enabled.checked=Boolean(data.wechat_enabled);
+    document.getElementById('reflowWechatState').textContent=
+      enabled.checked?'已启用':'已关闭';
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+  }).catch(function(reason){
+    error.style.display='block';
+    error.textContent=reason.message||'保存失败';
+  });
+}
+function testReflowWechat(){
+  var button=document.getElementById('reflowWechatTest');
+  var state=document.getElementById('reflowWechatTestState');
+  button.disabled=true;
+  state.textContent='正在发送测试消息...';
+  fetch('/api/reflow/alert-settings/test',{method:'POST'}).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.last_test_ok){
+        throw new Error(data.last_test_error||data.error||'测试失败');
+      }
+      return data;
+    });
+  }).then(function(data){
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+    state.textContent='测试消息已发送';
+  }).catch(function(reason){
+    state.textContent=reason.message||'测试失败';
+  }).finally(function(){
+    button.disabled=false;
   });
 }
 function openFuelTopup(uid,uname){
