@@ -189,6 +189,35 @@ class ReflowAlertLedgerTests(unittest.TestCase):
 
 
 class ReflowWechatDeliveryTests(unittest.TestCase):
+    def test_test_webhook_rejects_invalid_stored_webhook_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            settings = Path(folder) / "settings.json"
+            settings.write_text(json.dumps({
+                "version": 1, "wechat_enabled": False,
+                "wechat_webhook": "https://example.com/not-official",
+                "updated_at": 1, "updated_by": "7", "last_test_at": 0,
+                "last_test_ok": False, "last_test_error": "",
+            }), encoding="utf-8")
+            original = settings.read_bytes()
+            with self.assertRaises(ValueError):
+                test_wechat_webhook(settings, 2)
+            self.assertEqual(settings.read_bytes(), original)
+
+    def test_delivery_rejects_enabled_empty_stored_webhook_without_writing(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            settings.write_text(json.dumps({
+                "version": 1, "wechat_enabled": True, "wechat_webhook": "",
+                "updated_at": 1, "updated_by": "7", "last_test_at": 0,
+                "last_test_ok": False, "last_test_error": "",
+            }), encoding="utf-8")
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            settings_before = settings.read_bytes(); ledger_before = ledger.read_bytes()
+            with self.assertRaises(ValueError):
+                deliver_due_wechat(settings, ledger, 2)
+            self.assertEqual(settings.read_bytes(), settings_before)
+            self.assertEqual(ledger.read_bytes(), ledger_before)
+
     def test_concurrent_delivery_sends_once_and_advances_cursor_monotonically(self):
         with TemporaryDirectory() as folder:
             root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"

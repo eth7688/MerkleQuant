@@ -93,6 +93,10 @@ def _validate_settings(value: dict) -> dict:
             or type(value.get("last_test_ok")) is not bool
             or type(value.get("last_test_error")) is not str):
         raise ValueError("reflow alert settings version or shape is invalid")
+    if value["wechat_webhook"]:
+        validate_wechat_webhook(value["wechat_webhook"])
+    elif value["wechat_enabled"]:
+        raise ValueError("wechat webhook is required")
     return value
 
 
