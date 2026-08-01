@@ -552,6 +552,7 @@ def _scan_symbol(
             closed_only=True,
             market_type="futures",
             testnet=False,
+            bitget_granularity="1Dutc",
         )
         if not isinstance(daily, pd.DataFrame) or daily.empty:
             raise ValueError("daily candle history is unavailable")

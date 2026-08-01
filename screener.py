@@ -201,10 +201,17 @@ def _closed_kline_frame(df, interval, limit=None):
         return df.tail(limit).reset_index(drop=True) if limit else df
 
 def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True,
-                 market_type=None, testnet=None, price_type=None):
+                 market_type=None, testnet=None, price_type=None,
+                 bitget_granularity=None):
     ex = exchange if exchange is not None else _exchange
     if ex == "bitget":
-        return _fetch_klines_bitget(symbol, interval, limit, closed_only=closed_only)
+        return _fetch_klines_bitget(
+            symbol,
+            interval,
+            limit,
+            closed_only=closed_only,
+            granularity=bitget_granularity,
+        )
     if str(market_type or "spot").lower() == "futures":
         base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
         endpoint = "markPriceKlines" if str(price_type or "").lower() == "mark" else "klines"
@@ -475,9 +482,13 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,
     return frame
 
 
-def _fetch_klines_bitget(symbol, interval, limit=200, closed_only=True):
-    granularity = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",
-                   "1h":"1H","4h":"4H","1d":"1D","1w":"1W"}.get(interval,"1H")
+def _fetch_klines_bitget(
+    symbol, interval, limit=200, closed_only=True, granularity=None
+):
+    granularity = granularity or {
+        "1m":"1m","5m":"5m","15m":"15m","30m":"30m",
+        "1h":"1H","4h":"4H","1d":"1D","1w":"1W"
+    }.get(interval,"1H")
     try:
         req_limit = min(int(limit) + 1, 1000) if closed_only else int(limit)
         params = {"symbol": symbol, "granularity": granularity, "limit": str(req_limit),

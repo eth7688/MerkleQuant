@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 import momentum_reflow
+import screener
 
 from momentum_reflow import (
     add_hourly_indicators,
@@ -462,6 +463,34 @@ def make_return_window_hourly_history(symbol):
     return hourly
 
 
+class BitgetDailyBoundaryRoutingTests(unittest.TestCase):
+    @patch("screener.requests.get")
+    def test_bitget_daily_defaults_to_exchange_daily_boundary(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": "00000", "data": []}
+        get.return_value = response
+
+        screener.fetch_klines("TRXUSDT", "1d", 40, exchange="bitget")
+
+        self.assertEqual(get.call_args.kwargs["params"]["granularity"], "1D")
+
+    @patch("screener.requests.get")
+    def test_bitget_daily_accepts_utc_boundary_override(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": "00000", "data": []}
+        get.return_value = response
+
+        screener.fetch_klines(
+            "TRXUSDT",
+            "1d",
+            40,
+            exchange="bitget",
+            bitget_granularity="1Dutc",
+        )
+
+        self.assertEqual(get.call_args.kwargs["params"]["granularity"], "1Dutc")
+
+
 class ReflowScanServiceTests(unittest.TestCase):
     @patch("momentum_reflow.ThreadPoolExecutor")
     @patch("momentum_reflow.fetch_futures_universe")
@@ -748,7 +777,7 @@ class ReflowScanServiceTests(unittest.TestCase):
         )
         latest.assert_any_call(
             "OLDUSDT", "1d", 40, exchange="bitget", closed_only=True,
-            market_type="futures", testnet=False,
+            market_type="futures", testnet=False, bitget_granularity="1Dutc",
         )
         ranged.assert_called_once_with(
             "OLDUSDT", "1h", 0, exchange="bitget",
