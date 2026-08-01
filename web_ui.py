@@ -1675,6 +1675,7 @@ var _reflowPayload={rows:[]};
 var REFLOW_ALERT_SOUND_KEY='axiom_reflow_alert_sound_v1';
 var REFLOW_ALERT_CURSOR_KEY='axiom_reflow_alert_cursor_v1';
 var _reflowAlertTimer=null,_reflowAudioContext=null,_reflowSoundNeedsGesture=false;
+var _reflowAlertPollPromise=null,_reflowAlertBaselinePromise=null,_reflowAlertGeneration=0;
 
 function updateReflowSoundControls(){
   var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
@@ -1705,32 +1706,68 @@ function playReflowCoinSound(){
     _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
   }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
 }
+function fetchReflowAlertBaseline(){
+  return fetch('/api/reflow/alerts?after=0').then(function(response){
+    if(!response.ok) throw new Error('alert baseline failed');
+    return response.json();
+  });
+}
+function storeReflowAlertCursor(latestAlertId){
+  var current=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY),10);
+  var latest=parseInt(latestAlertId||0,10);
+  if(!isFinite(latest)||latest<0) latest=0;
+  if(isFinite(current)) latest=Math.max(current,latest);
+  localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(latest));
+}
 function setReflowSoundEnabled(enabled){
-  localStorage.setItem(REFLOW_ALERT_SOUND_KEY,enabled?'1':'0');
+  var generation=++_reflowAlertGeneration;
+  localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'0');
   if(!enabled){updateReflowSoundControls();return Promise.resolve();}
-  return activateReflowAudio().then(function(){
-    return fetch('/api/reflow/alerts?after=0').then(function(r){return r.json();});
-  }).then(function(data){localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||0));updateReflowSoundControls();});
+  return activateReflowAudio().then(function(active){
+    if(!active||generation!==_reflowAlertGeneration) return null;
+    return fetchReflowAlertBaseline();
+  }).then(function(data){
+    if(!data||generation!==_reflowAlertGeneration) return;
+    storeReflowAlertCursor(data.latest_alert_id);
+    _reflowAlertBaselinePromise=Promise.resolve(true);
+    localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'1');
+    updateReflowSoundControls();
+  }).catch(function(){
+    if(generation===_reflowAlertGeneration){localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'0');updateReflowSoundControls();}
+  });
 }
 function testReflowCoinSound(){return playReflowCoinSound();}
 function pollReflowAlerts(){
   if(localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
-  var cursor=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)||'0',10);
-  return fetch('/api/reflow/alerts?after='+cursor).then(function(response){
-    if(!response.ok) throw new Error('alert poll failed');return response.json();
-  }).then(function(data){
+  if(_reflowAlertPollPromise) return _reflowAlertPollPromise;
+  var generation=_reflowAlertGeneration;
+  var ready=_reflowAlertBaselinePromise||Promise.resolve(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)!==null);
+  var work=Promise.resolve(ready).then(function(baselineReady){
+    if(!baselineReady||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return null;
+    var cursor=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY),10);
+    if(!isFinite(cursor)) return null;
+    return fetch('/api/reflow/alerts?after='+cursor).then(function(response){
+      if(!response.ok) throw new Error('alert poll failed');return response.json();
+    }).then(function(data){return {cursor:cursor,data:data};});
+  }).then(function(result){
+    if(!result||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return;
+    var data=result.data;
     if(!Array.isArray(data.events)||!data.events.length) return;
     return playReflowCoinSound().then(function(played){
-      if(played) localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||cursor));
+      if(played&&generation===_reflowAlertGeneration&&localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1'){
+        storeReflowAlertCursor(data.latest_alert_id||result.cursor);
+      }
     });
   }).catch(function(){});
+  _reflowAlertPollPromise=work.then(function(value){_reflowAlertPollPromise=null;return value;});
+  return _reflowAlertPollPromise;
 }
 function initReflowAlertSound(){
   if(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)===null){
-    fetch('/api/reflow/alerts?after=0').then(function(r){return r.ok?r.json():null;}).then(function(data){
-      if(data) localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||0));
-    }).catch(function(){});
-  }
+    _reflowAlertBaselinePromise=fetchReflowAlertBaseline().then(function(data){
+      storeReflowAlertCursor(data.latest_alert_id);return true;
+    }).catch(function(){return false;});
+  }else if(!_reflowAlertBaselinePromise) _reflowAlertBaselinePromise=Promise.resolve(true);
   if(!_reflowAlertTimer) _reflowAlertTimer=setInterval(pollReflowAlerts,5000);
   updateReflowSoundControls();
 }
