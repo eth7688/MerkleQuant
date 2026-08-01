@@ -9,13 +9,12 @@ from functools import wraps
 import secrets, os, sys
 from momentum_reflow_dashboard import load_reflow_settings, save_reflow_settings
 from momentum_reflow_alerts import (
-    baseline_wechat_delivery,
+    enable_wechat_alerts,
     load_alert_settings,
     public_alert_settings,
     read_delivery_status,
     save_alert_settings,
     test_wechat_webhook,
-    validate_wechat_webhook,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -240,19 +239,22 @@ def api_reflow_alert_settings():
     ):
         return jsonify({"error": "invalid alert settings"}), 400
     try:
-        previous = load_alert_settings(_REFLOW_ALERT_SETTINGS_PATH)
-        candidate = (webhook or previous["wechat_webhook"]).strip()
         if enabled:
-            validate_wechat_webhook(candidate)
-        if enabled and not previous["wechat_enabled"]:
-            baseline_wechat_delivery(_REFLOW_ALERT_LEDGER_PATH)
-        saved = save_alert_settings(
-            _REFLOW_ALERT_SETTINGS_PATH,
-            wechat_enabled=enabled,
-            wechat_webhook=webhook,
-            updated_by=str(session["admin_id"]),
-            now_ms=int(time.time() * 1000),
-        )
+            saved = enable_wechat_alerts(
+                _REFLOW_ALERT_SETTINGS_PATH,
+                _REFLOW_ALERT_LEDGER_PATH,
+                wechat_webhook=webhook,
+                updated_by=str(session["admin_id"]),
+                now_ms=int(time.time() * 1000),
+            )
+        else:
+            saved = save_alert_settings(
+                _REFLOW_ALERT_SETTINGS_PATH,
+                wechat_enabled=False,
+                wechat_webhook=webhook,
+                updated_by=str(session["admin_id"]),
+                now_ms=int(time.time() * 1000),
+            )
     except (TypeError, ValueError):
         return jsonify({"error": "invalid alert settings"}), 400
     return jsonify({"ok": True, **public_alert_settings(saved)})

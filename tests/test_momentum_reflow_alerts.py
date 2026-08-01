@@ -1,10 +1,14 @@
 import json
+import subprocess
+import sys
 import threading
+import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import momentum_reflow_alerts as alerts
 from momentum_reflow_alerts import (
     baseline_wechat_delivery,
     deliver_due_wechat,
@@ -187,6 +191,113 @@ class ReflowAlertLedgerTests(unittest.TestCase):
             observe_reflow_alerts(path, [row()], 2_000)
             self.assertEqual(baseline_wechat_delivery(path), 1)
 
+    def test_atomic_enable_blocks_cross_process_observation_until_settings_write(self):
+        enable_wechat_alerts = getattr(alerts, "enable_wechat_alerts", None)
+        self.assertTrue(
+            callable(enable_wechat_alerts),
+            "missing atomic enable_wechat_alerts operation",
+        )
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            url = (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+                "fake-secret"
+            )
+            save_alert_settings(
+                settings, wechat_enabled=False, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row("historical")], 2)
+
+            paused_after_baseline = threading.Event()
+            release_transition = threading.Event()
+            transition_errors = []
+            real_atomic_write = alerts._atomic_write
+
+            def pause_settings_write(path, payload):
+                if path == settings and payload.get("wechat_enabled"):
+                    paused_after_baseline.set()
+                    if not release_transition.wait(5):
+                        raise AssertionError("atomic enable was not released")
+                return real_atomic_write(path, payload)
+
+            def enable():
+                try:
+                    enable_wechat_alerts(
+                        settings, ledger, wechat_webhook="", updated_by="7",
+                        now_ms=3,
+                    )
+                except BaseException as error:
+                    transition_errors.append(error)
+
+            child = None
+            transition = threading.Thread(target=enable)
+            try:
+                with patch.object(
+                    alerts, "_atomic_write", side_effect=pause_settings_write
+                ):
+                    transition.start()
+                    self.assertTrue(paused_after_baseline.wait(2))
+                    child_script = textwrap.dedent(
+                        """
+                        import json
+                        import sys
+                        from pathlib import Path
+                        import momentum_reflow_alerts as alerts
+
+                        acquire = alerts._acquire_state_file_lock
+                        def report_then_acquire(handle):
+                            print('attempting', flush=True)
+                            return acquire(handle)
+                        alerts._acquire_state_file_lock = report_then_acquire
+                        alerts.observe_reflow_alerts(
+                            Path(sys.argv[1]), [json.loads(sys.argv[2])], 4
+                        )
+                        print('finished', flush=True)
+                        """
+                    )
+                    child = subprocess.Popen(
+                        [
+                            sys.executable, "-c", child_script, str(ledger),
+                            json.dumps(row("post-enable")),
+                        ],
+                        cwd=Path(__file__).resolve().parents[1],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(child.stdout.readline().strip(), "attempting")
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.wait(timeout=0.2)
+                    blocked_ledger = json.loads(ledger.read_text(encoding="utf-8"))
+                    self.assertEqual(blocked_ledger["wechat_cursor"], 1)
+                    self.assertEqual(len(blocked_ledger["events"]), 1)
+
+                    release_transition.set()
+                    transition.join(2)
+                    remaining_stdout, stderr = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, 0, stderr)
+                    self.assertEqual(remaining_stdout.strip(), "finished")
+            finally:
+                release_transition.set()
+                transition.join(2)
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.wait(2)
+
+            self.assertEqual(transition_errors, [])
+            self.assertTrue(load_alert_settings(settings)["wechat_enabled"])
+            final_ledger = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(final_ledger["wechat_cursor"], 1)
+            self.assertEqual(
+                [event["signal_key"] for event in final_ledger["events"]],
+                ["historical", "post-enable"],
+            )
+
 
 class ReflowWechatDeliveryTests(unittest.TestCase):
     def test_test_webhook_rejects_invalid_stored_webhook_without_overwrite(self):
@@ -202,6 +313,44 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 test_wechat_webhook(settings, 2)
             self.assertEqual(settings.read_bytes(), original)
+
+    def test_test_message_merges_result_into_concurrently_updated_settings(self):
+        with TemporaryDirectory() as folder:
+            settings = Path(folder) / "settings.json"
+            old_url = (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+                "fake-old-1111"
+            )
+            new_url = (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+                "fake-new-2222"
+            )
+            save_alert_settings(
+                settings, wechat_enabled=False, wechat_webhook=old_url,
+                updated_by="7", now_ms=1,
+            )
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"errcode": 0}
+
+            def post(*args, **kwargs):
+                save_alert_settings(
+                    settings, wechat_enabled=False, wechat_webhook=new_url,
+                    updated_by="8", now_ms=2,
+                )
+                return response
+
+            result = test_wechat_webhook(settings, 3, post=post)
+
+            current = load_alert_settings(settings)
+            self.assertTrue(
+                current["wechat_webhook"] == new_url,
+                "concurrent credential was overwritten",
+            )
+            self.assertEqual(current["updated_by"], "8")
+            self.assertEqual(current["updated_at"], 2)
+            self.assertTrue(current["last_test_ok"])
+            self.assertEqual(result["webhook_mask"], "****2222")
 
     def test_delivery_rejects_enabled_empty_stored_webhook_without_writing(self):
         with TemporaryDirectory() as folder:
@@ -247,6 +396,54 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
             self.assertEqual(len(calls), 1)
             self.assertEqual(json.loads(ledger.read_text(encoding="utf-8"))["wechat_cursor"], 1)
+
+    def test_delivery_http_does_not_hold_general_state_lock(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret"
+            save_alert_settings(
+                settings, wechat_enabled=True, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row("delivery")], 2)
+            http_started = threading.Event()
+            release_http = threading.Event()
+            observation_finished = threading.Event()
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"errcode": 0}
+
+            def post(*args, **kwargs):
+                http_started.set()
+                if not release_http.wait(2):
+                    raise AssertionError("HTTP test was not released")
+                return response
+
+            delivery = threading.Thread(
+                target=deliver_due_wechat,
+                args=(settings, ledger, 2),
+                kwargs={"post": post},
+            )
+            observation = threading.Thread(
+                target=lambda: (
+                    observe_reflow_alerts(ledger, [row("parallel")], 3),
+                    observation_finished.set(),
+                )
+            )
+            try:
+                delivery.start()
+                self.assertTrue(http_started.wait(1))
+                observation.start()
+                self.assertTrue(observation_finished.wait(1))
+            finally:
+                release_http.set()
+                delivery.join(2)
+                observation.join(2)
+            self.assertFalse(delivery.is_alive())
+            self.assertFalse(observation.is_alive())
 
     def test_delivery_rejects_non_integer_timestamp_before_writing(self):
         with TemporaryDirectory() as folder:

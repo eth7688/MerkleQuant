@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import textwrap
@@ -6,6 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import admin_server
+import momentum_reflow_alerts as alerts
+from momentum_reflow_alerts import observe_reflow_alerts
 from momentum_reflow_dashboard import load_reflow_settings, save_reflow_settings
 
 
@@ -658,39 +661,56 @@ class MomentumReflowAlertAdminTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
-    def test_enable_transition_baselines_existing_events_while_disabled(self):
+    def test_enable_transition_atomically_baselines_existing_events(self):
         login_admin(self.client)
-        url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=fake-secret"
-
-        def baseline_while_disabled(path):
-            self.assertFalse(
-                admin_server.load_alert_settings(self.settings)["wechat_enabled"]
-            )
-            return 7
+        url = (
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+            "fake-secret-1234"
+        )
+        saved = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": False, "wechat_webhook": url},
+        )
+        self.assertEqual(saved.status_code, 200)
+        observe_reflow_alerts(self.ledger, [], 1)
+        observe_reflow_alerts(self.ledger, [{
+            "signal_key": "historical", "symbol": "BTCUSDT",
+            "direction": "LONG", "quality_label": "HIGH", "status": "ACTIVE",
+            "price": 100.0, "ema50": 99.0, "daily_kind": "strong_momentum",
+            "window_index": 1, "breakout_volume_ratio": 3.0,
+            "first_seen_at": 100,
+        }], 2)
 
         with patch.object(
             admin_server,
-            "baseline_wechat_delivery",
-            side_effect=baseline_while_disabled,
-        ) as baseline:
+            "enable_wechat_alerts",
+            wraps=alerts.enable_wechat_alerts,
+            create=True,
+        ) as enable:
             response = self.client.post(
                 "/api/reflow/alert-settings",
-                json={"wechat_enabled": True, "wechat_webhook": url},
+                json={"wechat_enabled": True, "wechat_webhook": ""},
             )
 
         self.assertEqual(response.status_code, 200)
-        baseline.assert_called_once_with(self.ledger)
+        enable.assert_called_once()
+        self.assertEqual(response.get_json()["webhook_mask"], "****1234")
+        self.assertTrue(
+            admin_server.load_alert_settings(self.settings)["wechat_enabled"]
+        )
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertEqual(ledger["wechat_cursor"], 1)
+        self.assertEqual(len(ledger["events"]), 1)
 
     def test_invalid_webhook_is_rejected_before_baseline(self):
         login_admin(self.client)
-        with patch.object(admin_server, "baseline_wechat_delivery") as baseline:
-            response = self.client.post(
-                "/api/reflow/alert-settings",
-                json={"wechat_enabled": True, "wechat_webhook": "https://invalid.test"},
-            )
+        response = self.client.post(
+            "/api/reflow/alert-settings",
+            json={"wechat_enabled": True, "wechat_webhook": "https://invalid.test"},
+        )
 
         self.assertEqual(response.status_code, 400)
-        baseline.assert_not_called()
+        self.assertFalse(self.ledger.exists())
         saved = admin_server.load_alert_settings(self.settings)
         self.assertFalse(saved["wechat_enabled"])
         self.assertEqual(saved["wechat_webhook"], "")

@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from numbers import Real
 from pathlib import Path
@@ -19,6 +20,7 @@ LEDGER_VERSION = 1
 WEBHOOK_PREFIX = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
 _LOCK = threading.RLock()
 _DELIVERY_LOCK = threading.Lock()
+_STATE_LOCK_NAME = ".momentum_reflow_alerts.lock"
 DEFAULT_SETTINGS = {
     "version": SETTINGS_VERSION,
     "wechat_enabled": False,
@@ -54,6 +56,52 @@ DAILY_LABELS = {
     "bottom_fractal": "底分型",
     "top_fractal": "顶分型",
 }
+
+
+def _acquire_state_file_lock(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _release_state_file_lock(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _state_lock(*paths: Path):
+    parents = {Path(path).parent.resolve() for path in paths}
+    if len(parents) != 1:
+        raise ValueError("reflow alert state files must share a directory")
+    parent = parents.pop()
+    parent.mkdir(parents=True, exist_ok=True)
+    lock_path = parent / _STATE_LOCK_NAME
+    with _LOCK:
+        with open(lock_path, "a+b") as handle:
+            _acquire_state_file_lock(handle)
+            try:
+                yield
+            finally:
+                _release_state_file_lock(handle)
 
 
 def _atomic_write(path: Path, payload: dict) -> None:
@@ -163,11 +211,15 @@ def _validate_snapshot(snapshot: dict) -> None:
         raise ValueError("reflow alert event snapshot is invalid")
 
 
+def _load_alert_settings_unlocked(path: Path) -> dict:
+    if not path.exists():
+        _atomic_write(path, DEFAULT_SETTINGS.copy())
+    return copy.deepcopy(_validate_settings(_read_object(path, "reflow alert settings")))
+
+
 def load_alert_settings(path: Path) -> dict:
-    with _LOCK:
-        if not path.exists():
-            _atomic_write(path, DEFAULT_SETTINGS.copy())
-        return copy.deepcopy(_validate_settings(_read_object(path, "reflow alert settings")))
+    with _state_lock(path):
+        return _load_alert_settings_unlocked(path)
 
 
 def validate_wechat_webhook(webhook: str) -> None:
@@ -180,8 +232,8 @@ def save_alert_settings(path: Path, *, wechat_enabled: bool, wechat_webhook: str
     if (type(wechat_enabled) is not bool or type(now_ms) is not int
             or not isinstance(updated_by, str)):
         raise TypeError("invalid reflow alert settings input")
-    with _LOCK:
-        current = load_alert_settings(path)
+    with _state_lock(path):
+        current = _load_alert_settings_unlocked(path)
         supplied = "" if wechat_webhook is None else str(wechat_webhook).strip()
         if supplied:
             validate_wechat_webhook(supplied)
@@ -190,6 +242,28 @@ def save_alert_settings(path: Path, *, wechat_enabled: bool, wechat_webhook: str
             raise ValueError("wechat webhook is required")
         current.update(wechat_enabled=wechat_enabled, updated_at=now_ms, updated_by=updated_by)
         _atomic_write(path, current)
+        return copy.deepcopy(current)
+
+
+def enable_wechat_alerts(settings_path: Path, ledger_path: Path, *,
+                         wechat_webhook: str | None, updated_by: str,
+                         now_ms: int) -> dict:
+    if (type(now_ms) is not int or not isinstance(updated_by, str)
+            or wechat_webhook is not None and not isinstance(wechat_webhook, str)):
+        raise TypeError("invalid reflow alert settings input")
+    with _state_lock(settings_path, ledger_path):
+        current = _load_alert_settings_unlocked(settings_path)
+        supplied = "" if wechat_webhook is None else wechat_webhook.strip()
+        candidate = supplied or current["wechat_webhook"]
+        validate_wechat_webhook(candidate)
+        if supplied:
+            current["wechat_webhook"] = supplied
+        if not current["wechat_enabled"]:
+            ledger = _load_ledger(ledger_path)
+            ledger["wechat_cursor"] = ledger["next_alert_id"] - 1
+            _atomic_write(ledger_path, ledger)
+        current.update(wechat_enabled=True, updated_at=now_ms, updated_by=updated_by)
+        _atomic_write(settings_path, current)
         return copy.deepcopy(current)
 
 
@@ -218,7 +292,7 @@ def _snapshot(row: dict) -> dict:
 def observe_reflow_alerts(path: Path, rows: list[dict], now_ms: int) -> list[dict]:
     if not isinstance(rows, list) or type(now_ms) is not int:
         raise TypeError("invalid reflow alert observation")
-    with _LOCK:
+    with _state_lock(path):
         ledger = _load_ledger(path)
         created = []
         initializing = not ledger["initialized"]
@@ -256,7 +330,7 @@ def observe_reflow_alerts(path: Path, rows: list[dict], now_ms: int) -> list[dic
 def read_public_alerts(path: Path, after_id: int) -> dict:
     if type(after_id) is not int or after_id < 0:
         raise ValueError("after_id must be a nonnegative integer")
-    with _LOCK:
+    with _state_lock(path):
         ledger = _load_ledger(path)
         latest = ledger["next_alert_id"] - 1
         events = []
@@ -269,7 +343,7 @@ def read_public_alerts(path: Path, after_id: int) -> dict:
 
 
 def read_delivery_status(path: Path) -> dict:
-    with _LOCK:
+    with _state_lock(path):
         ledger = _load_ledger(path)
         if not ledger["events"]:
             return {"last_delivery_at": 0, "last_delivery_status": "none",
@@ -283,7 +357,7 @@ def read_delivery_status(path: Path) -> dict:
 
 
 def baseline_wechat_delivery(path: Path) -> int:
-    with _LOCK:
+    with _state_lock(path):
         ledger = _load_ledger(path)
         ledger["wechat_cursor"] = ledger["next_alert_id"] - 1
         _atomic_write(path, ledger)
@@ -337,7 +411,7 @@ def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
     settings = load_alert_settings(settings_path)
     if not settings["wechat_enabled"]:
         return {"status": "disabled"}
-    with _LOCK:
+    with _state_lock(ledger_path):
         ledger = _load_ledger(ledger_path)
         event = next((item for item in ledger["events"]
                       if item["alert_id"] > ledger["wechat_cursor"]), None)
@@ -350,7 +424,7 @@ def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
         outcome, error_text = "delivered", ""
     except Exception as error:
         outcome, error_text = "retry_pending", _safe_error(error)
-    with _LOCK:
+    with _state_lock(ledger_path):
         ledger = _load_ledger(ledger_path)
         current = next(item for item in ledger["events"] if item["alert_id"] == event["alert_id"])
         delivery = current["wechat"]
@@ -382,6 +456,12 @@ def test_wechat_webhook(settings_path: Path, now_ms: int, *, post=requests.post)
         settings.update(last_test_at=now_ms, last_test_ok=True, last_test_error="")
     except Exception as error:
         settings.update(last_test_at=now_ms, last_test_ok=False, last_test_error=_safe_error(error))
-    with _LOCK:
-        _atomic_write(settings_path, settings)
-    return public_alert_settings(settings)
+    with _state_lock(settings_path):
+        current = _load_alert_settings_unlocked(settings_path)
+        current.update(
+            last_test_at=settings["last_test_at"],
+            last_test_ok=settings["last_test_ok"],
+            last_test_error=settings["last_test_error"],
+        )
+        _atomic_write(settings_path, current)
+    return public_alert_settings(current)
