@@ -319,6 +319,62 @@ let plays=0;playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
 await new Promise(resolve=>setImmediate(resolve));
 assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'4');assert.equal(plays,0);
 assert.equal(alertPollDelay,5000);process.stdout.write('ok');})()
+        """
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_persisted_cursor_still_baselines_page_before_polling_without_sound(self):
+        body = """
+let plays=0;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+global.fetch=url=>{fetches.push(url);
+  if(url==='/api/reflow/alerts?after=0')return Promise.resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:8,events:[{alert_id:8}]})});
+  if(url==='/api/reflow/alerts?after=8')return Promise.resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:8,events:[]})});
+  throw new Error('unexpected request '+url);
+};
+playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+(async()=>{initReflowAlertSound();await alertPoll();
+assert.deepEqual(fetches,['/api/reflow/alerts?after=0','/api/reflow/alerts?after=8']);
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'8');assert.equal(plays,0);process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_failed_page_baseline_is_retried_before_polling(self):
+        body = """
+let plays=0,baselineAttempts=0;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+global.fetch=url=>{fetches.push(url);
+  if(url==='/api/reflow/alerts?after=0'&&++baselineAttempts===1)return Promise.resolve({ok:false,json:()=>Promise.resolve({})});
+  if(url==='/api/reflow/alerts?after=0')return Promise.resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:8,events:[{alert_id:8}]})});
+  if(url==='/api/reflow/alerts?after=8')return Promise.resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:8,events:[]})});
+  throw new Error('unexpected request '+url);
+};
+playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+(async()=>{initReflowAlertSound();await new Promise(resolve=>setImmediate(resolve));
+await alertPoll();
+assert.deepEqual(fetches,['/api/reflow/alerts?after=0','/api/reflow/alerts?after=0','/api/reflow/alerts?after=8']);
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'8');assert.equal(plays,0);process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_disable_enable_invalidates_stale_page_baseline(self):
+        body = """
+let plays=0,pending=[];storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+activateReflowAudio=()=>Promise.resolve(true);
+global.fetch=url=>{fetches.push(url);return new Promise(resolve=>pending.push({url:url,resolve:resolve}));};
+playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+const response=data=>({ok:true,json:()=>Promise.resolve(data)});
+(async()=>{initReflowAlertSound();await new Promise(resolve=>setImmediate(resolve));
+assert.deepEqual(fetches,['/api/reflow/alerts?after=0']);
+await setReflowSoundEnabled(false);let enabling=setReflowSoundEnabled(true);
+await new Promise(resolve=>setImmediate(resolve));
+assert.deepEqual(fetches,['/api/reflow/alerts?after=0','/api/reflow/alerts?after=0']);
+pending[0].resolve(response({latest_alert_id:99,events:[{alert_id:99}]}));
+await new Promise(resolve=>setImmediate(resolve));
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');assert.equal(plays,0);
+pending[1].resolve(response({latest_alert_id:8,events:[{alert_id:8}]}));await enabling;
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'8');assert.equal(storage[REFLOW_ALERT_SOUND_KEY],'1');
+let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
+assert.equal(fetches[2],'/api/reflow/alerts?after=8');
+pending[2].resolve(response({latest_alert_id:8,events:[]}));await polling;
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'8');assert.equal(plays,0);process.stdout.write('ok');})()
 """
         self.assertEqual(run_alert_sound_javascript(body), "ok")
 
@@ -346,9 +402,10 @@ process.stdout.write('ok');})()
     def test_overlapping_alert_polls_share_one_request_and_one_playback(self):
         body = """
 let resolveFetch,plays=0;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
-global.fetch=url=>{fetches.push(url);return new Promise(resolve=>{resolveFetch=()=>resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:4,events:[{alert_id:4}]})});});};
 playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
-(async()=>{let first=pollReflowAlerts(),second=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
+(async()=>{fetchPayload={latest_alert_id:3,events:[]};await ensureReflowAlertBaseline(0);fetches.length=0;
+global.fetch=url=>{fetches.push(url);return new Promise(resolve=>{resolveFetch=()=>resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:4,events:[{alert_id:4}]})});});};
+let first=pollReflowAlerts(),second=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
 assert.equal(fetches.length,1);resolveFetch();await Promise.all([first,second]);
 assert.equal(plays,1);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'4');process.stdout.write('ok');})()
 """
@@ -357,9 +414,10 @@ assert.equal(plays,1);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'4');process
     def test_disabling_during_poll_prevents_playback_and_cursor_advance(self):
         body = """
 let resolveFetch,plays=0;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
-global.fetch=()=>new Promise(resolve=>{resolveFetch=()=>resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:4,events:[{alert_id:4}]})});});
 playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
-(async()=>{let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
+(async()=>{fetchPayload={latest_alert_id:3,events:[]};await ensureReflowAlertBaseline(0);
+global.fetch=()=>new Promise(resolve=>{resolveFetch=()=>resolve({ok:true,json:()=>Promise.resolve({latest_alert_id:4,events:[{alert_id:4}]})});});
+let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
 await setReflowSoundEnabled(false);resolveFetch();await polling;
 assert.equal(plays,0);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');process.stdout.write('ok');})()
 """
@@ -439,8 +497,10 @@ class DelayedAudioContext{
   createOscillator(){return {frequency:{setValueAtTime:()=>{}},connect:()=>{},start:()=>{starts++;},stop:()=>{}};}
   createGain(){return {gain:{setValueAtTime:()=>{},exponentialRampToValueAtTime:()=>{}},connect:()=>{}};}
 }
-window.AudioContext=DelayedAudioContext;fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};
-(async()=>{let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
+window.AudioContext=DelayedAudioContext;
+(async()=>{fetchPayload={latest_alert_id:3,events:[]};await ensureReflowAlertBaseline(0);
+fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};
+let polling=pollReflowAlerts();await new Promise(resolve=>setImmediate(resolve));
 await setReflowSoundEnabled(false);resolveResume();await polling;
 assert.equal(starts,0);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');process.stdout.write('ok');})()
 """
@@ -467,10 +527,11 @@ process.stdout.write('ok');})()
 
     def test_blocked_playback_keeps_cursor_and_requests_user_gesture(self):
         body = """
-let state={textContent:''};document.getElementById=id=>id==='reflowSoundState'?state:null;
-class BlockedAudioContext{constructor(){this.currentTime=0;}resume(){return Promise.reject(new Error('blocked'));}}
-window.AudioContext=BlockedAudioContext;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
-(async()=>{fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};await pollReflowAlerts();
+        let state={textContent:''};document.getElementById=id=>id==='reflowSoundState'?state:null;
+        class BlockedAudioContext{constructor(){this.currentTime=0;}resume(){return Promise.reject(new Error('blocked'));}}
+        window.AudioContext=BlockedAudioContext;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+        (async()=>{fetchPayload={latest_alert_id:3,events:[]};await ensureReflowAlertBaseline(0);
+        fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};await pollReflowAlerts();
 assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');assert.equal(state.textContent,'需要点击恢复声音');
 process.stdout.write('ok');})()
 """

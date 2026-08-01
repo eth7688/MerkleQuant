@@ -3,6 +3,7 @@ import subprocess
 import sys
 import threading
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,7 +36,25 @@ def row(key="BTC-LONG-1", quality="HIGH", status="ACTIVE", **overrides):
     return value
 
 
+def wait_for_path(path, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.01)
+    return path.exists()
+
+
 class ReflowAlertLedgerTests(unittest.TestCase):
+    def test_observation_rejects_negative_timestamp_without_creating_ledger(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+
+            with self.assertRaises(ValueError):
+                observe_reflow_alerts(path, [row()], -1)
+
+            self.assertFalse(path.exists())
+
     def test_first_observation_baselines_existing_high_without_event(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "alerts.json"
@@ -162,6 +181,78 @@ class ReflowAlertLedgerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_public_alerts(path, 0)
             self.assertEqual(path.read_bytes(), original)
+
+    def test_duplicate_event_signal_keys_fail_closed_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            observe_reflow_alerts(path, [], 1)
+            observe_reflow_alerts(path, [row("first")], 2)
+            observe_reflow_alerts(path, [row("second")], 3)
+            ledger = json.loads(path.read_text(encoding="utf-8"))
+            ledger["events"][1]["signal_key"] = "first"
+            path.write_text(json.dumps(ledger), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(ValueError):
+                read_public_alerts(path, 0)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_terminal_event_above_cursor_fails_closed_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            observe_reflow_alerts(path, [], 1)
+            observe_reflow_alerts(path, [row()], 2)
+            ledger = json.loads(path.read_text(encoding="utf-8"))
+            ledger["events"][0]["wechat"].update(
+                status="delivered", attempts=1, last_attempt_at=3,
+                next_attempt_at=0,
+            )
+            path.write_text(json.dumps(ledger), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(ValueError):
+                read_public_alerts(path, 0)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_invalid_delivery_state_fields_fail_closed_without_overwrite(self):
+        mutations = {
+            "negative attempts": lambda delivery, event: delivery.update(attempts=-1),
+            "too many attempts": lambda delivery, event: delivery.update(
+                attempts=alerts.MAX_ATTEMPTS + 1
+            ),
+            "negative creation time": lambda delivery, event: event.update(created_at=-1),
+            "negative last attempt": lambda delivery, event: delivery.update(last_attempt_at=-1),
+            "negative next attempt": lambda delivery, event: delivery.update(next_attempt_at=-1),
+            "exhausted pending": lambda delivery, event: delivery.update(
+                attempts=alerts.MAX_ATTEMPTS,
+                last_attempt_at=2,
+                next_attempt_at=3,
+                last_error="timeout",
+            ),
+            "delivered with retry time": lambda delivery, event: delivery.update(
+                status="delivered", attempts=1, last_attempt_at=2,
+                next_attempt_at=3,
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), TemporaryDirectory() as folder:
+                path = Path(folder) / "alerts.json"
+                observe_reflow_alerts(path, [], 1)
+                observe_reflow_alerts(path, [row()], 2)
+                ledger = json.loads(path.read_text(encoding="utf-8"))
+                event = ledger["events"][0]
+                mutate(event["wechat"], event)
+                if event["wechat"]["status"] != "pending":
+                    ledger["wechat_cursor"] = 1
+                path.write_text(json.dumps(ledger), encoding="utf-8")
+                original = path.read_bytes()
+
+                with self.assertRaises(ValueError):
+                    read_public_alerts(path, 0)
+
+                self.assertEqual(path.read_bytes(), original)
 
     def test_webhook_is_masked_and_blank_save_preserves_secret(self):
         with TemporaryDirectory() as folder:
@@ -306,6 +397,9 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             "momentum_reflow_alert_settings.json",
             "momentum_reflow_alerts.json",
             ".momentum_reflow_alerts.lock",
+            ".momentum_reflow_alert_settings.json.abc123.tmp",
+            ".momentum_reflow_alerts.json.abc123.tmp",
+            ".momentum_reflow_alert_delivery.lock",
         ):
             with self.subTest(runtime_file=runtime_file):
                 result = subprocess.run(
@@ -382,6 +476,37 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             self.assertEqual(settings.read_bytes(), settings_before)
             self.assertEqual(ledger.read_bytes(), ledger_before)
 
+    def test_delivery_refuses_non_pending_selected_event_without_posting(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(
+                settings, wechat_enabled=True, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row()], 2)
+            original = ledger.read_bytes()
+            real_load = alerts._load_ledger
+
+            def load_then_change_status(path):
+                loaded = real_load(path)
+                loaded["events"][0]["wechat"].update(
+                    status="delivered", attempts=1, last_attempt_at=2,
+                    next_attempt_at=0,
+                )
+                return loaded
+
+            post = Mock()
+            with patch.object(alerts, "_load_ledger", side_effect=load_then_change_status):
+                with self.assertRaises(ValueError):
+                    deliver_due_wechat(settings, ledger, 2, post=post)
+
+            post.assert_not_called()
+            self.assertEqual(ledger.read_bytes(), original)
+
     def test_concurrent_delivery_sends_once_and_advances_cursor_monotonically(self):
         with TemporaryDirectory() as folder:
             root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
@@ -411,6 +536,104 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
             self.assertEqual(len(calls), 1)
             self.assertEqual(json.loads(ledger.read_text(encoding="utf-8"))["wechat_cursor"], 1)
+
+    def test_cross_process_delivery_claim_sends_once_and_preserves_success(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            sends = root / "sends.txt"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(
+                settings, wechat_enabled=True, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row()], 2)
+            child_script = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                import time
+                from pathlib import Path
+
+                from momentum_reflow_alerts import deliver_due_wechat
+
+                role = sys.argv[1]
+                settings = Path(sys.argv[2])
+                ledger = Path(sys.argv[3])
+                root = Path(sys.argv[4])
+                entered = root / (role + '.entered')
+                release = root / (role + '.release')
+                sends = root / 'sends.txt'
+
+                class Response:
+                    def raise_for_status(self):
+                        return None
+                    def json(self):
+                        return {'errcode': 0}
+
+                def post(*args, **kwargs):
+                    with open(sends, 'a', encoding='utf-8') as handle:
+                        handle.write(role + '\\n')
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    entered.write_text('1', encoding='utf-8')
+                    deadline = time.monotonic() + 10
+                    while not release.exists():
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError('fake post release timed out')
+                        time.sleep(0.01)
+                    if role == 'failure':
+                        raise TimeoutError('late failure')
+                    return Response()
+
+                result = deliver_due_wechat(settings, ledger, 2, post=post)
+                print(json.dumps(result), flush=True)
+                """
+            )
+
+            def start_child(role):
+                return subprocess.Popen(
+                    [
+                        sys.executable, "-c", child_script, role,
+                        str(settings), str(ledger), str(root),
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                )
+
+            success = start_child("success")
+            failure = None
+            try:
+                self.assertTrue(wait_for_path(root / "success.entered", 5))
+                failure = start_child("failure")
+                failure_entered_while_success_inflight = wait_for_path(
+                    root / "failure.entered", 0.5
+                )
+                (root / "success.release").write_text("1", encoding="utf-8")
+                success_stdout, success_stderr = success.communicate(timeout=5)
+                self.assertEqual(success.returncode, 0, success_stderr)
+                if failure_entered_while_success_inflight:
+                    (root / "failure.release").write_text("1", encoding="utf-8")
+                failure_stdout, failure_stderr = failure.communicate(timeout=5)
+                self.assertEqual(failure.returncode, 0, failure_stderr)
+            finally:
+                for child in (success, failure):
+                    if child is not None and child.poll() is None:
+                        child.kill()
+                        child.wait(2)
+
+            self.assertEqual(json.loads(success_stdout)["status"], "delivered")
+            self.assertEqual(json.loads(failure_stdout)["status"], "idle")
+            self.assertEqual(sends.read_text(encoding="utf-8").splitlines(), ["success"])
+            final_ledger = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(final_ledger["wechat_cursor"], 1)
+            self.assertEqual(final_ledger["events"][0]["wechat"]["status"], "delivered")
 
     def test_inflight_delivery_cannot_regress_reenabled_baseline_cursor(self):
         with TemporaryDirectory() as folder:
@@ -538,6 +761,27 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
                 deliver_due_wechat(settings, ledger, True)
             self.assertEqual(ledger.read_bytes(), original)
 
+    def test_delivery_rejects_negative_timestamp_before_posting(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = root / "settings.json"
+            ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(
+                settings, wechat_enabled=True, wechat_webhook=url,
+                updated_by="7", now_ms=1,
+            )
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row()], 2)
+            original = ledger.read_bytes()
+            post = Mock()
+
+            with self.assertRaises(ValueError):
+                deliver_due_wechat(settings, ledger, -1, post=post)
+
+            post.assert_not_called()
+            self.assertEqual(ledger.read_bytes(), original)
+
     def test_markdown_uses_frozen_snapshot(self):
         event = {"trigger": "upgraded_high", "snapshot": row(
             price=101.25, direction="SHORT", daily_kind="bearish_engulfing",
@@ -576,6 +820,23 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "retry_pending")
             self.assertNotIn(url, raw)
             self.assertNotIn("secret-1234", raw)
+
+    def test_baselined_unattempted_event_reports_no_delivery_status(self):
+        with TemporaryDirectory() as folder:
+            ledger = Path(folder) / "ledger.json"
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row("historical")], 2)
+            baseline_wechat_delivery(ledger)
+
+            self.assertEqual(
+                read_delivery_status(ledger),
+                {
+                    "last_delivery_at": 0,
+                    "last_delivery_status": "none",
+                    "last_delivery_alert_id": 0,
+                    "last_delivery_error": "",
+                },
+            )
 
     def test_timeout_retries_then_successfully_delivers_same_event(self):
         with TemporaryDirectory() as folder:

@@ -1675,7 +1675,8 @@ var _reflowPayload={rows:[]};
 var REFLOW_ALERT_SOUND_KEY='axiom_reflow_alert_sound_v1';
 var REFLOW_ALERT_CURSOR_KEY='axiom_reflow_alert_cursor_v1';
 var _reflowAlertTimer=null,_reflowAudioContext=null,_reflowSoundNeedsGesture=false;
-var _reflowAlertPollPromise=null,_reflowAlertBaselinePromise=null,_reflowAlertGeneration=0;
+var _reflowAlertPollPromise=null,_reflowAlertBaselinePromise=null;
+var _reflowAlertBaselineGeneration=-1,_reflowAlertGeneration=0;
 
 function updateReflowSoundControls(){
   var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
@@ -1725,17 +1726,37 @@ function storeReflowAlertCursor(latestAlertId){
   if(isFinite(current)) latest=Math.max(current,latest);
   localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(latest));
 }
+function ensureReflowAlertBaseline(generation){
+  if(generation===undefined) generation=_reflowAlertGeneration;
+  if(generation!==_reflowAlertGeneration) return Promise.resolve(false);
+  if(_reflowAlertBaselinePromise&&_reflowAlertBaselineGeneration===generation){
+    return _reflowAlertBaselinePromise;
+  }
+  var pending=fetchReflowAlertBaseline().then(function(data){
+    if(generation!==_reflowAlertGeneration) return false;
+    storeReflowAlertCursor(data.latest_alert_id);return true;
+  }).catch(function(){return false;});
+  var tracked=pending.then(function(ready){
+    if(!ready&&generation===_reflowAlertGeneration&&_reflowAlertBaselinePromise===tracked){
+      _reflowAlertBaselinePromise=null;_reflowAlertBaselineGeneration=-1;
+    }
+    return ready;
+  });
+  _reflowAlertBaselineGeneration=generation;
+  _reflowAlertBaselinePromise=tracked;
+  return tracked;
+}
 function setReflowSoundEnabled(enabled){
   var generation=++_reflowAlertGeneration;
+  _reflowAlertBaselinePromise=null;_reflowAlertBaselineGeneration=-1;
+  _reflowAlertPollPromise=null;
   localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'0');
   if(!enabled){updateReflowSoundControls();return Promise.resolve();}
   return activateReflowAudio().then(function(active){
-    if(!active||generation!==_reflowAlertGeneration) return null;
-    return fetchReflowAlertBaseline();
-  }).then(function(data){
-    if(!data||generation!==_reflowAlertGeneration) return;
-    storeReflowAlertCursor(data.latest_alert_id);
-    _reflowAlertBaselinePromise=Promise.resolve(true);
+    if(!active||generation!==_reflowAlertGeneration) return false;
+    return ensureReflowAlertBaseline(generation);
+  }).then(function(ready){
+    if(!ready||generation!==_reflowAlertGeneration) return;
     localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'1');
     updateReflowSoundControls();
   }).catch(function(){
@@ -1747,8 +1768,7 @@ function pollReflowAlerts(){
   if(localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
   if(_reflowAlertPollPromise) return _reflowAlertPollPromise;
   var generation=_reflowAlertGeneration;
-  var ready=_reflowAlertBaselinePromise||Promise.resolve(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)!==null);
-  var work=Promise.resolve(ready).then(function(baselineReady){
+  var work=ensureReflowAlertBaseline(generation).then(function(baselineReady){
     if(!baselineReady||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return null;
     var cursor=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY),10);
     if(!isFinite(cursor)) return null;
@@ -1766,15 +1786,15 @@ function pollReflowAlerts(){
       }
     });
   }).catch(function(){});
-  _reflowAlertPollPromise=work.then(function(value){_reflowAlertPollPromise=null;return value;});
-  return _reflowAlertPollPromise;
+  var tracked=work.then(function(value){
+    if(_reflowAlertPollPromise===tracked) _reflowAlertPollPromise=null;
+    return value;
+  });
+  _reflowAlertPollPromise=tracked;
+  return tracked;
 }
 function initReflowAlertSound(){
-  if(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)===null){
-    _reflowAlertBaselinePromise=fetchReflowAlertBaseline().then(function(data){
-      storeReflowAlertCursor(data.latest_alert_id);return true;
-    }).catch(function(){return false;});
-  }else if(!_reflowAlertBaselinePromise) _reflowAlertBaselinePromise=Promise.resolve(true);
+  ensureReflowAlertBaseline(_reflowAlertGeneration);
   if(!_reflowAlertTimer) _reflowAlertTimer=setInterval(pollReflowAlerts,5000);
   updateReflowSoundControls();
 }

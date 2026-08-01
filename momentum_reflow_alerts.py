@@ -21,6 +21,7 @@ WEBHOOK_PREFIX = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
 _LOCK = threading.RLock()
 _DELIVERY_LOCK = threading.Lock()
 _STATE_LOCK_NAME = ".momentum_reflow_alerts.lock"
+_DELIVERY_LOCK_NAME = ".momentum_reflow_alert_delivery.lock"
 DEFAULT_SETTINGS = {
     "version": SETTINGS_VERSION,
     "wechat_enabled": False,
@@ -104,6 +105,24 @@ def _state_lock(*paths: Path):
                 _release_state_file_lock(handle)
 
 
+@contextmanager
+def _delivery_lock(*paths: Path):
+    parents = {Path(path).parent.resolve() for path in paths}
+    if len(parents) != 1:
+        raise ValueError("reflow alert state files must share a directory")
+    parent = parents.pop()
+    parent.mkdir(parents=True, exist_ok=True)
+    lock_path = parent / _DELIVERY_LOCK_NAME
+    # Delivery serialization is outermost; general state locks remain short-lived.
+    with _DELIVERY_LOCK:
+        with open(lock_path, "a+b") as handle:
+            _acquire_state_file_lock(handle)
+            try:
+                yield
+            finally:
+                _release_state_file_lock(handle)
+
+
 def _atomic_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -161,32 +180,58 @@ def _validate_ledger(value: dict) -> dict:
                  or value["observed"] or value["events"])):
         raise ValueError("reflow alert uninitialized ledger is invalid")
     for key, observed in value["observed"].items():
-        if (not isinstance(key, str) or not isinstance(observed, dict)
+        if (not isinstance(key, str) or not key or not isinstance(observed, dict)
                 or type(observed.get("ever_high")) is not bool
                 or type(observed.get("last_quality_label")) is not str):
             raise ValueError("reflow alert observed entry is invalid")
+    signal_keys = set()
     for expected_alert_id, event in enumerate(value["events"], start=1):
         delivery = event.get("wechat") if isinstance(event, dict) else None
         if (not isinstance(event, dict)
                 or type(event.get("alert_id")) is not int
                 or event["alert_id"] != expected_alert_id
                 or type(event.get("signal_key")) is not str
+                or not event["signal_key"]
                 or event.get("trigger") not in {"new_signal", "upgraded_high"}
                 or type(event.get("created_at")) is not int
+                or event["created_at"] < 0
                 or not isinstance(event.get("snapshot"), dict)
                 or not isinstance(delivery, dict)
                 or delivery.get("status") not in {"pending", "delivered", "failed"}
                 or type(delivery.get("attempts")) is not int
+                or not 0 <= delivery["attempts"] <= MAX_ATTEMPTS
                 or type(delivery.get("last_attempt_at")) is not int
+                or delivery["last_attempt_at"] < 0
                 or type(delivery.get("next_attempt_at")) is not int
+                or delivery["next_attempt_at"] < 0
                 or type(delivery.get("last_error")) is not str):
             raise ValueError("reflow alert event entry is invalid")
+        if event["signal_key"] in signal_keys:
+            raise ValueError("reflow alert event signal key is duplicated")
+        signal_keys.add(event["signal_key"])
         observed = value["observed"].get(event["signal_key"])
         if not observed or not observed["ever_high"]:
             raise ValueError("reflow alert event observation is invalid")
         if set(event["snapshot"]) != set(SNAPSHOT_FIELDS):
             raise ValueError("reflow alert event snapshot is invalid")
         _validate_snapshot(event["snapshot"])
+        status = delivery["status"]
+        if event["alert_id"] > value["wechat_cursor"] and status != "pending":
+            raise ValueError("reflow alert terminal event is above delivery cursor")
+        if status == "pending":
+            if (delivery["attempts"] >= MAX_ATTEMPTS
+                    or delivery["next_attempt_at"] < event["created_at"]
+                    or delivery["attempts"] == 0
+                    and (delivery["last_attempt_at"] != 0 or delivery["last_error"])
+                    or delivery["attempts"] > 0
+                    and delivery["next_attempt_at"] <= delivery["last_attempt_at"]):
+                raise ValueError("reflow alert pending delivery state is invalid")
+        elif status == "delivered":
+            if (delivery["attempts"] == 0 or delivery["next_attempt_at"] != 0
+                    or delivery["last_error"]):
+                raise ValueError("reflow alert delivered state is invalid")
+        elif delivery["attempts"] != MAX_ATTEMPTS or delivery["next_attempt_at"] != 0:
+            raise ValueError("reflow alert failed state is invalid")
     last_alert_id = len(value["events"])
     if (value["next_alert_id"] != last_alert_id + 1
             or not 0 <= value["wechat_cursor"] <= last_alert_id):
@@ -292,6 +337,8 @@ def _snapshot(row: dict) -> dict:
 def observe_reflow_alerts(path: Path, rows: list[dict], now_ms: int) -> list[dict]:
     if not isinstance(rows, list) or type(now_ms) is not int:
         raise TypeError("invalid reflow alert observation")
+    if now_ms < 0:
+        raise ValueError("reflow alert observation timestamp must be nonnegative")
     with _state_lock(path):
         ledger = _load_ledger(path)
         created = []
@@ -345,10 +392,11 @@ def read_public_alerts(path: Path, after_id: int) -> dict:
 def read_delivery_status(path: Path) -> dict:
     with _state_lock(path):
         ledger = _load_ledger(path)
-        if not ledger["events"]:
+        event = next((item for item in reversed(ledger["events"])
+                      if item["wechat"]["last_attempt_at"] > 0), None)
+        if event is None:
             return {"last_delivery_at": 0, "last_delivery_status": "none",
                     "last_delivery_alert_id": 0, "last_delivery_error": ""}
-        event = ledger["events"][-1]
         delivery = event["wechat"]
         return {"last_delivery_at": delivery["last_attempt_at"],
                 "last_delivery_status": delivery["status"],
@@ -402,7 +450,9 @@ def deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
                        post=requests.post) -> dict:
     if type(now_ms) is not int:
         raise TypeError("now_ms must be an integer")
-    with _DELIVERY_LOCK:
+    if now_ms < 0:
+        raise ValueError("now_ms must be nonnegative")
+    with _delivery_lock(settings_path, ledger_path):
         return _deliver_due_wechat(settings_path, ledger_path, now_ms, post=post)
 
 
@@ -417,6 +467,8 @@ def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
                       if item["alert_id"] > ledger["wechat_cursor"]), None)
     if event is None:
         return {"status": "idle"}
+    if event["wechat"]["status"] != "pending":
+        raise ValueError("reflow alert selected delivery is not pending")
     if event["wechat"]["next_attempt_at"] > now_ms:
         return {"status": "waiting_retry", "alert_id": event["alert_id"]}
     try:
@@ -433,6 +485,7 @@ def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
         delivery["last_error"] = error_text
         if outcome == "delivered":
             delivery["status"] = "delivered"
+            delivery["next_attempt_at"] = 0
             ledger["wechat_cursor"] = max(
                 ledger["wechat_cursor"], current["alert_id"]
             )
