@@ -2,15 +2,20 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 from momentum_reflow_alerts import (
     baseline_wechat_delivery,
+    deliver_due_wechat,
+    format_wechat_markdown,
     load_alert_settings,
     observe_reflow_alerts,
     public_alert_settings,
     read_delivery_status,
     read_public_alerts,
     save_alert_settings,
+    send_wechat_markdown,
+    test_wechat_webhook,
 )
 
 
@@ -167,3 +172,119 @@ class ReflowAlertLedgerTests(unittest.TestCase):
             observe_reflow_alerts(path, [], 1_000)
             observe_reflow_alerts(path, [row()], 2_000)
             self.assertEqual(baseline_wechat_delivery(path), 1)
+
+
+class ReflowWechatDeliveryTests(unittest.TestCase):
+    def test_delivery_rejects_non_integer_timestamp_before_writing(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            original = ledger.read_bytes()
+            with self.assertRaises(TypeError):
+                deliver_due_wechat(settings, ledger, True)
+            self.assertEqual(ledger.read_bytes(), original)
+
+    def test_markdown_uses_frozen_snapshot(self):
+        event = {"trigger": "upgraded_high", "snapshot": row(
+            price=101.25, direction="SHORT", daily_kind="bearish_engulfing",
+            first_seen_at=1_786_118_400_000,
+        )}
+        text = format_wechat_markdown(event)
+        self.assertIn("BTCUSDT · SHORT", text)
+        self.assertIn("价格：101.25", text)
+        self.assertIn("日线：看跌吞没", text)
+        self.assertIn("触发：标准信号升级为高质量", text)
+        self.assertIn("首次发现：2026-08-08", text)
+        self.assertNotIn("建议", text)
+
+    def test_sender_requires_official_https_webhook_and_success_code(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"errcode": 0, "errmsg": "ok"}
+        post = Mock(return_value=response)
+        url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+        send_wechat_markdown(url, "test", post=post)
+        post.assert_called_once_with(url, json={"msgtype": "markdown", "markdown": {"content": "test"}}, timeout=5.0)
+        with self.assertRaises(ValueError):
+            send_wechat_markdown("http://example.com/key=secret", "test", post=post)
+
+    def test_business_failure_is_sanitized_and_scheduled_for_retry(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-1234"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row()], 2)
+            response = Mock(); response.raise_for_status.return_value = None
+            response.json.return_value = {"errcode": 93000, "errmsg": f"bad {url}"}
+            result = deliver_due_wechat(settings, ledger, 2, post=Mock(return_value=response))
+            raw = ledger.read_text(encoding="utf-8")
+            self.assertEqual(result["status"], "retry_pending")
+            self.assertNotIn(url, raw)
+            self.assertNotIn("secret-1234", raw)
+
+    def test_timeout_retries_then_successfully_delivers_same_event(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            post = Mock(side_effect=[TimeoutError("timeout"), response])
+            self.assertEqual(deliver_due_wechat(settings, ledger, 2, post=post)["status"], "retry_pending")
+            self.assertEqual(deliver_due_wechat(settings, ledger, 60_002, post=post)["status"], "delivered")
+            self.assertEqual(post.call_count, 2)
+
+    def test_fifth_failure_marks_event_failed_and_advances_cursor(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 93000}
+            now = 2
+            for _ in range(5):
+                result = deliver_due_wechat(settings, ledger, now, post=Mock(return_value=response))
+                now = json.loads(ledger.read_text(encoding="utf-8"))["events"][0]["wechat"]["next_attempt_at"]
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(read_delivery_status(ledger)["last_delivery_status"], "failed")
+
+    def test_success_advances_cursor_and_does_not_resend(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            post = Mock(return_value=response)
+            self.assertEqual(deliver_due_wechat(settings, ledger, 2, post=post)["status"], "delivered")
+            self.assertEqual(deliver_due_wechat(settings, ledger, 3, post=post)["status"], "idle")
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(read_delivery_status(ledger)["last_delivery_status"], "delivered")
+
+    def test_retry_waiting_event_blocks_later_event(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1)
+            observe_reflow_alerts(ledger, [row("first")], 2)
+            observe_reflow_alerts(ledger, [row("second")], 3)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 93000}
+            post = Mock(return_value=response)
+            deliver_due_wechat(settings, ledger, 3, post=post)
+            result = deliver_due_wechat(settings, ledger, 4, post=post)
+            self.assertEqual(result["status"], "waiting_retry")
+            self.assertEqual(post.call_count, 1)
+
+    def test_test_message_does_not_create_event_or_advance_cursor(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=False, wechat_webhook=url, updated_by="7", now_ms=1)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            result = test_wechat_webhook(settings, 2, post=Mock(return_value=response))
+            self.assertTrue(result["last_test_ok"])
+            self.assertFalse(ledger.exists())

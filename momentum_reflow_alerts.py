@@ -5,7 +5,11 @@ import json
 import os
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import requests
 
 
 SETTINGS_VERSION = 1
@@ -34,6 +38,19 @@ SNAPSHOT_FIELDS = (
     "symbol", "direction", "price", "ema50", "daily_kind", "window_index",
     "breakout_volume_ratio", "first_seen_at",
 )
+RETRY_DELAYS_MS = (60_000, 300_000, 900_000, 3_600_000)
+MAX_ATTEMPTS = 5
+DAILY_LABELS = {
+    "strong_momentum": "强动能日K",
+    "bullish_engulfing": "看涨吞没",
+    "bearish_engulfing": "看跌吞没",
+    "hammer": "锤子线",
+    "shooting_star": "流星线",
+    "morning_star": "早晨之星",
+    "evening_star": "黄昏之星",
+    "bottom_fractal": "底分型",
+    "top_fractal": "顶分型",
+}
 
 
 def _atomic_write(path: Path, payload: dict) -> None:
@@ -246,3 +263,94 @@ def baseline_wechat_delivery(path: Path) -> int:
         ledger["wechat_cursor"] = ledger["next_alert_id"] - 1
         _atomic_write(path, ledger)
         return ledger["wechat_cursor"]
+
+
+def _safe_error(error: object) -> str:
+    text = str(error)
+    if WEBHOOK_PREFIX in text:
+        text = text.split(WEBHOOK_PREFIX, 1)[0] + WEBHOOK_PREFIX + "****"
+    return text[:120]
+
+
+def format_wechat_markdown(event: dict) -> str:
+    item = event["snapshot"]
+    first_seen = datetime.fromtimestamp(item["first_seen_at"] / 1000, ZoneInfo("Asia/Shanghai"))
+    trigger = ("标准信号升级为高质量" if event["trigger"] == "upgraded_high"
+               else "新高质量信号")
+    return "\n".join((
+        "【AXIOM 高质量回流警报】", "",
+        f"{item['symbol']} · {item['direction']}",
+        f"触发：{trigger}", f"价格：{item['price']}", f"EMA50：{item['ema50']}",
+        f"日线：{DAILY_LABELS.get(item['daily_kind'], item['daily_kind'])}",
+        f"窗口：{item['window_index']}/5", f"量比：{item['breakout_volume_ratio']}x",
+        f"首次发现：{first_seen:%Y-%m-%d %H:%M} 北京时间",
+    ))
+
+
+def send_wechat_markdown(webhook: str, content: str, *, post=requests.post,
+                         timeout: float = 5.0) -> None:
+    validate_wechat_webhook(webhook)
+    response = post(webhook, json={"msgtype": "markdown", "markdown": {"content": content}},
+                    timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("errcode") != 0:
+        errcode = payload.get("errcode", "invalid") if isinstance(payload, dict) else "invalid"
+        raise RuntimeError(f"enterprise wechat rejected request: {errcode}")
+
+
+def deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
+                       post=requests.post) -> dict:
+    if type(now_ms) is not int:
+        raise TypeError("now_ms must be an integer")
+    settings = load_alert_settings(settings_path)
+    if not settings["wechat_enabled"]:
+        return {"status": "disabled"}
+    with _LOCK:
+        ledger = _load_ledger(ledger_path)
+        event = next((item for item in ledger["events"]
+                      if item["alert_id"] > ledger["wechat_cursor"]), None)
+    if event is None:
+        return {"status": "idle"}
+    if event["wechat"]["next_attempt_at"] > now_ms:
+        return {"status": "waiting_retry", "alert_id": event["alert_id"]}
+    try:
+        send_wechat_markdown(settings["wechat_webhook"], format_wechat_markdown(event), post=post)
+        outcome, error_text = "delivered", ""
+    except Exception as error:
+        outcome, error_text = "retry_pending", _safe_error(error)
+    with _LOCK:
+        ledger = _load_ledger(ledger_path)
+        current = next(item for item in ledger["events"] if item["alert_id"] == event["alert_id"])
+        delivery = current["wechat"]
+        delivery["attempts"] += 1
+        delivery["last_attempt_at"] = now_ms
+        delivery["last_error"] = error_text
+        if outcome == "delivered":
+            delivery["status"] = "delivered"
+            ledger["wechat_cursor"] = current["alert_id"]
+        elif delivery["attempts"] >= MAX_ATTEMPTS:
+            delivery["status"] = "failed"
+            delivery["next_attempt_at"] = 0
+            ledger["wechat_cursor"] = current["alert_id"]
+            outcome = "failed"
+        else:
+            delivery["status"] = "pending"
+            delay = RETRY_DELAYS_MS[min(delivery["attempts"] - 1, len(RETRY_DELAYS_MS) - 1)]
+            delivery["next_attempt_at"] = now_ms + delay
+        _atomic_write(ledger_path, ledger)
+    return {"status": outcome, "alert_id": event["alert_id"], "error": error_text}
+
+
+def test_wechat_webhook(settings_path: Path, now_ms: int, *, post=requests.post) -> dict:
+    if type(now_ms) is not int:
+        raise TypeError("now_ms must be an integer")
+    settings = load_alert_settings(settings_path)
+    try:
+        send_wechat_markdown(settings["wechat_webhook"], "【AXIOM】企业微信警报测试成功", post=post)
+        settings.update(last_test_at=now_ms, last_test_ok=True, last_test_error="")
+    except Exception as error:
+        settings.update(last_test_at=now_ms, last_test_ok=False, last_test_error=_safe_error(error))
+    with _LOCK:
+        _atomic_write(settings_path, settings)
+    return public_alert_settings(settings)
