@@ -253,5 +253,60 @@ class ReflowSchedulerLifecycleTests(unittest.TestCase):
         self.assertIn("error", response.get_json())
 
 
+class ReflowAlertWorkerLifecycleTests(unittest.TestCase):
+    def tearDown(self):
+        web_ui._stop_reflow_alert_worker_for_tests()
+
+    def test_import_alone_does_not_start_alert_worker(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path.cwd())
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from unittest.mock import patch\n"
+                    "with patch('trader.SqueezeBreakoutBot.start'):\n"
+                    "    import web_ui\n"
+                    "assert web_ui._reflow_alert_thread is None"
+                ),
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_start_called_twice_creates_one_alert_thread(self):
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+                self.alive = False
+                threads.append(self)
+
+            def start(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                self.alive = False
+
+        with patch.object(web_ui.threading, "Thread", DeferredThread):
+            self.assertTrue(web_ui._start_reflow_alert_worker())
+            self.assertFalse(web_ui._start_reflow_alert_worker())
+
+        self.assertEqual(len(threads), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

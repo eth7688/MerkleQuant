@@ -177,6 +177,70 @@ def candidate():
 
 
 class MomentumReflowUiTests(unittest.TestCase):
+    def test_successful_scan_observes_alerts_after_history_merge(self):
+        web_ui = importlib.import_module("web_ui")
+        payload = {
+            "rows": [{
+                **candidate(),
+                "signal_key": "key",
+                "quality_label": "HIGH",
+                "status": "ACTIVE",
+            }]
+        }
+        with patch.object(web_ui, "scan_momentum_reflow", return_value={"rows": []}), \
+             patch.object(web_ui, "merge_reflow_signals", return_value=payload), \
+             patch.object(web_ui, "observe_reflow_alerts", return_value=[{"alert_id": 1}]) as observe:
+            result = web_ui._run_reflow_scan(lambda *_: None)
+
+        self.assertIs(result, payload)
+        observe.assert_called_once()
+
+    def test_alert_ledger_failure_does_not_fail_scan(self):
+        web_ui = importlib.import_module("web_ui")
+        payload = {"rows": []}
+        with patch.object(web_ui, "scan_momentum_reflow", return_value={"rows": []}), \
+             patch.object(web_ui, "merge_reflow_signals", return_value=payload), \
+             patch.object(
+                 web_ui,
+                 "observe_reflow_alerts",
+                 side_effect=ValueError("broken ledger"),
+             ):
+            self.assertIs(web_ui._run_reflow_scan(lambda *_: None), payload)
+
+        self.assertIn("broken ledger", web_ui._reflow_alert_status["last_error"])
+
+    def test_alert_api_requires_login_and_returns_no_webhook(self):
+        web_ui = importlib.import_module("web_ui")
+        client = web_ui.app.test_client()
+
+        self.assertEqual(client.get("/api/reflow/alerts?after=0").status_code, 401)
+        with client.session_transaction() as user_session:
+            user_session["user_id"] = 9
+        with patch.object(
+            web_ui,
+            "read_public_alerts",
+            return_value={"latest_alert_id": 3, "events": []},
+        ):
+            response = client.get("/api/reflow/alerts?after=2")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("webhook", response.get_data(as_text=True).lower())
+
+    def test_alert_api_reports_corrupt_ledger_as_unavailable(self):
+        web_ui = importlib.import_module("web_ui")
+        client = web_ui.app.test_client()
+        with client.session_transaction() as user_session:
+            user_session["user_id"] = 9
+        with patch.object(
+            web_ui,
+            "read_public_alerts",
+            side_effect=ValueError("broken ledger"),
+        ):
+            response = client.get("/api/reflow/alerts?after=0")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("broken ledger", response.get_data(as_text=True))
+
     def test_sidebar_description_and_renderer_are_wired(self):
         source = Path("web_ui.py").read_text(encoding="utf-8")
 

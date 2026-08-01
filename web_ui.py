@@ -22,12 +22,19 @@ from momentum_reflow_dashboard import (
     merge_reflow_signals,
     next_reflow_scan_at,
 )
+from momentum_reflow_alerts import (
+    deliver_due_wechat,
+    observe_reflow_alerts,
+    read_public_alerts,
+)
 
 # 交易引擎实例 (全局单例)
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 MOMENTUM_REFLOW_LEDGER = Path(__file__).with_name("momentum_reflow_state.json")
 MOMENTUM_REFLOW_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_settings.json"
 MOMENTUM_REFLOW_HISTORY = Path(_BASE_DIR) / "momentum_reflow_daily_signals.json"
+MOMENTUM_REFLOW_ALERT_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_alert_settings.json"
+MOMENTUM_REFLOW_ALERT_LEDGER = Path(_BASE_DIR) / "momentum_reflow_alerts.json"
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -449,6 +456,15 @@ _reflow_automation = {
 _reflow_scheduler_lock = threading.Lock()
 _reflow_scheduler_thread = None
 _reflow_scheduler_stop = threading.Event()
+_reflow_alert_lock = threading.Lock()
+_reflow_alert_thread = None
+_reflow_alert_stop = threading.Event()
+_reflow_alert_wakeup = threading.Event()
+_reflow_alert_status = {
+    "running": False,
+    "last_error": "",
+    "last_delivery_at": 0,
+}
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -3753,12 +3769,30 @@ def _reflow_dashboard_payload(base=None, now_ms=None):
 
 def _run_reflow_scan(progress):
     result = scan_momentum_reflow(MOMENTUM_REFLOW_LEDGER, progress=progress)
-    return merge_reflow_signals(
+    now_ms = int(time.time() * 1000)
+    payload = merge_reflow_signals(
         MOMENTUM_REFLOW_HISTORY,
         MOMENTUM_REFLOW_LEDGER,
         result,
-        int(time.time() * 1000),
+        now_ms,
     )
+    _process_reflow_alerts(payload, now_ms)
+    return payload
+
+def _process_reflow_alerts(payload, now_ms):
+    try:
+        created = observe_reflow_alerts(
+            MOMENTUM_REFLOW_ALERT_LEDGER,
+            payload.get("rows", []),
+            now_ms,
+        )
+    except Exception as error:
+        with _reflow_alert_lock:
+            _reflow_alert_status["last_error"] = str(error)[:80]
+        return []
+    if created:
+        _reflow_alert_wakeup.set()
+    return created
 
 def _update_reflow_automation_success(trigger, payload):
     if trigger != "auto":
@@ -3929,6 +3963,61 @@ def _stop_reflow_scheduler_for_tests():
         with _reflow_automation_lock:
             _reflow_automation["running"] = still_running
 
+def _reflow_alert_worker_loop():
+    with _reflow_alert_lock:
+        _reflow_alert_status["running"] = True
+    try:
+        while not _reflow_alert_stop.is_set():
+            try:
+                result = deliver_due_wechat(
+                    MOMENTUM_REFLOW_ALERT_SETTINGS,
+                    MOMENTUM_REFLOW_ALERT_LEDGER,
+                    int(time.time() * 1000),
+                )
+                with _reflow_alert_lock:
+                    _reflow_alert_status["last_error"] = result.get("error", "")
+                    if result.get("status") == "delivered":
+                        _reflow_alert_status["last_delivery_at"] = int(
+                            time.time() * 1000
+                        )
+            except Exception as error:
+                with _reflow_alert_lock:
+                    _reflow_alert_status["last_error"] = str(error)[:80]
+            _reflow_alert_wakeup.wait(30)
+            _reflow_alert_wakeup.clear()
+    finally:
+        with _reflow_alert_lock:
+            _reflow_alert_status["running"] = False
+
+def _start_reflow_alert_worker():
+    global _reflow_alert_thread
+    with _reflow_alert_lock:
+        if _reflow_alert_thread is not None and _reflow_alert_thread.is_alive():
+            return False
+        _reflow_alert_stop.clear()
+        worker = threading.Thread(target=_reflow_alert_worker_loop, daemon=True)
+        _reflow_alert_thread = worker
+        try:
+            worker.start()
+        except Exception:
+            _reflow_alert_thread = None
+            raise
+    return True
+
+def _stop_reflow_alert_worker_for_tests():
+    global _reflow_alert_thread
+    _reflow_alert_stop.set()
+    _reflow_alert_wakeup.set()
+    with _reflow_alert_lock:
+        worker = _reflow_alert_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _reflow_alert_lock:
+        if _reflow_alert_thread is worker and (
+            worker is None or not worker.is_alive()
+        ):
+            _reflow_alert_thread = None
+
 @app.route("/api/reflow/automation/status")
 def reflow_automation_status():
     with _reflow_automation_lock:
@@ -3945,6 +4034,23 @@ def reflow_automation_status():
         **automation,
         "auto_scan_enabled": settings["auto_scan_enabled"],
     })
+
+@app.route("/api/reflow/alerts")
+def reflow_alert_events():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    raw = request.args.get("after", "0")
+    try:
+        after_id = int(raw)
+        if after_id < 0:
+            raise ValueError("negative cursor")
+    except (TypeError, ValueError):
+        return jsonify({"error": "after must be a nonnegative integer"}), 400
+    try:
+        payload = read_public_alerts(MOMENTUM_REFLOW_ALERT_LEDGER, after_id)
+    except ValueError:
+        return jsonify({"error": "警报暂不可用"}), 503
+    return jsonify(payload)
 
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
@@ -4393,4 +4499,5 @@ if __name__=="__main__":
     print("\n  >>> Axiom Quant v1.0 <<<")
     print("  http://127.0.0.1:5000\n")
     _start_reflow_scheduler()
+    _start_reflow_alert_worker()
     app.run(host="0.0.0.0",port=5000,debug=False,threaded=True)
