@@ -697,6 +697,9 @@ tr:last-child td{border-bottom:none}
 .reflow-filter-label{padding:0 4px;color:var(--muted);font-size:9.5px;letter-spacing:.04em}
 .reflow-filter-btn{border:0;border-radius:4px;padding:4px 6px;background:transparent;color:var(--text2);cursor:pointer;font:520 10px var(--font)}
 .reflow-filter-btn:hover,.reflow-filter-btn.active{color:var(--text);background:rgba(255,255,255,.07)}
+.reflow-sound-controls{display:flex;align-items:center;gap:5px;margin-left:auto;color:var(--muted);font-size:10px}
+.reflow-sound-controls button{border:1px solid var(--border);border-radius:4px;padding:4px 6px;background:rgba(255,255,255,.018);color:var(--text2);cursor:pointer;font:520 10px var(--font)}
+.reflow-sound-controls button:hover{color:var(--text);background:rgba(255,255,255,.07)}
 .reflow-quality,.reflow-status{display:inline-block;padding:2px 6px;border:1px solid transparent;border-radius:4px;font-size:10px;font-family:var(--font);font-weight:600;white-space:nowrap}
 .reflow-quality-high{color:var(--s-green);background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.15)}
 .reflow-quality-standard{color:var(--s-blue);background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.15)}
@@ -1669,6 +1672,77 @@ function renderBreakout(rows){
 var _reflowFilters={quality:'ALL',direction:'ALL',type:'ALL',status:'ALL'};
 var _reflowPayload={rows:[]};
 
+var REFLOW_ALERT_SOUND_KEY='axiom_reflow_alert_sound_v1';
+var REFLOW_ALERT_CURSOR_KEY='axiom_reflow_alert_cursor_v1';
+var _reflowAlertTimer=null,_reflowAudioContext=null,_reflowSoundNeedsGesture=false;
+
+function updateReflowSoundControls(){
+  var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
+  var state=document.getElementById('reflowSoundState');
+  if(state) state.textContent=_reflowSoundNeedsGesture?'需要点击恢复声音':(enabled?'已开启':'已关闭');
+}
+function activateReflowAudio(){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _reflowAudioContext=_reflowAudioContext||new AudioCtor();
+  return Promise.resolve(_reflowAudioContext.resume()).then(function(){
+    _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
+  }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
+}
+function playReflowCoinSound(){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _reflowAudioContext=_reflowAudioContext||new AudioCtor();
+  return Promise.resolve(_reflowAudioContext.resume()).then(function(){
+    var now=_reflowAudioContext.currentTime;
+    [880,1175,1568].forEach(function(frequency,index){
+      var start=now+index*0.18,osc=_reflowAudioContext.createOscillator(),gain=_reflowAudioContext.createGain();
+      osc.type='triangle';osc.frequency.setValueAtTime(frequency,start);
+      gain.gain.setValueAtTime(0.0001,start);gain.gain.exponentialRampToValueAtTime(0.22,start+0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001,start+0.32);
+      osc.connect(gain);gain.connect(_reflowAudioContext.destination);osc.start(start);osc.stop(start+0.34);
+    });
+    _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
+  }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
+}
+function setReflowSoundEnabled(enabled){
+  localStorage.setItem(REFLOW_ALERT_SOUND_KEY,enabled?'1':'0');
+  if(!enabled){updateReflowSoundControls();return Promise.resolve();}
+  return activateReflowAudio().then(function(){
+    return fetch('/api/reflow/alerts?after=0').then(function(r){return r.json();});
+  }).then(function(data){localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||0));updateReflowSoundControls();});
+}
+function testReflowCoinSound(){return playReflowCoinSound();}
+function pollReflowAlerts(){
+  if(localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
+  var cursor=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)||'0',10);
+  return fetch('/api/reflow/alerts?after='+cursor).then(function(response){
+    if(!response.ok) throw new Error('alert poll failed');return response.json();
+  }).then(function(data){
+    if(!Array.isArray(data.events)||!data.events.length) return;
+    return playReflowCoinSound().then(function(played){
+      if(played) localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||cursor));
+    });
+  }).catch(function(){});
+}
+function initReflowAlertSound(){
+  if(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY)===null){
+    fetch('/api/reflow/alerts?after=0').then(function(r){return r.ok?r.json():null;}).then(function(data){
+      if(data) localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(data.latest_alert_id||0));
+    }).catch(function(){});
+  }
+  if(!_reflowAlertTimer) _reflowAlertTimer=setInterval(pollReflowAlerts,5000);
+  updateReflowSoundControls();
+}
+function reflowSoundControls(){
+  var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
+  return '<div class="reflow-sound-controls">'
+    +'<button type="button" onclick="setReflowSoundEnabled('+(!enabled)+')">'
+    +(enabled?'关闭声音提醒':'开启声音提醒')+'</button>'
+    +'<button type="button" onclick="testReflowCoinSound()">测试声音</button>'
+    +'<span id="reflowSoundState"></span></div>';
+}
+
 function reflowFreshness(returnCloseTime){
   var time=finiteRNumber(returnCloseTime);
   if(time===null||time<=0) return '--';
@@ -1706,17 +1780,18 @@ function renderMomentumReflow(payload){
   function filters(){
     var defs=[['quality','\u8d28\u91cf',[['ALL','\u5168\u90e8'],['HIGH','\u9ad8\u8d28\u91cf'],['STANDARD','\u6807\u51c6'],['WATCH','\u89c2\u5bdf']]],['direction','\u65b9\u5411',[['ALL','\u5168\u90e8'],['LONG','LONG'],['SHORT','SHORT']]],['type','\u7c7b\u578b',[['ALL','\u5168\u90e8'],['CRYPTO','\u52a0\u5bc6'],['COMMODITY','\u5546\u54c1'],['FX','\u5916\u6c47']]],['status','\u72b6\u6001',[['ALL','\u5168\u90e8'],['ACTIVE','\u56de\u6d41\u6709\u6548'],['WINDOW_COMPLETE','\u7a97\u53e3\u7ed3\u675f'],['INVALID','\u4e8b\u4ef6\u5931\u6548']]]],h='<div class="reflow-filter-bar">';
     for(var i=0;i<defs.length;i++){var group=defs[i];h+='<div class="reflow-filter-group"><span class="reflow-filter-label">'+group[1]+'</span>';for(var j=0;j<group[2].length;j++){var item=group[2][j];h+='<button type="button" class="reflow-filter-btn '+(_reflowFilters[group[0]]===item[0]?'active':'')+'" onclick="setReflowFilter(\''+group[0]+'\',\''+item[0]+'\')">'+item[1]+'</button>';}h+='</div>';}
-    return h+'</div>';
+    return h+reflowSoundControls()+'</div>';
   }
   rows.sort(function(a,b){a=a&&typeof a==='object'?a:{};b=b&&typeof b==='object'?b:{};return finiteRNumber(b.return_open_time)-finiteRNumber(a.return_open_time)||finiteRNumber(b.quality_score)-finiteRNumber(a.quality_score)||finiteRNumber(b.breakout_volume_ratio)-finiteRNumber(a.breakout_volume_ratio)||String(a.symbol).localeCompare(String(b.symbol));});
   rows=rows.filter(function(row){row=row&&typeof row==='object'?row:{};return (_reflowFilters.quality==='ALL'||qualityKey(row)===_reflowFilters.quality)&&(_reflowFilters.direction==='ALL'||row.direction===_reflowFilters.direction)&&(_reflowFilters.type==='ALL'||typeKey(row)===_reflowFilters.type)&&(_reflowFilters.status==='ALL'||statusKey(row)===_reflowFilters.status);});
   var hasProgress=automation.progress!==undefined&&automation.progress!==null&&automation.progress!=='';
   var progress=automation.scanning?'\u626b\u63cf\u4e2d'+(hasProgress?' '+String(automation.progress):''):(hasProgress?String(automation.progress):'--');
   document.getElementById('stats').innerHTML='<div class="reflow-status-grid">'+card('\u81ea\u52a8\u626b\u63cf',automation.auto_scan_enabled?'\u5df2\u5f00\u542f':'\u5df2\u5173\u95ed',automation.auto_scan_enabled?'g':'r')+card('\u4e0a\u6b21\u626b\u63cf',bjTime(automation.last_auto_scan_at))+card('\u4e0b\u6b21\u626b\u63cf',bjTime(automation.next_scan_at),'c')+card('\u5f53\u524d\u626b\u63cf',progress,automation.scanning?'c':'')+card('\u5df2\u626b\u63cf',count(payload.scanned))+card('\u9519\u8bef',count(payload.errors),'r')+card('\u4eca\u65e5\u603b\u6570',count(payload.today_total),'c')+card('\u9ad8\u8d28\u91cf',count(payload.high_quality_count),'g')+'</div>';
-  if(!rows.length){document.getElementById('main').innerHTML=filters()+'<div class="empty-state"><div class="ic-empty"></div><h3>\u6682\u65e0\u9996\u6b21\u56de\u6d41\u5019\u9009</h3><p>\u7b49\u5f85 EMA50 \u5f3a\u52bf\u7a81\u7834\u3001\u6269\u5f20\u4e0e\u65e5\u7ebf\u786e\u8ba4\u540e\u9996\u6b21\u56de\u8e29\u3002</p></div>';return;}
+  if(!rows.length){document.getElementById('main').innerHTML=filters()+'<div class="empty-state"><div class="ic-empty"></div><h3>\u6682\u65e0\u9996\u6b21\u56de\u6d41\u5019\u9009</h3><p>\u7b49\u5f85 EMA50 \u5f3a\u52bf\u7a81\u7834\u3001\u6269\u5f20\u4e0e\u65e5\u7ebf\u786e\u8ba4\u540e\u9996\u6b21\u56de\u8e29\u3002</p></div>';updateReflowSoundControls();return;}
   var h=filters()+'<div class="reflow-dashboard"><table><thead><tr><th>#</th><th>\u4ea4\u6613\u5bf9</th><th>\u65b9\u5411</th><th>\u8d28\u91cf</th><th>\u72b6\u6001</th><th>\u7c7b\u578b</th><th>\u4ef7\u683c</th><th>EMA50</th><th>\u65b0\u9c9c\u5ea6</th><th>\u7a97\u53e3</th><th>\u7a81\u7834\u65f6\u95f4</th><th>\u65e5\u7ebf\u786e\u8ba4</th><th>\u91cf\u6bd4</th></tr></thead><tbody>';
   for(var i=0;i<rows.length;i++){var row=rows[i]&&typeof rows[i]==='object'?rows[i]:{},symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol),direction=row.direction==='SHORT'?'SHORT':'LONG',tone=direction==='LONG'?'g':'r',q=qualityKey(row),type=typeKey(row),status=statusKey(row),windowIndex=finiteRNumber(row.window_index),window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5',daily=escapeRHtml(dailyLabel[row.daily_kind]||row.daily_kind||'--');h+='<tr><td>'+(i+1)+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="\u590d\u5236"></span> <b>'+(escapeRHtml(symbol.replace('USDT',''))||'--')+'</b></td><td class="'+tone+' reflow-'+direction.toLowerCase()+'">'+direction+'</td><td><span class="reflow-quality reflow-quality-'+q.toLowerCase()+'">'+qualityLabel[q]+'</span></td><td class="reflow-mobile-detail-cell"><span class="reflow-status reflow-status-'+status.toLowerCase().replace('_','-')+'">'+statusLabel[status]+'</span><span class="reflow-mobile-freshness">'+reflowFreshness(row.return_close_time)+'</span><details class="reflow-mobile-details"><summary>\u66f4\u591a\u8be6\u60c5</summary><div>\u7c7b\u578b '+typeLabel[type]+' \u00b7 \u4ef7\u683c '+price(row.price)+' \u00b7 EMA50 '+price(row.ema50)+' \u00b7 \u7a97\u53e3 '+window+' \u00b7 \u7a81\u7834 '+bjTime(row.breakout_time)+' \u00b7 \u65e5\u7ebf '+daily+' \u00b7 \u91cf\u6bd4 '+volume(row.breakout_volume_ratio)+' \u00b7 \u6536\u76d8\u8ddd\u79bb '+atr(row.close_distance_atr)+' \u00b7 \u6700\u5927\u6269\u5f20 '+atr(row.max_expansion_atr)+'</div></details></td><td>'+typeLabel[type]+'</td><td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td>'+reflowFreshness(row.return_close_time)+'</td><td>'+window+'</td><td>'+bjTime(row.breakout_time)+'</td><td>'+daily+'</td><td>'+volume(row.breakout_volume_ratio)+'</td></tr>';}
   document.getElementById('main').innerHTML=h+'</tbody></table></div>';
+  updateReflowSoundControls();
 }
 
 // ===== SCANNING =====
@@ -3642,6 +3717,7 @@ if(firstMenu){firstMenu.classList.add('open'); firstMenu.previousElementSibling.
 if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||(Array.isArray(v.rows)?v.rows.length===0:(!Array.isArray(v.negative)||v.negative.length===0)&&(!Array.isArray(v.positive)||v.positive.length===0)))})){
   document.getElementById('scanLabel').textContent='首次使用，点击开始扫描';
 }
+initReflowAlertSound();
 </script></body></html>"""
 
 @app.route("/")

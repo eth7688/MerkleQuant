@@ -41,6 +41,8 @@ def render_reflow_payload(payload):
     ]
     script = f"""
 var nodes={{stats:{{innerHTML:''}},main:{{innerHTML:''}}}};
+global.localStorage={{getItem:function(){{return null;}},setItem:function(){{}}}};
+global.window={{}};
 global.document={{getElementById:function(id){{return nodes[id];}}}};
 {helpers}
 {renderer}
@@ -70,6 +72,7 @@ def render_reflow_filtered_payload(payload, filter_name, filter_value):
     script = f"""
 var nodes={{stats:{{innerHTML:''}},main:{{innerHTML:''}}}};
 global.window={{}};
+global.localStorage={{getItem:function(){{return null;}},setItem:function(){{}}}};
 global.document={{getElementById:function(id){{return nodes[id];}}}};
 {helpers}
 {renderer}
@@ -127,10 +130,48 @@ Promise.resolve().then(function(){{return Promise.resolve();}}).then(function(){
     return json.loads(completed.stdout)
 
 
+def run_alert_sound_javascript(test_body, include_menu_switch=False):
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    if "var REFLOW_ALERT_SOUND_KEY=" not in source:
+        raise AssertionError("reflow alert sound JavaScript is missing")
+    script = source[
+        source.index("var REFLOW_ALERT_SOUND_KEY="):
+        source.index("// ===== TRADER PANEL =====")
+    ]
+    if include_menu_switch:
+        script += source[
+            source.index("function selectTab(tid)"):
+            source.index("function copySymbol(sym, el)")
+        ]
+    harness = """
+const assert=require('assert');
+let storage={};
+global.localStorage={getItem:k=>storage[k]??null,setItem:(k,v)=>storage[k]=String(v)};
+let fetchPayload={latest_alert_id:0,events:[]},fetches=[];
+global.fetch=url=>{fetches.push(url);return Promise.resolve({ok:true,json:()=>Promise.resolve(fetchPayload)});};
+global.document={getElementById:()=>null}; global.window=global;
+global.setInterval=(fn,delay)=>{global.alertPoll=fn;global.alertPollDelay=delay;return 9;};
+global.clearedTimer=null;global.clearInterval=id=>{global.clearedTimer=id;};
+"""
+    try:
+        completed = subprocess.run(
+            ["node", "-e", harness + script + test_body],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except subprocess.CalledProcessError as error:
+        raise AssertionError(error.stderr) from error
+    return completed.stdout
+
+
 def first_use_scan_label(cache):
     source = Path("web_ui.py").read_text(encoding="utf-8")
     marker = "var firstMenu=document.querySelector('.menu-items');"
-    initial_state = source[source.index(marker):source.index("</script>", source.index(marker))]
+    initial_state = source[
+        source.index(marker):source.index("initReflowAlertSound();", source.index(marker))
+    ]
     script = f"""
 var D={json.dumps(cache)};
 var nodes={{scanLabel:{{textContent:''}}}};
@@ -258,6 +299,87 @@ class MomentumReflowUiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertNotIn("broken ledger", response.get_data(as_text=True))
+
+    def test_sound_first_enable_baselines_without_playing_and_batch_plays_once(self):
+        body = """
+let plays=0,activations=0;
+activateReflowAudio=()=>{activations++;return Promise.resolve(true);};
+playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+(async()=>{fetchPayload={latest_alert_id:4,events:[]};await setReflowSoundEnabled(true);
+assert.equal(activations,1);assert.equal(plays,0);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'4');
+fetchPayload={latest_alert_id:6,events:[{alert_id:5},{alert_id:6}]};await pollReflowAlerts();
+assert.equal(plays,1);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'6');process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_new_browser_baselines_and_starts_global_five_second_poll(self):
+        body = """
+let plays=0;playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+(async()=>{fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};initReflowAlertSound();
+await new Promise(resolve=>setImmediate(resolve));
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'4');assert.equal(plays,0);
+assert.equal(alertPollDelay,5000);process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_menu_switch_does_not_stop_global_alert_poll(self):
+        body = """
+storage[REFLOW_ALERT_CURSOR_KEY]='3';
+global.show=()=>{};global.closeSidebar=()=>{};
+initReflowAlertSound();selectTab('calculator');
+assert.equal(_reflowAlertTimer,9);assert.notEqual(clearedTimer,9);process.stdout.write('ok');
+"""
+        self.assertEqual(
+            run_alert_sound_javascript(body, include_menu_switch=True),
+            "ok",
+        )
+
+    def test_disabled_sound_does_not_poll_or_advance_cursor(self):
+        body = """
+(async()=>{storage[REFLOW_ALERT_SOUND_KEY]='0';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};await pollReflowAlerts();
+assert.equal(fetches.length,0);assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');
+process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_coin_sound_starts_three_ascending_metallic_tones(self):
+        body = """
+let frequencies=[],starts=[],ramps=[];
+class FakeAudioContext{
+  constructor(){this.currentTime=10;this.destination={};}
+  resume(){return Promise.resolve();}
+  createOscillator(){return {type:'',frequency:{setValueAtTime:v=>frequencies.push(v)},
+    connect:()=>{},start:v=>starts.push(v),stop:()=>{}};}
+  createGain(){return {gain:{setValueAtTime:()=>{},exponentialRampToValueAtTime:(v,t)=>ramps.push([v,t])},
+    connect:()=>{}};}
+}
+window.AudioContext=FakeAudioContext;
+(async()=>{assert.equal(await playReflowCoinSound(),true);assert.deepEqual(frequencies,[880,1175,1568]);
+assert.equal(starts.length,3);assert.equal(ramps.filter(x=>x[0]===0.0001).length,3);
+process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_test_sound_does_not_change_alert_cursor(self):
+        body = """
+let plays=0;storage[REFLOW_ALERT_CURSOR_KEY]='7';
+playReflowCoinSound=()=>{plays++;return Promise.resolve(true);};
+(async()=>{assert.equal(await testReflowCoinSound(),true);assert.equal(plays,1);
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'7');process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
+
+    def test_blocked_playback_keeps_cursor_and_requests_user_gesture(self):
+        body = """
+let state={textContent:''};document.getElementById=id=>id==='reflowSoundState'?state:null;
+class BlockedAudioContext{constructor(){this.currentTime=0;}resume(){return Promise.reject(new Error('blocked'));}}
+window.AudioContext=BlockedAudioContext;storage[REFLOW_ALERT_SOUND_KEY]='1';storage[REFLOW_ALERT_CURSOR_KEY]='3';
+(async()=>{fetchPayload={latest_alert_id:4,events:[{alert_id:4}]};await pollReflowAlerts();
+assert.equal(storage[REFLOW_ALERT_CURSOR_KEY],'3');assert.equal(state.textContent,'需要点击恢复声音');
+process.stdout.write('ok');})()
+"""
+        self.assertEqual(run_alert_sound_javascript(body), "ok")
 
     def test_sidebar_description_and_renderer_are_wired(self):
         source = Path("web_ui.py").read_text(encoding="utf-8")
