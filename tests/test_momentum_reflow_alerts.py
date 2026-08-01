@@ -300,6 +300,21 @@ class ReflowAlertLedgerTests(unittest.TestCase):
 
 
 class ReflowWechatDeliveryTests(unittest.TestCase):
+    def test_alert_runtime_files_are_gitignored(self):
+        repository = Path(__file__).resolve().parents[1]
+        for runtime_file in (
+            "momentum_reflow_alert_settings.json",
+            "momentum_reflow_alerts.json",
+            ".momentum_reflow_alerts.lock",
+        ):
+            with self.subTest(runtime_file=runtime_file):
+                result = subprocess.run(
+                    ["git", "check-ignore", "--no-index", "-q", runtime_file],
+                    cwd=repository,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+
     def test_test_webhook_rejects_invalid_stored_webhook_without_overwrite(self):
         with TemporaryDirectory() as folder:
             settings = Path(folder) / "settings.json"

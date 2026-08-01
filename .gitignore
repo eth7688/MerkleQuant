@@ -17,6 +17,9 @@ signal_events*.jsonl
 rj_*_events*.jsonl
 watchlist*.json
 momentum_reflow_state.json
+/momentum_reflow_alert_settings.json
+/momentum_reflow_alerts.json
+/.momentum_reflow_alerts.lock
 
 # Credentials and private keys
 *ed25519
