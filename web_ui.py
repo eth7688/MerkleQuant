@@ -4,6 +4,7 @@ Version: 1.0.0 (Titanium Build)
 启动: python web_ui.py  -> 浏览器 http://127.0.0.1:5000
 """
 from flask import Flask, render_template_string, jsonify, request, session, send_from_directory
+import re
 import threading, time, requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -23,6 +24,7 @@ from momentum_reflow_dashboard import (
     next_reflow_scan_at,
 )
 from momentum_reflow_alerts import (
+    WEBHOOK_PREFIX,
     deliver_due_wechat,
     observe_reflow_alerts,
     read_public_alerts,
@@ -465,6 +467,13 @@ _reflow_alert_status = {
     "last_error": "",
     "last_delivery_at": 0,
 }
+
+def _sanitize_reflow_alert_error(error):
+    return re.sub(
+        rf"({re.escape(WEBHOOK_PREFIX)})\S*",
+        r"\1****",
+        str(error or ""),
+    )[:80]
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -3788,7 +3797,7 @@ def _process_reflow_alerts(payload, now_ms):
         )
     except Exception as error:
         with _reflow_alert_lock:
-            _reflow_alert_status["last_error"] = str(error)[:80]
+            _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(error)
         return []
     if created:
         _reflow_alert_wakeup.set()
@@ -3975,14 +3984,16 @@ def _reflow_alert_worker_loop():
                     int(time.time() * 1000),
                 )
                 with _reflow_alert_lock:
-                    _reflow_alert_status["last_error"] = result.get("error", "")
+                    _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(
+                        result.get("error", "")
+                    )
                     if result.get("status") == "delivered":
                         _reflow_alert_status["last_delivery_at"] = int(
                             time.time() * 1000
                         )
             except Exception as error:
                 with _reflow_alert_lock:
-                    _reflow_alert_status["last_error"] = str(error)[:80]
+                    _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(error)
             _reflow_alert_wakeup.wait(30)
             _reflow_alert_wakeup.clear()
     finally:

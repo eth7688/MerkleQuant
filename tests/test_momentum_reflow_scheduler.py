@@ -254,6 +254,12 @@ class ReflowSchedulerLifecycleTests(unittest.TestCase):
 
 
 class ReflowAlertWorkerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        web_ui._reflow_alert_stop.clear()
+        web_ui._reflow_alert_wakeup.clear()
+        with web_ui._reflow_alert_lock:
+            web_ui._reflow_alert_status["last_error"] = ""
+
     def tearDown(self):
         web_ui._stop_reflow_alert_worker_for_tests()
 
@@ -306,6 +312,48 @@ class ReflowAlertWorkerLifecycleTests(unittest.TestCase):
             self.assertFalse(web_ui._start_reflow_alert_worker())
 
         self.assertEqual(len(threads), 1)
+
+    def test_worker_masks_webhook_and_caps_returned_delivery_error(self):
+        unsafe_error = (
+            "delivery failure https://qyapi.weixin.qq.com/cgi-bin/webhook/send?"
+            "key=leaked-returned-key " + "x" * 100
+        )
+
+        def stop_after_wait(timeout):
+            web_ui._reflow_alert_stop.set()
+            return False
+
+        with patch.object(
+            web_ui,
+            "deliver_due_wechat",
+            return_value={"status": "idle", "error": unsafe_error},
+        ), patch.object(web_ui._reflow_alert_wakeup, "wait", stop_after_wait):
+            web_ui._reflow_alert_worker_loop()
+
+        status_error = web_ui._reflow_alert_status["last_error"]
+        self.assertNotIn("leaked", status_error)
+        self.assertLessEqual(len(status_error), 80)
+
+    def test_worker_masks_webhook_and_caps_raised_delivery_error(self):
+        unsafe_error = (
+            "delivery failure https://qyapi.weixin.qq.com/cgi-bin/webhook/send?"
+            "key=leaked-raised-key " + "x" * 100
+        )
+
+        def stop_after_wait(timeout):
+            web_ui._reflow_alert_stop.set()
+            return False
+
+        with patch.object(
+            web_ui,
+            "deliver_due_wechat",
+            side_effect=RuntimeError(unsafe_error),
+        ), patch.object(web_ui._reflow_alert_wakeup, "wait", stop_after_wait):
+            web_ui._reflow_alert_worker_loop()
+
+        status_error = web_ui._reflow_alert_status["last_error"]
+        self.assertNotIn("leaked", status_error)
+        self.assertLessEqual(len(status_error), 80)
 
 
 if __name__ == "__main__":

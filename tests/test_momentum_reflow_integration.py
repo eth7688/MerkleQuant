@@ -209,6 +209,24 @@ class MomentumReflowUiTests(unittest.TestCase):
 
         self.assertIn("broken ledger", web_ui._reflow_alert_status["last_error"])
 
+    def test_alert_observation_error_masks_webhook_and_caps_status(self):
+        web_ui = importlib.import_module("web_ui")
+        unsafe_error = (
+            "ledger failure https://qyapi.weixin.qq.com/cgi-bin/webhook/send?"
+            "key=leaked-observation-key " + "x" * 100
+        )
+
+        with patch.object(
+            web_ui,
+            "observe_reflow_alerts",
+            side_effect=ValueError(unsafe_error),
+        ):
+            self.assertEqual(web_ui._process_reflow_alerts({"rows": []}, 1), [])
+
+        status_error = web_ui._reflow_alert_status["last_error"]
+        self.assertNotIn("leaked", status_error)
+        self.assertLessEqual(len(status_error), 80)
+
     def test_alert_api_requires_login_and_returns_no_webhook(self):
         web_ui = importlib.import_module("web_ui")
         client = web_ui.app.test_client()
