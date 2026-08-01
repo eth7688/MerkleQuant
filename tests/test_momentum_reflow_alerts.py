@@ -795,14 +795,14 @@ class ReflowWechatDeliveryTests(unittest.TestCase):
         self.assertIn("首次发现：2026-08-08", text)
         self.assertNotIn("建议", text)
 
-    def test_sender_requires_official_https_webhook_and_success_code(self):
+    def test_sender_uses_plain_text_for_wechat_plugin_compatibility(self):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"errcode": 0, "errmsg": "ok"}
         post = Mock(return_value=response)
         url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
         send_wechat_markdown(url, "test", post=post)
-        post.assert_called_once_with(url, json={"msgtype": "markdown", "markdown": {"content": "test"}}, timeout=5.0)
+        post.assert_called_once_with(url, json={"msgtype": "text", "text": {"content": "test"}}, timeout=5.0)
         with self.assertRaises(ValueError):
             send_wechat_markdown("http://example.com/key=secret", "test", post=post)
 

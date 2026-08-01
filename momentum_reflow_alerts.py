@@ -437,7 +437,7 @@ def format_wechat_markdown(event: dict) -> str:
 def send_wechat_markdown(webhook: str, content: str, *, post=requests.post,
                          timeout: float = 5.0) -> None:
     validate_wechat_webhook(webhook)
-    response = post(webhook, json={"msgtype": "markdown", "markdown": {"content": content}},
+    response = post(webhook, json={"msgtype": "text", "text": {"content": content}},
                     timeout=timeout)
     response.raise_for_status()
     payload = response.json()
