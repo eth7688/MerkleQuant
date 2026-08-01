@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import tempfile
 import threading
 from datetime import datetime
+from numbers import Real
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,6 +18,7 @@ SETTINGS_VERSION = 1
 LEDGER_VERSION = 1
 WEBHOOK_PREFIX = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
 _LOCK = threading.RLock()
+_DELIVERY_LOCK = threading.Lock()
 DEFAULT_SETTINGS = {
     "version": SETTINGS_VERSION,
     "wechat_enabled": False,
@@ -131,11 +134,29 @@ def _validate_ledger(value: dict) -> dict:
             raise ValueError("reflow alert event observation is invalid")
         if set(event["snapshot"]) != set(SNAPSHOT_FIELDS):
             raise ValueError("reflow alert event snapshot is invalid")
+        _validate_snapshot(event["snapshot"])
     last_alert_id = len(value["events"])
     if (value["next_alert_id"] != last_alert_id + 1
             or not 0 <= value["wechat_cursor"] <= last_alert_id):
         raise ValueError("reflow alert ledger sequence is invalid")
     return value
+
+
+def _validate_snapshot(snapshot: dict) -> None:
+    if (not isinstance(snapshot["symbol"], str) or not snapshot["symbol"]
+            or not isinstance(snapshot["direction"], str) or not snapshot["direction"]
+            or not isinstance(snapshot["daily_kind"], str) or not snapshot["daily_kind"]
+            or type(snapshot["window_index"]) is not int or snapshot["window_index"] <= 0
+            or type(snapshot["first_seen_at"]) is not int or snapshot["first_seen_at"] < 0):
+        raise ValueError("reflow alert event snapshot is invalid")
+    for field in ("price", "ema50"):
+        if (isinstance(snapshot[field], bool) or not isinstance(snapshot[field], Real)
+                or not math.isfinite(snapshot[field])):
+            raise ValueError("reflow alert event snapshot is invalid")
+    ratio = snapshot["breakout_volume_ratio"]
+    if (isinstance(ratio, bool) or not isinstance(ratio, Real)
+            or not math.isfinite(ratio) or ratio < 0):
+        raise ValueError("reflow alert event snapshot is invalid")
 
 
 def load_alert_settings(path: Path) -> dict:
@@ -303,6 +324,12 @@ def deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
                        post=requests.post) -> dict:
     if type(now_ms) is not int:
         raise TypeError("now_ms must be an integer")
+    with _DELIVERY_LOCK:
+        return _deliver_due_wechat(settings_path, ledger_path, now_ms, post=post)
+
+
+def _deliver_due_wechat(settings_path: Path, ledger_path: Path, now_ms: int, *,
+                         post=requests.post) -> dict:
     settings = load_alert_settings(settings_path)
     if not settings["wechat_enabled"]:
         return {"status": "disabled"}

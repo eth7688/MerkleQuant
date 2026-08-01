@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -145,6 +146,19 @@ class ReflowAlertLedgerTests(unittest.TestCase):
                 read_public_alerts(path, 0)
             self.assertEqual(path.read_bytes(), original)
 
+    def test_malformed_snapshot_field_fails_closed_without_overwrite(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "alerts.json"
+            observe_reflow_alerts(path, [], 1)
+            observe_reflow_alerts(path, [row()], 2)
+            ledger = json.loads(path.read_text(encoding="utf-8"))
+            ledger["events"][0]["snapshot"]["first_seen_at"] = "bad"
+            path.write_text(json.dumps(ledger), encoding="utf-8")
+            original = path.read_bytes()
+            with self.assertRaises(ValueError):
+                read_public_alerts(path, 0)
+            self.assertEqual(path.read_bytes(), original)
+
     def test_webhook_is_masked_and_blank_save_preserves_secret(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"
@@ -175,6 +189,36 @@ class ReflowAlertLedgerTests(unittest.TestCase):
 
 
 class ReflowWechatDeliveryTests(unittest.TestCase):
+    def test_concurrent_delivery_sends_once_and_advances_cursor_monotonically(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
+            url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=url, updated_by="7", now_ms=1)
+            observe_reflow_alerts(ledger, [], 1); observe_reflow_alerts(ledger, [row()], 2)
+            first_started = threading.Event(); second_started = threading.Event(); release_first = threading.Event()
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            calls = []
+
+            def post(*args, **kwargs):
+                calls.append((args, kwargs))
+                if len(calls) == 1:
+                    first_started.set()
+                    release_first.wait(1)
+                else:
+                    second_started.set()
+                return response
+
+            first = threading.Thread(target=deliver_due_wechat, args=(settings, ledger, 2), kwargs={"post": post})
+            second = threading.Thread(target=deliver_due_wechat, args=(settings, ledger, 2), kwargs={"post": post})
+            first.start(); self.assertTrue(first_started.wait(1))
+            second.start()
+            second_entered = second_started.wait(0.2)
+            release_first.set(); first.join(1); second.join(1)
+            self.assertFalse(second_entered)
+            self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(json.loads(ledger.read_text(encoding="utf-8"))["wechat_cursor"], 1)
+
     def test_delivery_rejects_non_integer_timestamp_before_writing(self):
         with TemporaryDirectory() as folder:
             root = Path(folder); settings = root / "settings.json"; ledger = root / "ledger.json"
