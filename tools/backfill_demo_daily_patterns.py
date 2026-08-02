@@ -41,6 +41,7 @@ def parse_time_ms(value: object) -> int | None:
 
 def build_entry_time_index(event_lines: list[str]) -> dict[str, int]:
     index: dict[str, int] = {}
+    seen_keys: set[str] = set()
     for raw in event_lines:
         if not raw.strip():
             continue
@@ -49,11 +50,14 @@ def build_entry_time_index(event_lines: list[str]) -> dict[str, int]:
             continue
         snapshot = event.get("snapshot") or event.get("data") or {}
         key = str(event.get("signal_key") or snapshot.get("signal_key") or "").strip()
-        entry_ms = parse_time_ms(event.get("time"))
-        if not key or entry_ms is None:
+        if not key:
             continue
-        if key in index and index[key] != entry_ms:
+        if key in seen_keys:
             raise RuntimeError(f"non-unique entry event for {key}")
+        seen_keys.add(key)
+        entry_ms = parse_time_ms(event.get("time"))
+        if entry_ms is None:
+            continue
         index[key] = entry_ms
     return index
 
@@ -102,6 +106,14 @@ def _snapshot(row: dict, entry_ms: int, daily: pd.DataFrame) -> dict:
     return state
 
 
+def _line_ending(raw: str) -> str:
+    if raw.endswith("\r\n"):
+        return "\r\n"
+    if raw.endswith(("\n", "\r")):
+        return raw[-1]
+    return ""
+
+
 def backfill_records(
     positions: list[dict],
     trade_lines: list[str],
@@ -126,15 +138,16 @@ def backfill_records(
         )),
     ):
         for index, row in indexed_rows:
+            pattern = row.get("daily_pattern") or {}
+            if bool(pattern.get("recorded")):
+                skipped_recorded += 1
+                continue
             entry_ms = _entry_time_for_row(kind, row, entry_times, cutoff_ms)
             eligible, entry_ms = _eligible(row, entry_ms, cutoff_ms)
             if eligible:
                 targets.append((kind, index, row, entry_ms))
                 continue
-            pattern = row.get("daily_pattern") or {}
-            if bool(pattern.get("recorded")):
-                skipped_recorded += 1
-            elif entry_ms is not None and entry_ms < cutoff_ms:
+            if entry_ms is not None and entry_ms < cutoff_ms:
                 skipped_pre_cutoff += 1
 
     histories: dict[str, pd.DataFrame] = {}
@@ -169,7 +182,7 @@ def backfill_records(
         index for kind, index, _ in planned if kind == "trade"
     }
     new_lines = [
-        json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + _line_ending(raw)
         if index in changed_trade_indexes else raw
         for index, (raw, row) in enumerate(parsed_trades)
     ]
@@ -234,7 +247,8 @@ def main() -> None:
         parser.error("required paths do not exist: " + ", ".join(missing))
 
     positions = json.loads(positions_path.read_text(encoding="utf-8"))
-    trade_lines = trades_path.read_text(encoding="utf-8").splitlines()
+    trade_text = trades_path.read_bytes().decode("utf-8")
+    trade_lines = trade_text.splitlines(keepends=True)
     event_lines = events_path.read_text(encoding="utf-8").splitlines()
     entry_times = build_entry_time_index(event_lines)
     new_positions, new_trade_lines, report = backfill_records(
@@ -252,7 +266,13 @@ def main() -> None:
         parser.error("--apply requires at least one target")
 
     positions_text = json.dumps(new_positions, ensure_ascii=False, indent=2) + "\n"
-    trades_text = "\n".join(new_trade_lines) + "\n"
+    trades_text = "".join(new_trade_lines)
+    if trades_text and not _line_ending(trades_text):
+        original_ending = next(
+            (_line_ending(line) for line in trade_lines if _line_ending(line)),
+            "\n",
+        )
+        trades_text += original_ending
     atomic_write(positions_path, positions_text)
     atomic_write(trades_path, trades_text)
 

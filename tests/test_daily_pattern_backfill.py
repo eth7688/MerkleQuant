@@ -1,13 +1,18 @@
 import copy
+import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
+import tools.backfill_demo_daily_patterns as backfill_tool
 from tools.backfill_demo_daily_patterns import (
     backfill_records, build_entry_time_index, parse_time_ms,
 )
@@ -63,6 +68,29 @@ class DailyPatternBackfillTest(unittest.TestCase):
         self.assertEqual(parse_time_ms(CUTOFF), CUTOFF)
         self.assertEqual(parse_time_ms("2026-08-01T08:10:32+00:00"), CUTOFF)
 
+    def test_entry_index_rejects_same_time_duplicate(self):
+        event = json.dumps({
+            "event": "entry_filled",
+            "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        with self.assertRaises(RuntimeError):
+            build_entry_time_index([event, event])
+
+    def test_entry_index_rejects_valid_and_invalid_duplicate(self):
+        valid = json.dumps({
+            "event": "entry_filled",
+            "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        invalid = json.dumps({
+            "event": "entry_filled",
+            "time": "invalid",
+            "signal_key": "SIG-1",
+        })
+        with self.assertRaises(RuntimeError):
+            build_entry_time_index([valid, invalid])
+
     def test_backfill_uses_entry_time_and_ignores_future_candle(self):
         position = missing()
         positions, lines, report = backfill_records(
@@ -112,6 +140,46 @@ class DailyPatternBackfillTest(unittest.TestCase):
         self.assertEqual(lines[0], "")
         self.assertEqual(json.loads(lines[1])["daily_pattern"]["recorded"], True)
 
+    def test_cli_apply_preserves_untouched_crlf_bytes(self):
+        untouched = json.dumps(missing(entry_ms=CUTOFF - 1), ensure_ascii=False)
+        target = json.dumps(closed_trade(), ensure_ascii=False)
+        event = json.dumps({
+            "event": "entry_filled",
+            "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "positions_<uid>.json").write_bytes(b"[]\r\n")
+            trades_path = root / "trades_<uid>.jsonl"
+            trades_path.write_bytes(
+                f"{untouched}\r\n{target}\r\n".encode("utf-8")
+            )
+            (root / "signal_events_0.jsonl").write_bytes(
+                f"{event}\r\n".encode("utf-8")
+            )
+
+            argv = [
+                "backfill_demo_daily_patterns.py",
+                "--root", str(root),
+                "--apply",
+            ]
+            with (
+                patch.object(backfill_tool, "load_history", return_value=frame_with_future_pattern()),
+                patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+            ):
+                backfill_tool.main()
+
+            migrated = trades_path.read_bytes()
+            self.assertTrue(
+                migrated.startswith(f"{untouched}\r\n".encode("utf-8"))
+            )
+            self.assertEqual(migrated.count(b"\r\n"), 2)
+            self.assertNotIn(b"\n", migrated.replace(b"\r\n", b""))
+            changed = migrated.split(b"\r\n")[1]
+            self.assertTrue(json.loads(changed)["daily_pattern"]["recorded"])
+
     def test_any_loader_failure_raises_before_mutating_inputs(self):
         positions = [missing()]
         original = copy.deepcopy(positions)
@@ -144,3 +212,15 @@ class DailyPatternBackfillTest(unittest.TestCase):
             backfill_records(
                 [], [trade], {}, CUTOFF, lambda _: frame_with_future_pattern(),
             )
+
+    def test_recent_recorded_trade_skips_missing_entry_event(self):
+        recorded = closed_trade(signal_key="MISSING")
+        recorded["daily_pattern"] = {"recorded": True, "kind": "hammer"}
+        raw = json.dumps(recorded, ensure_ascii=False)
+        _, lines, report = backfill_records(
+            [], [raw], {}, CUTOFF,
+            lambda _: (_ for _ in ()).throw(AssertionError("loader called")),
+        )
+        self.assertEqual(lines, [raw])
+        self.assertEqual(report["targets"], 0)
+        self.assertEqual(report["skipped_recorded"], 1)
