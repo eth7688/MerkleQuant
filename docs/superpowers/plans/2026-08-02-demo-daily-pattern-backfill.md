@@ -17,6 +17,7 @@
 - Backfill cutoff is exactly `2026-08-01T08:10:32Z` (`1785571832000` milliseconds).
 - Only missing or `not_recorded` snapshots at/after the cutoff are eligible.
 - Existing recorded snapshots and pre-cutoff history are immutable.
+- Closed trades derive entry time only from a unique `signal_key` match to an `entry_filled` event in `signal_events_0.jsonl`; trade `time` is exit time and must never drive pattern evaluation.
 - Any target fetch/evaluation failure aborts the whole migration before state-file replacement.
 - No external dependency or frontend change is allowed.
 
@@ -199,7 +200,8 @@ git commit -m "fix: record daily pattern for every demo entry source"
 
 **Interfaces:**
 - Produces: `parse_time_ms(value: object) -> int | None`
-- Produces: `backfill_records(positions: list[dict], trade_lines: list[str], cutoff_ms: int, history_loader: Callable[[str], pd.DataFrame]) -> tuple[list[dict], list[str], dict]`
+- Produces: `build_entry_time_index(event_lines: list[str]) -> dict[str, int]`
+- Produces: `backfill_records(positions: list[dict], trade_lines: list[str], entry_times: dict[str, int], cutoff_ms: int, history_loader: Callable[[str], pd.DataFrame]) -> tuple[list[dict], list[str], dict]`
 - Produces CLI: `python tools/backfill_demo_daily_patterns.py --root PATH [--cutoff ISO] [--apply]`
 - Report keys: `targets`, `updated_positions`, `updated_trades`, `skipped_pre_cutoff`, `skipped_recorded`, `failures`, and `snapshots`.
 
@@ -215,7 +217,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from tools.backfill_demo_daily_patterns import backfill_records, parse_time_ms
+from tools.backfill_demo_daily_patterns import (
+    backfill_records, build_entry_time_index, parse_time_ms,
+)
 
 
 DAY_MS = 86_400_000
@@ -244,6 +248,14 @@ def missing(symbol="TESTUSDT", entry_ms=CUTOFF + 1_000):
     }
 
 
+def closed_trade(signal_key="SIG-1", exit_ms=CUTOFF + DAY_MS):
+    row = missing(entry_ms=CUTOFF + 1_000)
+    row.pop("entry_time")
+    row["time"] = datetime.fromtimestamp(exit_ms / 1000, timezone.utc).isoformat()
+    row["signal_key"] = signal_key
+    return row
+
+
 class DailyPatternBackfillTest(unittest.TestCase):
     def test_parse_time_accepts_iso_and_milliseconds(self):
         self.assertEqual(parse_time_ms(CUTOFF), CUTOFF)
@@ -252,7 +264,7 @@ class DailyPatternBackfillTest(unittest.TestCase):
     def test_backfill_uses_entry_time_and_ignores_future_candle(self):
         position = missing()
         positions, lines, report = backfill_records(
-            [position], [], CUTOFF, lambda _: frame_with_future_pattern(),
+            [position], [], {}, CUTOFF, lambda _: frame_with_future_pattern(),
         )
         self.assertEqual(report["updated_positions"], 1)
         self.assertEqual(positions[0]["daily_pattern"]["kind"], "bullish_engulfing")
@@ -267,20 +279,22 @@ class DailyPatternBackfillTest(unittest.TestCase):
         recorded["daily_pattern"] = {"recorded": True, "kind": "hammer"}
         original = copy.deepcopy([old, recorded])
         positions, _, report = backfill_records(
-            [old, recorded], [], CUTOFF, lambda _: frame_with_future_pattern(),
+            [old, recorded], [], {}, CUTOFF, lambda _: frame_with_future_pattern(),
         )
         self.assertEqual(positions, original)
         self.assertEqual(report["targets"], 0)
 
     def test_trade_jsonl_preserves_untouched_lines_and_is_idempotent(self):
         untouched = json.dumps(missing(entry_ms=CUTOFF - 1), ensure_ascii=False)
-        target = json.dumps(missing(), ensure_ascii=False)
+        target = json.dumps(closed_trade(), ensure_ascii=False)
         positions, lines, first = backfill_records(
-            [], [untouched, target], CUTOFF, lambda _: frame_with_future_pattern(),
+            [], [untouched, target], {"SIG-1": CUTOFF + 1_000},
+            CUTOFF, lambda _: frame_with_future_pattern(),
         )
         self.assertEqual(lines[0], untouched)
         _, second_lines, second = backfill_records(
-            positions, lines, CUTOFF, lambda _: frame_with_future_pattern(),
+            positions, lines, {"SIG-1": CUTOFF + 1_000},
+            CUTOFF, lambda _: frame_with_future_pattern(),
         )
         self.assertEqual(second_lines, lines)
         self.assertEqual(second["targets"], 0)
@@ -290,10 +304,33 @@ class DailyPatternBackfillTest(unittest.TestCase):
         original = copy.deepcopy(positions)
         with self.assertRaises(RuntimeError):
             backfill_records(
-                positions, [], CUTOFF,
+                positions, [], {}, CUTOFF,
                 lambda _: (_ for _ in ()).throw(RuntimeError("network")),
             )
         self.assertEqual(positions, original)
+
+    def test_trade_uses_entry_event_not_exit_time(self):
+        event = json.dumps({
+            "event": "entry_filled", "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        index = build_entry_time_index([event])
+        trade = json.dumps(closed_trade(exit_ms=CUTOFF + 10 * DAY_MS))
+        _, lines, report = backfill_records(
+            [], [trade], index, CUTOFF, lambda _: frame_with_future_pattern(),
+        )
+        migrated = json.loads(lines[0])
+        self.assertEqual(index["SIG-1"], CUTOFF + 1_000)
+        self.assertLessEqual(
+            migrated["daily_pattern"]["candle_close_time"], index["SIG-1"],
+        )
+
+    def test_recent_trade_without_unique_entry_event_aborts(self):
+        trade = json.dumps(closed_trade(signal_key="MISSING"))
+        with self.assertRaises(RuntimeError):
+            backfill_records(
+                [], [trade], {}, CUTOFF, lambda _: frame_with_future_pattern(),
+            )
 ```
 
 - [ ] **Step 2: Run migration tests and verify RED**
@@ -329,10 +366,42 @@ def parse_time_ms(value):
     return int(parsed.timestamp() * 1000)
 
 
-def _eligible(row, cutoff_ms):
+def build_entry_time_index(event_lines):
+    index = {}
+    for raw in event_lines:
+        if not raw.strip():
+            continue
+        event = json.loads(raw)
+        if event.get("event") != "entry_filled":
+            continue
+        snapshot = event.get("snapshot") or event.get("data") or {}
+        key = str(event.get("signal_key") or snapshot.get("signal_key") or "").strip()
+        entry_ms = parse_time_ms(event.get("time"))
+        if not key or entry_ms is None:
+            continue
+        if key in index and index[key] != entry_ms:
+            raise RuntimeError(f"non-unique entry event for {key}")
+        index[key] = entry_ms
+    return index
+
+
+def _entry_time_for_row(kind, row, entry_times, cutoff_ms):
+    if kind == "position":
+        return parse_time_ms(row.get("entry_time"))
+    key = str(row.get("signal_key", "") or "").strip()
+    if key and key in entry_times:
+        return entry_times[key]
+    exit_ms = parse_time_ms(row.get("time"))
+    if exit_ms is not None and exit_ms >= cutoff_ms:
+        raise RuntimeError(
+            f"recent trade has no unique entry event: {row.get('symbol')}/{key}"
+        )
+    return None
+
+
+def _eligible(row, entry_ms, cutoff_ms):
     pattern = row.get("daily_pattern") or {}
     reason = str(pattern.get("reason", "not_recorded") or "not_recorded")
-    entry_ms = parse_time_ms(row.get("entry_time") or row.get("time"))
     return (
         entry_ms is not None
         and entry_ms >= cutoff_ms
@@ -355,14 +424,17 @@ def _snapshot(row, entry_ms, daily):
     return state
 
 
-def backfill_records(positions, trade_lines, cutoff_ms, history_loader):
+def backfill_records(positions, trade_lines, entry_times, cutoff_ms, history_loader):
     new_positions = copy.deepcopy(positions)
     parsed_trades = [(line, json.loads(line)) for line in trade_lines if line.strip()]
     targets = []
     for kind, rows in (("position", new_positions),
                        ("trade", [row for _, row in parsed_trades])):
         for index, row in enumerate(rows):
-            eligible, entry_ms = _eligible(row, cutoff_ms)
+            entry_ms = _entry_time_for_row(
+                kind, row, entry_times, cutoff_ms,
+            )
+            eligible, entry_ms = _eligible(row, entry_ms, cutoff_ms)
             if eligible:
                 targets.append((kind, index, row, entry_ms))
 
@@ -433,7 +505,7 @@ def atomic_write(path, text):
             os.unlink(temp_name)
 ```
 
-It loads `<root>/positions_<uid>.json` and raw lines from `<root>/trades_<uid>.jsonl`, calls `backfill_records`, prints the JSON report in both modes, and writes only when `--apply` is present. It writes positions as indented JSON plus newline and trades as joined JSONL plus a final newline. It must refuse `--apply` unless both paths exist and `report["targets"] > 0`.
+It loads `<root>/positions_<uid>.json`, raw lines from `<root>/trades_<uid>.jsonl`, and read-only entry events from `<root>/signal_events_0.jsonl`. It builds the unique entry-time index, calls `backfill_records`, prints the JSON report in both modes, and writes only when `--apply` is present. It writes positions as indented JSON plus newline and trades as joined JSONL plus a final newline. It must refuse `--apply` unless all three paths exist and `report["targets"] > 0`.
 
 - [ ] **Step 5: Run migration tests twice and verify GREEN/idempotency**
 
@@ -516,6 +588,7 @@ Skip the commit command when there is no review fix. Expected final status: empt
 **Files:**
 - Deploy: `trader.py` to `<deploy-dir>/trader.py`
 - Temporary migration upload: `tools/backfill_demo_daily_patterns.py` to `/tmp/backfill_demo_daily_patterns.py`
+- Read-only migration source: `<deploy-dir>/signal_events_0.jsonl`
 - Mutate after backup and dry-run: `<deploy-dir>/positions_<uid>.json`, `<deploy-dir>/trades_<uid>.jsonl`
 - Update locally after successful deployment: `PROGRESS.md`
 
@@ -527,7 +600,7 @@ Skip the commit command when there is no review fix. Expected final status: empt
 
 - [ ] **Step 1: Record pre-deployment hashes and create a server backup**
 
-Stop `macd-bot` only after confirming the staged local verification is green. Then create `/root/axiom_deploy_backups/daily_pattern_backfill_<UTC timestamp>` containing `trader.py`, `positions_<uid>.json`, `trades_<uid>.jsonl`, `demo_bot_config.json`, and `axiom_accounts.db`. Record SHA256 for all five files and the position/trade counts.
+Stop `macd-bot` only after confirming the staged local verification is green. Then create `/root/axiom_deploy_backups/daily_pattern_backfill_<UTC timestamp>` containing `trader.py`, `positions_<uid>.json`, `trades_<uid>.jsonl`, `signal_events_0.jsonl`, `demo_bot_config.json`, and `axiom_accounts.db`. Record SHA256 for all six files and the position/trade counts.
 
 - [ ] **Step 2: Upload explicit staged files and compile before replacement**
 

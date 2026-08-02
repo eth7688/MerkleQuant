@@ -45,16 +45,16 @@
 - 实体来自 `positions_<uid>.json` 或 `trades_<uid>.jsonl`。
 - 入场时间不早于日线影子功能首次生产部署时间 `2026-08-01T08:10:32Z`。
 - 当前 `daily_pattern.recorded` 为 `false`，且原因为 `not_recorded` 或字段缺失。
-- 记录具备可解析的币种、方向和入场时间。
+- 记录具备可解析的币种、方向和入场时间。持仓直接使用`entry_time`；交易记录的`time`是平仓时间，必须通过唯一`signal_key`关联`signal_events_0.jsonl`中的`entry_filled.time`，严禁把平仓时间当作入场时间。
 
 每条目标记录按其原始入场时间作为 `decision_time`。评估器只允许选择 `candle_close_time <= decision_time` 的日K；即使拉取结果包含后来K线，也不得读取。
 
-功能上线前的记录、已有真实快照、解析失败记录均不修改。迁移重复执行时结果为零变更。
+功能上线前的记录、已有真实快照均不修改。功能上线后可能符合回填条件、但无法唯一关联入场事件的交易会使整次迁移中止，不猜测时间。迁移重复执行时结果为零变更。
 
 ## 迁移安全性
 
 - 先停止 `macd-bot`，避免运行中引擎覆盖持仓或追加交易记录；`macd-admin`无需写这些文件。
-- 在服务器创建带时间戳备份，包含代码、`positions_<uid>.json`、`trades_<uid>.jsonl`、`demo_bot_config.json`和数据库。
+- 在服务器创建带时间戳备份，包含代码、`positions_<uid>.json`、`trades_<uid>.jsonl`、只读关联源`signal_events_0.jsonl`、`demo_bot_config.json`和数据库。
 - 迁移工具先执行 dry-run，输出目标数、成功数、失败数和每笔快照摘要，不写文件。
 - 只要任何目标记录无法拉取或评估，正式迁移整体中止，不写任何文件。
 - 正式应用先生成并校验两个临时文件，再用 `os.replace` 替换；未变更的 JSONL 行保持原文，避免无关重写。
