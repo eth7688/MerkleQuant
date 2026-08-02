@@ -209,7 +209,7 @@ def load_history(symbol: str) -> pd.DataFrame:
     )
 
 
-def atomic_write(path: Path, text: str) -> None:
+def atomic_write(path: Path, text: str) -> str:
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
     )
@@ -218,10 +218,28 @@ def atomic_write(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    finally:
+        return temp_name
+    except BaseException:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+        raise
+
+
+def _validate_staged_outputs(positions_temp: str, trades_temp: str) -> None:
+    positions = json.loads(Path(positions_temp).read_text(encoding="utf-8"))
+    if not isinstance(positions, list):
+        raise ValueError("staged positions output is not a JSON list")
+    for line_number, raw in enumerate(
+        Path(trades_temp).read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not raw.strip():
+            continue
+        trade = json.loads(raw)
+        if not isinstance(trade, dict):
+            raise ValueError(
+                f"staged trade line {line_number} is not a JSON object"
+            )
 
 
 def main() -> None:
@@ -273,8 +291,19 @@ def main() -> None:
             "\n",
         )
         trades_text += original_ending
-    atomic_write(positions_path, positions_text)
-    atomic_write(trades_path, trades_text)
+    staged_temps = []
+    try:
+        positions_temp = atomic_write(positions_path, positions_text)
+        staged_temps.append(positions_temp)
+        trades_temp = atomic_write(trades_path, trades_text)
+        staged_temps.append(trades_temp)
+        _validate_staged_outputs(positions_temp, trades_temp)
+        os.replace(positions_temp, positions_path)
+        os.replace(trades_temp, trades_path)
+    finally:
+        for temp_name in staged_temps:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
 
 if __name__ == "__main__":

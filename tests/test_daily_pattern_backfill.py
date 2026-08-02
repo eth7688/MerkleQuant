@@ -180,6 +180,86 @@ class DailyPatternBackfillTest(unittest.TestCase):
             changed = migrated.split(b"\r\n")[1]
             self.assertTrue(json.loads(changed)["daily_pattern"]["recorded"])
 
+    def test_cli_dry_run_prints_report_without_writing_outputs(self):
+        target = json.dumps(closed_trade(), ensure_ascii=False)
+        event = json.dumps({
+            "event": "entry_filled",
+            "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positions_path = root / "positions_<uid>.json"
+            trades_path = root / "trades_<uid>.jsonl"
+            positions_path.write_bytes(b"[]\r\n")
+            trades_path.write_bytes(f"{target}\r\n".encode("utf-8"))
+            (root / "signal_events_0.jsonl").write_bytes(
+                f"{event}\r\n".encode("utf-8")
+            )
+            original_positions = positions_path.read_bytes()
+            original_trades = trades_path.read_bytes()
+            output = io.StringIO()
+
+            argv = ["backfill_demo_daily_patterns.py", "--root", str(root)]
+            with (
+                patch.object(backfill_tool, "load_history", return_value=frame_with_future_pattern()),
+                patch.object(sys, "argv", argv),
+                redirect_stdout(output),
+            ):
+                backfill_tool.main()
+
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["targets"], 1)
+            self.assertEqual(report["updated_trades"], 1)
+            self.assertEqual(positions_path.read_bytes(), original_positions)
+            self.assertEqual(trades_path.read_bytes(), original_trades)
+
+    def test_cli_apply_second_stage_failure_preserves_both_outputs(self):
+        target = json.dumps(closed_trade(), ensure_ascii=False)
+        event = json.dumps({
+            "event": "entry_filled",
+            "time": "2026-08-01T08:10:33+00:00",
+            "signal_key": "SIG-1",
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positions_path = root / "positions_<uid>.json"
+            trades_path = root / "trades_<uid>.jsonl"
+            positions_path.write_bytes(b"[]\r\n")
+            trades_path.write_bytes(f"{target}\r\n".encode("utf-8"))
+            (root / "signal_events_0.jsonl").write_bytes(
+                f"{event}\r\n".encode("utf-8")
+            )
+            original_positions = positions_path.read_bytes()
+            original_trades = trades_path.read_bytes()
+            real_atomic_write = backfill_tool.atomic_write
+            call_count = 0
+
+            def fail_second_stage(path, text):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise RuntimeError("second stage failed")
+                return real_atomic_write(path, text)
+
+            argv = [
+                "backfill_demo_daily_patterns.py",
+                "--root", str(root),
+                "--apply",
+            ]
+            with (
+                patch.object(backfill_tool, "load_history", return_value=frame_with_future_pattern()),
+                patch.object(backfill_tool, "atomic_write", side_effect=fail_second_stage),
+                patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "second stage failed"),
+            ):
+                backfill_tool.main()
+
+            self.assertEqual(positions_path.read_bytes(), original_positions)
+            self.assertEqual(trades_path.read_bytes(), original_trades)
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
     def test_any_loader_failure_raises_before_mutating_inputs(self):
         positions = [missing()]
         original = copy.deepcopy(positions)
