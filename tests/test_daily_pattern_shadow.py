@@ -242,12 +242,14 @@ class DailyPatternLiveAuditTest(unittest.TestCase):
         bot.cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget")
         bot.cfg.rj_daily_pattern_filter_mode = "off"
         with patch.object(bot, "_daily_pattern_state_for_entry") as observe:
-            state, blocked = bot._daily_pattern_entry_decision(
-                "TESTUSDT", "SHORT", "predicta_ewo", decision_time=123,
-            )
+            for source_strategy in ("structure", "rj_only", "predicta_ewo"):
+                with self.subTest(source_strategy=source_strategy):
+                    state, blocked = bot._daily_pattern_entry_decision(
+                        "TESTUSDT", "SHORT", source_strategy, decision_time=123,
+                    )
+                    self.assertIsNone(state)
+                    self.assertFalse(blocked)
         observe.assert_not_called()
-        self.assertIsNone(state)
-        self.assertFalse(blocked)
 
     def test_soft_block_remains_rj_only(self):
         bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
@@ -264,6 +266,92 @@ class DailyPatternLiveAuditTest(unittest.TestCase):
             )
         self.assertFalse(predicta_block)
         self.assertTrue(rj_block)
+
+    def test_structure_entry_attaches_audited_snapshot_to_position(self):
+        bot = SqueezeBreakoutBot(TradeConfig(
+            mode="paper", enabled=False, exchange="bitget", min_score=0.0,
+        ))
+        bot.cfg.rj_daily_pattern_filter_mode = "log_only"
+        frame = pd.DataFrame({
+            "ot": [index * 1_800_000 for index in range(200)],
+            "o": [100.0] * 200,
+            "h": [101.0] * 200,
+            "l": [99.0] * 200,
+            "c": [100.0] * 200,
+            "v": [1_000.0] * 200,
+        })
+        snapshot = {
+            "recorded": True,
+            "kind": "hammer",
+            "pattern_direction": "LONG",
+            "alignment": "aligned",
+            "rank": 1,
+            "would_block": False,
+            "candle_open_time": 123,
+            "candle_close_time": 456,
+            "reason": "aligned",
+            "mode": "log_only",
+        }
+        signal = {
+            "symbol": "TESTUSDT",
+            "direction": "LONG",
+            "price": 100.0,
+            "score": 100.0,
+            "source_interval": "30m",
+            "source_strategy": "structure",
+        }
+        chain = {
+            "fractal_sl": 95.0,
+            "band_sl": 96.0,
+        }
+        target_zone = {
+            "target_zone_type": "none",
+            "target_zone_price": 0.0,
+            "target_zone_low": 0.0,
+            "target_zone_high": 0.0,
+            "target_r": 0.0,
+            "target_distance_pct": 0.0,
+            "target_zone_bars_ago": 0,
+        }
+        events = []
+
+        def record_event(event_type, symbol="", payload=None):
+            events.append((event_type, symbol, payload or {}))
+
+        with (
+            patch("trader.fetch_klines", return_value=frame),
+            patch("trader.calc_ma_band", return_value=(
+                [101.0] * 200, [99.0] * 200, [0.02] * 200,
+            )),
+            patch("trader.verify_pool_signal_details", return_value=chain),
+            patch.object(bot, "_apply_rj_entry_filter", return_value=(
+                True, {"rj_filter_mode": "off"},
+            )),
+            patch.object(bot, "_build_signal_keys", return_value=["STRUCT|TEST"]),
+            patch.object(bot, "_any_signal_key_used", return_value=False),
+            patch.object(bot, "_failed_signal_key", return_value=None),
+            patch.object(bot, "calc_position_size", return_value=(1.0, 100.0, 5.0)),
+            patch.object(bot, "_calc_target_zone", return_value=target_zone),
+            patch.object(bot, "_btc_regime_fields", return_value={
+                "btc_regime": "btc_unknown", "btc_score": 0,
+            }),
+            patch.object(bot, "_daily_pattern_state_for_entry", return_value=snapshot) as observe,
+            patch.object(bot, "_mark_signal_used"),
+            patch.object(bot, "_save_positions"),
+            patch.object(bot, "_append_signal_event", side_effect=record_event),
+            patch.object(bot, "_send_telegram"),
+        ):
+            position = bot.enter_position(signal)
+
+        self.assertIsNotNone(position)
+        self.assertEqual(position.source_strategy, "structure")
+        self.assertEqual(position.daily_pattern["kind"], "hammer")
+        observe.assert_called_once()
+        self.assertEqual(observe.call_args.args[:2], ("TESTUSDT", "LONG"))
+        shadow = [payload for event, _, payload in events
+                  if event == "rj_daily_pattern_shadow"]
+        self.assertEqual(len(shadow), 1)
+        self.assertEqual(shadow[0]["daily_pattern"]["kind"], "hammer")
 
     def test_position_daily_pattern_is_saved_and_restored(self):
         bot = SqueezeBreakoutBot(TradeConfig(mode="paper", enabled=False, exchange="bitget"))

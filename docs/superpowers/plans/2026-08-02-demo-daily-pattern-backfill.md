@@ -14,6 +14,7 @@
 - Other engines remain `off` unless explicitly configured.
 - Existing `soft` blocking remains limited to `source_strategy == "rj_only"`.
 - All pattern decisions use Bitget `1Dutc` and `candle_close_time <= entry decision_time`.
+- Stored position/event/trade timestamps are Beijing wall time mislabeled with `+00:00`; subtract eight hours after parsing them. The CLI cutoff is true UTC and must not be shifted.
 - Backfill cutoff is exactly `2026-08-01T08:10:32Z` (`1785571832000` milliseconds).
 - Only missing or `not_recorded` snapshots at/after the cutoff are eligible.
 - Existing recorded snapshots and pre-cutoff history are immutable.
@@ -28,11 +29,13 @@
 **Files:**
 - Modify: `trader.py:1722-1747`
 - Modify: `trader.py:6494-6509`
+- Modify: the valid `structure` entry path in `trader.py`
 - Test: `tests/test_daily_pattern_shadow.py`
 
 **Interfaces:**
 - Consumes: `SqueezeBreakoutBot._daily_pattern_state_for_entry(symbol: str, direction: str, decision_time: int | None = None) -> dict`
 - Produces: `SqueezeBreakoutBot._daily_pattern_entry_decision(symbol: str, direction: str, source_strategy: str, decision_time: int | None = None) -> tuple[dict | None, bool]`
+- Produces: one shared attachment helper used by `structure`, `rj_only`, and `predicta_ewo`; it records the audit snapshot and returns the existing RJ-only soft-block decision.
 - The tuple is `(snapshot, should_block)`. `snapshot is None` only when mode is `off`; `should_block` may be true only for RJ-only soft mode.
 
 - [ ] **Step 1: Write failing tests for Predicta observation, off mode, and RJ soft preservation**
@@ -200,6 +203,7 @@ git commit -m "fix: record daily pattern for every demo entry source"
 
 **Interfaces:**
 - Produces: `parse_time_ms(value: object) -> int | None`
+- Produces: `parse_stored_project_time_ms(value: object) -> int | None`, which subtracts eight hours only for project-persisted timestamps.
 - Produces: `build_entry_time_index(event_lines: list[str]) -> dict[str, int]`
 - Produces: `backfill_records(positions: list[dict], trade_lines: list[str], entry_times: dict[str, int], cutoff_ms: int, history_loader: Callable[[str], pd.DataFrame]) -> tuple[list[dict], list[str], dict]`
 - Produces CLI: `python tools/backfill_demo_daily_patterns.py --root PATH [--cutoff ISO] [--apply]`
@@ -478,6 +482,8 @@ def backfill_records(positions, trade_lines, entry_times, cutoff_ms, history_loa
 ```
 
 The final implementation must also count `skipped_pre_cutoff` and `skipped_recorded` while scanning so the report matches the interface.
+
+Use `parse_stored_project_time_ms()` for position `entry_time`, `entry_filled.time`, and the trade exit-time fail-closed check. Keep `parse_time_ms()` for `--cutoff`. Add exact cutoff tests using stored `2026-08-01T16:10:31+00:00` and `2026-08-01T16:10:33+00:00`, plus a UTC-midnight lookahead regression.
 
 - [ ] **Step 4: Implement dry-run-first CLI and atomic writes**
 

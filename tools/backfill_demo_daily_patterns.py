@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ from strategy_filters import evaluate_daily_pattern_state
 
 
 DEFAULT_CUTOFF = "2026-08-01T08:10:32+00:00"
+BEIJING_OFFSET_MS = 8 * 60 * 60 * 1_000
+MAX_ERROR_LENGTH = 240
 
 
 def parse_time_ms(value: object) -> int | None:
@@ -37,6 +40,12 @@ def parse_time_ms(value: object) -> int | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return int(parsed.timestamp() * 1000)
+
+
+def parse_stored_project_time_ms(value: object) -> int | None:
+    """Convert the project's Beijing wall-clock timestamps to real UTC epoch ms."""
+    parsed = parse_time_ms(value)
+    return None if parsed is None else parsed - BEIJING_OFFSET_MS
 
 
 def build_entry_time_index(event_lines: list[str]) -> dict[str, int]:
@@ -55,7 +64,7 @@ def build_entry_time_index(event_lines: list[str]) -> dict[str, int]:
         if key in seen_keys:
             raise RuntimeError(f"non-unique entry event for {key}")
         seen_keys.add(key)
-        entry_ms = parse_time_ms(event.get("time"))
+        entry_ms = parse_stored_project_time_ms(event.get("time"))
         if entry_ms is None:
             continue
         index[key] = entry_ms
@@ -69,11 +78,11 @@ def _entry_time_for_row(
     cutoff_ms: int,
 ) -> int | None:
     if kind == "position":
-        return parse_time_ms(row.get("entry_time"))
+        return parse_stored_project_time_ms(row.get("entry_time"))
     key = str(row.get("signal_key", "") or "").strip()
     if key and key in entry_times:
         return entry_times[key]
-    exit_ms = parse_time_ms(row.get("time"))
+    exit_ms = parse_stored_project_time_ms(row.get("time"))
     if exit_ms is not None and exit_ms >= cutoff_ms:
         raise RuntimeError(
             f"recent trade has no unique entry event: {row.get('symbol')}/{key}"
@@ -159,7 +168,12 @@ def backfill_records(
         if not symbol or direction not in ("LONG", "SHORT"):
             raise RuntimeError(f"invalid target record: {symbol}/{direction}")
         if symbol not in histories:
-            histories[symbol] = history_loader(symbol)
+            try:
+                histories[symbol] = history_loader(symbol)
+            except Exception as error:
+                raise RuntimeError(
+                    f"history fetch failed for {symbol}"
+                ) from error
         state = _snapshot(row, entry_ms, histories[symbol])
         planned.append((kind, index, state))
         snapshots.append({
@@ -242,7 +256,81 @@ def _validate_staged_outputs(positions_temp: str, trades_temp: str) -> None:
             )
 
 
-def main() -> None:
+def _stage_backup(path: Path) -> str:
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.rollback.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(path.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temp_name
+    except BaseException:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+        raise
+
+
+def _replace_staged_pair(replacements: list[tuple[str, Path]]) -> None:
+    backups: dict[Path, str] = {}
+    replaced: list[Path] = []
+    try:
+        for _, target in replacements:
+            backups[target] = _stage_backup(target)
+        try:
+            for staged, target in replacements:
+                os.replace(staged, target)
+                replaced.append(target)
+        except Exception as replace_error:
+            rollback_errors = []
+            for target in reversed(replaced):
+                backup = backups[target]
+                try:
+                    os.replace(backup, target)
+                except Exception as rollback_error:
+                    rollback_errors.append(type(rollback_error).__name__)
+            if rollback_errors:
+                raise RuntimeError(
+                    "final replace failed and rollback failed: "
+                    + ",".join(rollback_errors)
+                ) from replace_error
+            raise
+    finally:
+        for backup in backups.values():
+            if os.path.exists(backup):
+                os.unlink(backup)
+
+
+def _bounded_error(error: Exception) -> str:
+    message = re.sub(r"\s+", " ", str(error)).strip()
+    message = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?key|secret|signature|token|authorization|password|passphrase)\b\s*[:=]\s*[^\s,;&]+",
+        r"\1=[redacted]",
+        message,
+    )
+    diagnostic = type(error).__name__
+    if message:
+        diagnostic += f": {message}"
+    if len(diagnostic) > MAX_ERROR_LENGTH:
+        diagnostic = diagnostic[:MAX_ERROR_LENGTH - 3] + "..."
+    return diagnostic
+
+
+def _failure_report(error: Exception) -> dict:
+    return {
+        "targets": 0,
+        "updated_positions": 0,
+        "updated_trades": 0,
+        "skipped_pre_cutoff": 0,
+        "skipped_recorded": 0,
+        "failures": 1,
+        "snapshots": [],
+        "error": _bounded_error(error),
+    }
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Backfill demo daily-pattern snapshots at their entry times.",
     )
@@ -264,47 +352,53 @@ def main() -> None:
     if missing:
         parser.error("required paths do not exist: " + ", ".join(missing))
 
-    positions = json.loads(positions_path.read_text(encoding="utf-8"))
-    trade_text = trades_path.read_bytes().decode("utf-8")
-    trade_lines = trade_text.splitlines(keepends=True)
-    event_lines = events_path.read_text(encoding="utf-8").splitlines()
-    entry_times = build_entry_time_index(event_lines)
-    new_positions, new_trade_lines, report = backfill_records(
-        positions,
-        trade_lines,
-        entry_times,
-        cutoff_ms,
-        load_history,
-    )
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-
-    if not args.apply:
-        return
-    if report["targets"] <= 0:
-        parser.error("--apply requires at least one target")
-
-    positions_text = json.dumps(new_positions, ensure_ascii=False, indent=2) + "\n"
-    trades_text = "".join(new_trade_lines)
-    if trades_text and not _line_ending(trades_text):
-        original_ending = next(
-            (_line_ending(line) for line in trade_lines if _line_ending(line)),
-            "\n",
-        )
-        trades_text += original_ending
-    staged_temps = []
     try:
-        positions_temp = atomic_write(positions_path, positions_text)
-        staged_temps.append(positions_temp)
-        trades_temp = atomic_write(trades_path, trades_text)
-        staged_temps.append(trades_temp)
-        _validate_staged_outputs(positions_temp, trades_temp)
-        os.replace(positions_temp, positions_path)
-        os.replace(trades_temp, trades_path)
-    finally:
-        for temp_name in staged_temps:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+        positions = json.loads(positions_path.read_text(encoding="utf-8"))
+        trade_text = trades_path.read_bytes().decode("utf-8")
+        trade_lines = trade_text.splitlines(keepends=True)
+        event_lines = events_path.read_text(encoding="utf-8").splitlines()
+        entry_times = build_entry_time_index(event_lines)
+        new_positions, new_trade_lines, report = backfill_records(
+            positions,
+            trade_lines,
+            entry_times,
+            cutoff_ms,
+            load_history,
+        )
+        if args.apply:
+            if report["targets"] <= 0:
+                raise RuntimeError("--apply requires at least one target")
+            positions_text = json.dumps(
+                new_positions, ensure_ascii=False, indent=2,
+            ) + "\n"
+            trades_text = "".join(new_trade_lines)
+            if trades_text and not _line_ending(trades_text):
+                original_ending = next(
+                    (_line_ending(line) for line in trade_lines if _line_ending(line)),
+                    "\n",
+                )
+                trades_text += original_ending
+            staged_temps = []
+            try:
+                positions_temp = atomic_write(positions_path, positions_text)
+                staged_temps.append(positions_temp)
+                trades_temp = atomic_write(trades_path, trades_text)
+                staged_temps.append(trades_temp)
+                _validate_staged_outputs(positions_temp, trades_temp)
+                _replace_staged_pair([
+                    (positions_temp, positions_path),
+                    (trades_temp, trades_path),
+                ])
+            finally:
+                for temp_name in staged_temps:
+                    if os.path.exists(temp_name):
+                        os.unlink(temp_name)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as error:
+        print(json.dumps(_failure_report(error), ensure_ascii=False, indent=2))
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

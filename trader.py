@@ -1764,6 +1764,37 @@ class SqueezeBreakoutBot:
         )
         return snapshot, bool(should_block)
 
+    def _attach_daily_pattern_for_entry(
+        self, signal: dict, source_strategy: str,
+        decision_time: Optional[int] = None,
+    ) -> bool:
+        symbol = str(signal.get("symbol", "") or "")
+        direction = str(signal.get("direction", "") or "")
+        snapshot, should_block = self._daily_pattern_entry_decision(
+            symbol,
+            direction,
+            source_strategy,
+            decision_time=decision_time,
+        )
+        if snapshot is None:
+            return False
+        signal["daily_pattern"] = snapshot
+        self._append_signal_event(
+            "rj_daily_pattern_shadow",
+            symbol,
+            self._signal_snapshot(signal, {"daily_pattern": snapshot}),
+        )
+        if should_block:
+            self._append_signal_event(
+                "entry_reject",
+                symbol,
+                self._signal_snapshot(signal, {
+                    "reason": "daily_pattern_opposed",
+                    "daily_pattern": snapshot,
+                }),
+            )
+        return should_block
+
     def _entry_choppy_audit_map(self) -> dict:
         """从成交事件恢复旧持仓缺失的入场快照，不用当前行情补算。"""
         audits = {}
@@ -6509,24 +6540,11 @@ class SqueezeBreakoutBot:
                     "interval": signal_interval,
                 }))
                 return None
-        daily_pattern, daily_pattern_block = self._daily_pattern_entry_decision(
-            symbol,
-            direction,
+        if self._attach_daily_pattern_for_entry(
+            signal,
             source_strategy,
             decision_time=int(time.time() * 1000),
-        )
-        if daily_pattern is not None:
-            signal["daily_pattern"] = daily_pattern
-            self._append_signal_event(
-                "rj_daily_pattern_shadow",
-                symbol,
-                self._signal_snapshot(signal, {"daily_pattern": daily_pattern}),
-            )
-        if daily_pattern_block:
-            self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
-                "reason": "daily_pattern_opposed",
-                "daily_pattern": daily_pattern,
-            }))
+        ):
             return None
         entry_price = float(signal.get("price") or df["c"].iloc[-1])
         stop_field = "rj_only_stop_price" if source_strategy == "rj_only" else "predicta_stop_price"
@@ -7069,6 +7087,16 @@ class SqueezeBreakoutBot:
         if self.client is not None and self.cfg.market_type == "futures":
             self.client.set_leverage(symbol, self.cfg.leverage)
 
+        source_strategy = str(
+            signal.get("source_strategy", "structure") or "structure"
+        )
+        if self._attach_daily_pattern_for_entry(
+            signal,
+            source_strategy,
+            decision_time=int(time.time() * 1000),
+        ):
+            return None
+
         self._append_signal_event("entry_precheck_pass", symbol, self._signal_snapshot(signal, {
             "reason": "ready_to_order",
             "interval": signal_interval,
@@ -7164,6 +7192,7 @@ class SqueezeBreakoutBot:
             target_r=float(target_zone.get("target_r", 0.0) or 0.0),
             target_distance_pct=float(target_zone.get("target_distance_pct", 0.0) or 0.0),
             target_zone_bars_ago=int(target_zone.get("target_zone_bars_ago", 0) or 0),
+            daily_pattern=self._position_daily_pattern(signal.get("daily_pattern", {})),
         )
         pos.time_stop_armed = True
         pos.time_stop_armed_at = pos.entry_time
