@@ -1719,7 +1719,9 @@ class SqueezeBreakoutBot:
             "mode": str(state.get("mode", "") or "")[:16],
         }
 
-    def _daily_pattern_state_for_entry(self, symbol: str, direction: str) -> dict:
+    def _daily_pattern_state_for_entry(
+        self, symbol: str, direction: str, decision_time: Optional[int] = None,
+    ) -> dict:
         mode = str(getattr(self.cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
         if mode not in ("off", "log_only", "soft"):
             mode = "log_only"
@@ -1740,10 +1742,27 @@ class SqueezeBreakoutBot:
         state = evaluate_daily_pattern_state(
             daily,
             direction,
-            decision_time=int(time.time() * 1000),
+            decision_time=(int(time.time() * 1000) if decision_time is None else decision_time),
         )
         state["mode"] = mode
         return self._position_daily_pattern(state)
+
+    def _daily_pattern_entry_decision(
+        self, symbol: str, direction: str, source_strategy: str,
+        decision_time: Optional[int] = None,
+    ) -> tuple[Optional[dict], bool]:
+        mode = str(getattr(self.cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+        if mode == "off":
+            return None, False
+        snapshot = self._daily_pattern_state_for_entry(
+            symbol, direction, decision_time=decision_time,
+        )
+        should_block = (
+            source_strategy == "rj_only"
+            and snapshot.get("mode") == "soft"
+            and snapshot.get("would_block")
+        )
+        return snapshot, bool(should_block)
 
     def _entry_choppy_audit_map(self) -> dict:
         """从成交事件恢复旧持仓缺失的入场快照，不用当前行情补算。"""
@@ -6490,23 +6509,25 @@ class SqueezeBreakoutBot:
                     "interval": signal_interval,
                 }))
                 return None
-        if source_strategy == "rj_only":
-            daily_pattern = self._daily_pattern_state_for_entry(symbol, direction)
+        daily_pattern, daily_pattern_block = self._daily_pattern_entry_decision(
+            symbol,
+            direction,
+            source_strategy,
+            decision_time=int(time.time() * 1000),
+        )
+        if daily_pattern is not None:
             signal["daily_pattern"] = daily_pattern
             self._append_signal_event(
                 "rj_daily_pattern_shadow",
                 symbol,
                 self._signal_snapshot(signal, {"daily_pattern": daily_pattern}),
             )
-            if (
-                daily_pattern.get("mode") == "soft"
-                and daily_pattern.get("would_block")
-            ):
-                self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
-                    "reason": "daily_pattern_opposed",
-                    "daily_pattern": daily_pattern,
-                }))
-                return None
+        if daily_pattern_block:
+            self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                "reason": "daily_pattern_opposed",
+                "daily_pattern": daily_pattern,
+            }))
+            return None
         entry_price = float(signal.get("price") or df["c"].iloc[-1])
         stop_field = "rj_only_stop_price" if source_strategy == "rj_only" else "predicta_stop_price"
         stop_raw = signal.get(stop_field)

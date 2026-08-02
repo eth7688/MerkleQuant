@@ -223,6 +223,48 @@ class DailyPatternLiveAuditTest(unittest.TestCase):
         self.assertEqual(state["reason"], "daily_fetch_failed")
         self.assertEqual(state["mode"], "log_only")
 
+    def test_predicta_entry_observes_daily_pattern_when_log_only(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget")
+        bot.cfg.rj_daily_pattern_filter_mode = "log_only"
+        snapshot = {"recorded": True, "kind": "hammer", "mode": "log_only",
+                    "would_block": False}
+        with patch.object(bot, "_daily_pattern_state_for_entry", return_value=snapshot) as observe:
+            state, blocked = bot._daily_pattern_entry_decision(
+                "TESTUSDT", "LONG", "predicta_ewo", decision_time=123,
+            )
+        observe.assert_called_once_with("TESTUSDT", "LONG", decision_time=123)
+        self.assertIs(state, snapshot)
+        self.assertFalse(blocked)
+
+    def test_off_mode_skips_daily_fetch_for_every_source(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget")
+        bot.cfg.rj_daily_pattern_filter_mode = "off"
+        with patch.object(bot, "_daily_pattern_state_for_entry") as observe:
+            state, blocked = bot._daily_pattern_entry_decision(
+                "TESTUSDT", "SHORT", "predicta_ewo", decision_time=123,
+            )
+        observe.assert_not_called()
+        self.assertIsNone(state)
+        self.assertFalse(blocked)
+
+    def test_soft_block_remains_rj_only(self):
+        bot = SqueezeBreakoutBot.__new__(SqueezeBreakoutBot)
+        bot.cfg = TradeConfig(mode="paper", enabled=False, exchange="bitget")
+        bot.cfg.rj_daily_pattern_filter_mode = "soft"
+        opposed = {"recorded": True, "kind": "bearish_engulfing", "mode": "soft",
+                   "would_block": True}
+        with patch.object(bot, "_daily_pattern_state_for_entry", return_value=opposed):
+            _, predicta_block = bot._daily_pattern_entry_decision(
+                "TESTUSDT", "LONG", "predicta_ewo", decision_time=123,
+            )
+            _, rj_block = bot._daily_pattern_entry_decision(
+                "TESTUSDT", "LONG", "rj_only", decision_time=123,
+            )
+        self.assertFalse(predicta_block)
+        self.assertTrue(rj_block)
+
     def test_position_daily_pattern_is_saved_and_restored(self):
         bot = SqueezeBreakoutBot(TradeConfig(mode="paper", enabled=False, exchange="bitget"))
         with tempfile.TemporaryDirectory() as tmp:
