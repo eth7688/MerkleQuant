@@ -18,7 +18,7 @@ from momentum_compression_alerts import (
     read_public_compression_alerts,
 )
 from momentum_compression_store import apply_live_prices, default_state, reconcile_structure_scan, save_compression_state
-from momentum_reflow_alerts import RETRY_DELAYS_MS, save_alert_settings
+from momentum_reflow_alerts import MAX_ATTEMPTS, RETRY_DELAYS_MS, save_alert_settings
 
 
 def fresh(symbol="AUSDT", alignment="CONFIRMED", compression_id=None):
@@ -206,18 +206,28 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(compression_delivery_statuses(state), {"AUSDT-long-1": "indeterminate"})
 
-    def test_rejected_wecom_response_is_sanitized_and_terminal_failed(self):
+    def test_rejected_wecom_response_retries_with_backoff_then_fails(self):
         with TemporaryDirectory() as folder:
             events, state, settings = self.paths(Path(folder))
             webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-1234"
             save_alert_settings(settings, wechat_enabled=True, wechat_webhook=webhook, updated_by="7", now_ms=1)
             append_compression_alerts(events, state, [fresh()], 10)
             failed = Mock(); failed.raise_for_status.return_value = None; failed.json.return_value = {"errcode": 93000}
-            result = deliver_due_compression_wechat(settings, state, events, 10, post=Mock(return_value=failed))
-            raw = state.read_text(encoding="utf-8")
-            self.assertEqual(result["status"], "failed")
-            self.assertNotIn(webhook, raw); self.assertNotIn("secret-1234", raw)
-            self.assertEqual(json.loads(raw)["delivery_queue"][0]["next_attempt_at"], 0)
+            sent = Mock(return_value=failed)
+            now_ms = 10
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                result = deliver_due_compression_wechat(settings, state, events, now_ms, post=sent)
+                raw = state.read_text(encoding="utf-8")
+                self.assertNotIn(webhook, raw); self.assertNotIn("secret-1234", raw)
+                expected_status = "failed" if attempt == MAX_ATTEMPTS else "retry_pending"
+                self.assertEqual(result["status"], expected_status)
+                delivery = json.loads(raw)["delivery_queue"][0]
+                if attempt < MAX_ATTEMPTS:
+                    self.assertEqual(delivery["next_attempt_at"], now_ms + RETRY_DELAYS_MS[attempt - 1])
+                    now_ms = delivery["next_attempt_at"]
+                else:
+                    self.assertEqual(delivery["next_attempt_at"], 0)
+            self.assertEqual(sent.call_count, MAX_ATTEMPTS)
 
     def test_explicit_presend_validation_failure_is_retryable_without_http_call(self):
         with TemporaryDirectory() as folder:

@@ -376,7 +376,9 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             outcome, error_text = "retry_pending", _safe_error(error, settings["wechat_webhook"])
         except (requests.ReadTimeout, requests.ConnectionError) as error:
             outcome, error_text = "indeterminate", _safe_error(error, settings["wechat_webhook"])
-        except (_CompressionWeComRejectedError, requests.HTTPError) as error:
+        except _CompressionWeComRejectedError as error:
+            outcome, error_text = "retry_pending", _safe_error(error, settings["wechat_webhook"])
+        except requests.HTTPError as error:
             outcome, error_text = "failed", _safe_error(error, settings["wechat_webhook"])
         except Exception as error:
             outcome, error_text = "indeterminate", _safe_error(error, settings["wechat_webhook"])
