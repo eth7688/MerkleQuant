@@ -93,11 +93,22 @@ def _validate_state(state):
             raise ValueError(f"invalid {key}")
         for compression_id, item in state[key].items():
             _validate_item(compression_id, item, allow_failed=key == "episodes")
+            if key == "episodes" and not item["fresh_emitted"]:
+                raise ValueError("terminal episode must have emitted fresh")
     if not isinstance(state["emitted_event_ids"], dict):
         raise ValueError("invalid emitted event registry")
+    event_ids = set()
     for compression_id, event_id in state["emitted_event_ids"].items():
-        if not isinstance(compression_id, str) or not compression_id or not _is_int(event_id) or event_id <= 0:
+        if (not isinstance(compression_id, str) or not compression_id or not _is_int(event_id)
+                or event_id <= 0 or event_id >= state["next_event_id"] or event_id in event_ids):
             raise ValueError("invalid emitted event registry")
+        event_ids.add(event_id)
+    for key in ("pool", "episodes"):
+        for compression_id, item in state[key].items():
+            if item["fresh_emitted"] and compression_id not in state["emitted_event_ids"]:
+                raise ValueError("fresh item missing emitted event registry")
+            if compression_id in state["emitted_event_ids"] and not item["fresh_emitted"]:
+                raise ValueError("emitted event registry contradicts item")
     if not isinstance(state["delivery_queue"], list) or not all(isinstance(event, dict) for event in state["delivery_queue"]):
         raise ValueError("invalid delivery queue")
 

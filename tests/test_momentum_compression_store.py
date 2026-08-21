@@ -216,6 +216,24 @@ class CompressionStatePersistenceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         load_compression_state(path)
 
+    def test_restart_rejects_contradictory_fresh_registry_before_price_replay(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        cases = (
+            ("fresh pool missing registry", lambda corrupt: corrupt["emitted_event_ids"].clear()),
+            ("registry backed pool not fresh", lambda corrupt: corrupt["pool"]["long-episode-1"].__setitem__("fresh_emitted", False)),
+            ("registry event id not yet allocated", lambda corrupt: corrupt["emitted_event_ids"].__setitem__("long-episode-1", corrupt["next_event_id"])),
+        )
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            for name, mutate in cases:
+                with self.subTest(name=name):
+                    corrupt = json.loads(json.dumps(state))
+                    mutate(corrupt)
+                    path.write_text(json.dumps(corrupt), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_compression_state(path)
+
     def test_repeated_save_and_load_are_consistent(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
