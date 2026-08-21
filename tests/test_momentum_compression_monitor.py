@@ -279,6 +279,73 @@ class CompressionMonitorScanTests(unittest.TestCase):
         self.assertEqual(len(created), 6)
         self.assertTrue(monitor.status()["running"])
 
+    def test_disable_during_worker_start_never_joins_an_unstarted_thread(self):
+        created = []
+        first_started = threading.Event()
+        allow_first_start = threading.Event()
+        disable_attempted = threading.Event()
+        join_called = threading.Event()
+        disable_errors = []
+
+        class BlockingThread:
+            def __init__(self, *, target, **kwargs):
+                self.target = target
+                self.started = False
+                self.finished = False
+                created.append(self)
+
+            def start(self):
+                self.started = True
+                if len(created) == 3 and self is created[0]:
+                    first_started.set()
+                    allow_first_start.wait(1)
+
+            def join(self, timeout):
+                join_called.set()
+                if not self.started:
+                    raise RuntimeError("cannot join thread before it is started")
+                if not self.finished:
+                    self.finished = True
+                    self.target()
+
+            def is_alive(self):
+                return self.started and not self.finished
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root, lambda *args: {"events": []})
+            monitor.thread_factory = BlockingThread
+            monitor._stream_loop = lambda: None
+            monitor._fallback_loop = lambda: None
+            monitor._scheduler_loop = lambda: None
+            state = default_state()
+            state["auto_enabled"] = True
+            save_compression_state(root / "state.json", state)
+            starter = threading.Thread(target=monitor.start)
+            starter.start()
+            self.assertTrue(first_started.wait(1))
+
+            def disable():
+                disable_attempted.set()
+                try:
+                    monitor.set_auto_enabled(False)
+                except Exception as error:
+                    disable_errors.append(error)
+
+            disabler = threading.Thread(target=disable)
+            disabler.start()
+            self.assertTrue(disable_attempted.wait(1))
+            try:
+                self.assertFalse(join_called.wait(0.05))
+            finally:
+                allow_first_start.set()
+                starter.join(1)
+                disabler.join(1)
+
+        self.assertEqual(disable_errors, [])
+        self.assertTrue(all(worker.started and worker.finished for worker in created))
+        self.assertFalse(monitor.status()["running"])
+
     def test_successful_socket_session_resets_next_retry_delay_to_one_second(self):
         from momentum_compression_monitor import CompressionMonitor
 

@@ -280,8 +280,8 @@ class CompressionMonitor:
                     "compression-price-stream", "compression-price-fallback", "compression-15m-scheduler",
                 ))
             ]
-        for thread in self._threads:
-            thread.start()
+            for thread in self._threads:
+                thread.start()
         return True
 
     def _run_worker(self, worker, generation):
@@ -307,13 +307,16 @@ class CompressionMonitor:
             self.start()
 
     def stop(self, timeout: float = 2.0) -> bool:
-        self._stop.set()
-        if self._app is not None:
+        with self._lifecycle_lock:
+            self._stop.set()
+            app = self._app
+            threads = tuple(self._threads)
+        if app is not None:
             try:
-                self._app.close()
+                app.close()
             except Exception:
                 pass
-        for thread in self._threads:
+        for thread in threads:
             thread.join(timeout)
         self._stream_connected = False
         with self._lifecycle_lock:
