@@ -153,6 +153,38 @@ class CompressionStatePersistenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_compression_state(path)
 
+    def test_nested_pool_records_reject_missing_or_invalid_live_fields(self):
+        cases = (
+            ("missing symbol", lambda item: item.pop("symbol")),
+            ("missing boundary", lambda item: item.pop("upper_boundary_price")),
+            ("nonfinite boundary", lambda item: item.__setitem__("upper_boundary_price", float("nan"))),
+            ("inverted boundaries", lambda item: item.__setitem__("lower_boundary_price", 110.0)),
+            ("negative buffer", lambda item: item.__setitem__("breakout_buffer_price", -0.1)),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name), TemporaryDirectory() as folder:
+                state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+                mutate(state["pool"]["long-episode-1"])
+                path = Path(folder) / "state.json"
+                path.write_text(json.dumps(state), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_compression_state(path)
+
+    def test_nested_episode_records_reject_invalid_identity_and_timestamps(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 105.0}, 3_000)
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            for field, value in (("side", "SIDEWAYS"), ("first_seen_at", -1),
+                                 ("last_verified_at", float("inf"))):
+                with self.subTest(field=field):
+                    corrupt = json.loads(json.dumps(state))
+                    corrupt["episodes"]["long-episode-1"][field] = value
+                    path.write_text(json.dumps(corrupt), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_compression_state(path)
+
     def test_repeated_save_and_load_are_consistent(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
@@ -191,6 +223,20 @@ class CompressionSnapshotTests(unittest.TestCase):
             payload = json.loads(first)
         self.assertEqual(payload["parameter_version"], "15m-compression-v1")
         self.assertEqual(payload["ohlcv"]["c"], [1.5, 2.5])
+
+    def test_snapshot_existing_identity_is_not_overwritten_by_later_data(self):
+        frame = pd.DataFrame({
+            "ot": [100], "o": [1.0], "h": [2.0], "l": [0.5], "c": [1.5], "v": [10.0],
+        })
+        changed = frame.assign(c=[99.0])
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            ref = write_compression_snapshot(root, evaluation(), frame)
+            path = root / ref
+            original = path.read_bytes()
+            later = evaluation(parameter_version="later-version", symbol="CHANGEDUSDT")
+            self.assertEqual(write_compression_snapshot(root, later, changed), ref)
+            self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == "__main__":

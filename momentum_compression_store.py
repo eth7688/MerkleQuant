@@ -47,14 +47,35 @@ def _require_nonnegative_int(value, name):
         raise ValueError(f"{name} must be a nonnegative integer")
 
 
+def _require_finite_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be finite")
+
+
 def _validate_item(compression_id, item, *, allow_failed=False):
     if not isinstance(compression_id, str) or not compression_id or not isinstance(item, dict):
         raise ValueError("invalid pool item")
+    if not isinstance(item.get("symbol"), str) or not item["symbol"]:
+        raise ValueError("invalid pool symbol")
     if item.get("compression_id") != compression_id or item.get("side") not in {"LONG", "SHORT"}:
         raise ValueError("invalid pool identity")
-    allowed_states = _POOL_STATES | ({"BREAKOUT_FAILED"} if allow_failed else set())
+    allowed_states = {"BREAKOUT_FAILED"} if allow_failed else _POOL_STATES
     if item.get("state") not in allowed_states or not isinstance(item.get("fresh_emitted"), bool):
         raise ValueError("invalid pool state")
+    if item["state"].endswith("_LONG") and item["side"] != "LONG":
+        raise ValueError("pool state does not match side")
+    if item["state"].endswith("_SHORT") and item["side"] != "SHORT":
+        raise ValueError("pool state does not match side")
+    for key in ("upper_boundary_price", "lower_boundary_price", "breakout_buffer_price"):
+        _require_finite_number(item.get(key), key)
+    if item["upper_boundary_price"] <= item["lower_boundary_price"] or item["breakout_buffer_price"] < 0:
+        raise ValueError("invalid pool boundaries")
+    for key in ("first_seen_at", "last_verified_at"):
+        _require_nonnegative_int(item.get(key), key)
+    if "last_price_at" in item:
+        _require_nonnegative_int(item["last_price_at"], "last_price_at")
+    if "live_price" in item:
+        _require_finite_number(item["live_price"], "live_price")
 
 
 def _validate_state(state):
@@ -212,13 +233,15 @@ def apply_live_prices(state: dict, prices: dict[str, float], now_ms: int) -> tup
 
 
 def write_compression_snapshot(directory: Path, evaluation: dict, frame: pd.DataFrame) -> str:
-    if not isinstance(evaluation, dict) or not isinstance(evaluation.get("compression_id"), str):
+    if not isinstance(evaluation, dict) or not isinstance(evaluation.get("compression_id"), str) or not evaluation["compression_id"]:
         raise ValueError("evaluation compression_id is required")
-    if not isinstance(frame, pd.DataFrame) or any(column not in frame for column in ("ot", "o", "h", "l", "c", "v")):
-        raise ValueError("frame must contain OHLCV columns")
     compression_id = evaluation["compression_id"]
     ref = f"momentum_compression_snapshots/{compression_id}.json"
     path = Path(directory) / ref
+    if path.exists():
+        return ref
+    if not isinstance(frame, pd.DataFrame) or any(column not in frame for column in ("ot", "o", "h", "l", "c", "v")):
+        raise ValueError("frame must contain OHLCV columns")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "parameter_version": evaluation.get("parameter_version", ""),
@@ -230,6 +253,5 @@ def write_compression_snapshot(directory: Path, evaluation: dict, frame: pd.Data
         "ohlcv": {column: frame[column].tolist() for column in ("ot", "o", "h", "l", "c", "v")},
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if not path.exists() or path.read_bytes() != encoded:
-        path.write_bytes(encoded)
+    path.write_bytes(encoded)
     return ref
