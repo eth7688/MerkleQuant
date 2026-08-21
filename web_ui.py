@@ -1443,6 +1443,7 @@ let DEMO_CFG={{ demo_cfg_json|safe }};
 let cur='squeeze_4h';
 let pollTimer=null;
 var _reflowPolling=false, _pollingScan=false;
+var _compressionStatusTimer=null;
 
 // ===== SIDEBAR =====
 let groups=[
@@ -1452,6 +1453,7 @@ let groups=[
   ['glow','演示引擎',[['demo','净值看板','D']]],
   ['breakout','动量突破',[['breakout_4h','4H','6'],['breakout_1h','1H','7'],['breakout_15m','15m','8'],['breakout_1d','日线','9']]],
   ['reflow','动能回流',[['reflow_1h','1H首次回流','M']]],
+  ['compression','动能压缩破位',[['compression_15m','15M 压缩池','P']]],
   ['trader','自动交易',[['trader','交易面板','T']]],
   ['squeeze','收敛扫选',[['squeeze_4h','4H','1'],['squeeze_1h','1H','2'],['squeeze_15m','15m','3'],['squeeze_1d','日线','4'],['squeeze_1w','周线','5']]],
   ['short','做空扫选',[['short_4h','4H','9'],['short_1h','1H','0']]],
@@ -1476,6 +1478,7 @@ var _desc={
   breakout_15m:'方向性信号扫描（15m周期），灵敏度最高。建议结合大周期结构辅助判断。',
   breakout_1d:'方向性信号扫描（日线周期），结构稳定性最高，适合中长线参考。',
   reflow_1h:'1H 首次回流看板：持续保留当日信号，展示自动扫描状态、最新回流窗口与质量分层，辅助复核而不执行交易。',
+  compression_15m:'15M 已收盘结构压缩池：池内实时突破监控、状态复核与拒绝统计。只监控不交易。',
   trader:'自动交易引擎。配置API后自动执行：信号扫描→结构止损→动态追踪。内置多级风控与入场验证。',
   squeeze_4h:'波动压缩扫描（4H周期）。监测价格波动收敛状态，压缩越紧=蓄力越充分。',
   squeeze_1h:'波动压缩扫描（1H周期），全市场波动收敛程度排序。',
@@ -1574,11 +1577,12 @@ function show(tab, btn){
     _reflowPolling=false;
     if(pollTimer && !_pollingScan){clearInterval(pollTimer); pollTimer=null;}
   }
+  if(prev==='compression_15m' && tab!=='compression_15m' && _compressionStatusTimer){clearInterval(_compressionStatusTimer);_compressionStatusTimer=null;}
   var all=document.querySelectorAll('.nav-item');
   for(var i=0; i<all.length; i++){all[i].classList.remove('active');}
   if(btn) btn.classList.add('active');
   var rows=D[tab]||[];
-  var resultCount=tab==='reflow_1h'&&rows&&Array.isArray(rows.rows)?rows.rows.length:(Array.isArray(rows)?rows.length:0);
+  var resultCount=(tab==='reflow_1h'||tab==='compression_15m')&&rows&&Array.isArray(rows.rows)?rows.rows.length:(Array.isArray(rows)?rows.length:0);
   setDesc(tab);
   document.getElementById('statusCount').textContent=resultCount+' 结果';
   if(btn){
@@ -1589,6 +1593,10 @@ function show(tab, btn){
   if(tab==='reflow_1h'){
     _reflowPolling=true;
     if(!pollTimer){pollTimer=setInterval(pollResults,1500); pollResults();}
+  }
+  if(tab==='compression_15m'){
+    refreshCompressionStatus();
+    if(!_compressionStatusTimer) _compressionStatusTimer=setInterval(refreshCompressionStatus,2000);
   }
 }
 
@@ -1606,6 +1614,7 @@ function render(tab, rows){
   if(isDemo){renderDemo(); return;}
   if(isCR){renderCryptorank(tab.replace('cryptorank_','')); return;}
   if(tab==='reflow_1h'){renderMomentumReflow(rows); return;}
+  if(tab==='compression_15m'){renderMomentumCompression(rows); return;}
   if(isF){renderFunding(rows); return;}
   if(isB && rows && rows.length>0){renderBreakout(rows); return;}
 
@@ -1894,6 +1903,134 @@ function renderMomentumReflow(payload){
   updateReflowSoundControls();
 }
 
+// Compression dashboard remains separate from the reflow renderer and alert cursor.
+var COMPRESSION_ALERT_SOUND_KEY='axiom_compression_alert_sound_v1';
+var COMPRESSION_ALERT_CURSOR_KEY='axiom_compression_alert_cursor_v1';
+var _compressionAlertTimer=null,_compressionAudioContext=null,_compressionAlertPollPromise=null;
+var _compressionAlertBaselinePromise=null,_compressionAlertGeneration=0;
+var _compressionPayload={monitor:{},pool_rows:[],episode_rows:[],rejection_counts:{},can_manage:false};
+
+function compressionNumber(value, decimals){
+  var number=finiteRNumber(value);
+  return number===null?'--':number.toFixed(decimals);
+}
+function compressionTime(value){
+  if(typeof value==='string') return escapeRHtml(value||'--');
+  var number=finiteRNumber(value);
+  if(number===null||number<=0) return '--';
+  var date=new Date(number);
+  return isNaN(date.getTime())?'--':escapeRHtml(date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',hour12:false}));
+}
+function compressionDirection(row){return row&&row.side==='SHORT'?'SHORT':'LONG';}
+function compressionRows(rows, side){
+  return (Array.isArray(rows)?rows:[]).filter(function(row){return compressionDirection(row)===side;});
+}
+function compressionRowHtml(row, index){
+  row=row&&typeof row==='object'?row:{};
+  var symbol=escapeRHtml(row.symbol||'--'),side=compressionDirection(row),tone=side==='LONG'?'g':'r';
+  var state=escapeRHtml(row.state||'--'),price=compressionNumber(row.live_price,6);
+  var bars=compressionNumber(row.compression_bars,0),alignment=escapeRHtml(row.htf_alignment||'UNKNOWN');
+  return '<tr><td>'+index+'</td><td><b>'+symbol.replace('USDT','')+'</b></td><td class="'+tone+'">'+side+'</td><td>'+state+'</td><td>'+price+'</td><td>'+bars+'</td><td>'+alignment+'</td></tr>';
+}
+function compressionTable(title, rows, side){
+  var selected=compressionRows(rows,side),tone=side==='LONG'?'g':'r';
+  var html='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text)"><span class="'+tone+'">'+title+'</span> <span style="color:var(--muted)">'+selected.length+'</span></div>';
+  html+='<table><thead><tr><th>#</th><th>交易对</th><th>方向</th><th>当前状态</th><th>实时价格</th><th>压缩K线</th><th>大周期</th></tr></thead><tbody>';
+  if(!selected.length) html+='<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px">暂无候选</td></tr>';
+  for(var i=0;i<selected.length;i++) html+=compressionRowHtml(selected[i],i+1);
+  return html+'</tbody></table></section>';
+}
+function compressionSoundControls(){
+  var enabled=localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';
+  return '<div class="reflow-sound-controls"><button id="compressionSoundToggle" type="button" onclick="setCompressionSoundEnabled('+(!enabled)+')">'+(enabled?'关闭声音提醒':'开启声音提醒')+'</button><button type="button" onclick="testCompressionCoinSound()">测试声音</button><span id="compressionSoundState">'+(enabled?'已开启':'已关闭')+'</span></div>';
+}
+function updateCompressionSoundControls(){
+  var enabled=localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';
+  var toggle=document.getElementById('compressionSoundToggle'),state=document.getElementById('compressionSoundState');
+  if(toggle){toggle.textContent=enabled?'关闭声音提醒':'开启声音提醒';toggle.onclick=function(){return setCompressionSoundEnabled(!enabled);};}
+  if(state) state.textContent=enabled?'已开启':'已关闭';
+}
+function renderMomentumCompression(payload){
+  payload=payload&&typeof payload==='object'?payload:{};
+  _compressionPayload=payload;
+  var monitor=payload.monitor&&typeof payload.monitor==='object'?payload.monitor:{};
+  var pool=Array.isArray(payload.pool_rows)?payload.pool_rows:[];
+  var episodes=Array.isArray(payload.episode_rows)?payload.episode_rows:[];
+  var rejections=payload.rejection_counts&&typeof payload.rejection_counts==='object'?payload.rejection_counts:{};
+  var canManage=payload.can_manage===true, running=monitor.running===true, auto=monitor.auto_enabled===true;
+  var status=running?'运行中':(auto?'待启动':'已关闭');
+  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>本轮新突破</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div></div>';
+  document.getElementById('stats').innerHTML=stats;
+  var toggle='<button type="button" class="btn" '+(canManage?'':'disabled title="仅管理员可修改"')+' onclick="setCompressionAutoEnabled('+(!auto)+')">'+(auto?'关闭自动监控':'开启自动监控')+'</button>';
+  var controls='<div class="reflow-filter-bar"><span class="reflow-filter-label">15M 已收盘结构 · 池内实时突破 · 只监控不交易</span>'+toggle+(canManage?'':'<span style="color:var(--muted);font-size:11px">仅管理员可修改</span>')+compressionSoundControls()+'</div>';
+  var fresh=episodes.filter(function(row){return String((row||{}).state||'').indexOf('BREAKOUT_FRESH_')===0;});
+  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">新突破 <span class="g">'+fresh.length+'</span></div>'+(fresh.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>价格</th><th>大周期</th></tr></thead><tbody>'+fresh.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row);return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+escapeRHtml(row.htf_alignment||'UNKNOWN')+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无新突破</p></div>')+'</section>';
+  var rejectionKeys=Object.keys(rejections).sort();
+  var rejectionHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">拒绝统计</div><div style="padding:12px 14px;color:var(--text2);font-size:12px">'+(rejectionKeys.length?rejectionKeys.map(function(key){return '<span style="display:inline-block;margin:0 12px 8px 0">'+escapeRHtml(key)+' <b>'+compressionNumber(rejections[key],0)+'</b></span>';}).join(''):'本轮无拒绝统计')+'</div></section>';
+  document.getElementById('main').innerHTML=controls+compressionTable('LONG 观察池',pool,'LONG')+compressionTable('SHORT 观察池',pool,'SHORT')+freshHtml+rejectionHtml;
+  updateCompressionSoundControls();
+}
+function refreshCompressionStatus(){
+  return fetch('/api/compression/status').then(function(response){if(!response.ok) throw new Error('compression status failed');return response.json();}).then(function(payload){
+    D.compression_15m=payload;
+    if(cur==='compression_15m') renderMomentumCompression(payload);
+    return payload;
+  }).catch(function(){return null;});
+}
+function setCompressionAutoEnabled(enabled){
+  if(!_compressionPayload.can_manage) return Promise.resolve(false);
+  return fetch('/api/compression/automation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!!enabled})}).then(function(response){if(!response.ok) throw new Error('compression automation failed');return response.json();}).then(function(){return refreshCompressionStatus();}).catch(function(){return false;});
+}
+function activateCompressionAudio(){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _compressionAudioContext=_compressionAudioContext||new AudioCtor();
+  return Promise.resolve(_compressionAudioContext.resume()).then(function(){return true;}).catch(function(){return false;});
+}
+function playCompressionCoinSound(playGuard){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _compressionAudioContext=_compressionAudioContext||new AudioCtor();
+  return Promise.resolve(_compressionAudioContext.resume()).then(function(){
+    if(playGuard&&!playGuard()) return false;
+    var now=_compressionAudioContext.currentTime;
+    [880,1175,1568].forEach(function(frequency,index){var start=now+index*0.18,osc=_compressionAudioContext.createOscillator(),gain=_compressionAudioContext.createGain();osc.type='triangle';osc.frequency.setValueAtTime(frequency,start);gain.gain.setValueAtTime(0.0001,start);gain.gain.exponentialRampToValueAtTime(0.22,start+0.012);gain.gain.exponentialRampToValueAtTime(0.0001,start+0.32);osc.connect(gain);gain.connect(_compressionAudioContext.destination);osc.start(start);osc.stop(start+0.34);});
+    return true;
+  }).catch(function(){return false;});
+}
+function storeCompressionAlertCursor(latest){
+  var value=parseInt(latest,10),current=parseInt(localStorage.getItem(COMPRESSION_ALERT_CURSOR_KEY),10);
+  if(!isFinite(value)||value<0) value=0;
+  if(isFinite(current)) value=Math.max(value,current);
+  localStorage.setItem(COMPRESSION_ALERT_CURSOR_KEY,String(value));
+}
+function ensureCompressionAlertBaseline(generation){
+  if(generation!==_compressionAlertGeneration) return Promise.resolve(false);
+  if(_compressionAlertBaselinePromise) return _compressionAlertBaselinePromise;
+  _compressionAlertBaselinePromise=fetch('/api/compression/alerts?after=0').then(function(response){if(!response.ok) throw new Error('compression baseline failed');return response.json();}).then(function(data){if(generation!==_compressionAlertGeneration) return false;storeCompressionAlertCursor(data.latest_alert_id);return true;}).catch(function(){return false;}).then(function(ready){_compressionAlertBaselinePromise=null;return ready;});
+  return _compressionAlertBaselinePromise;
+}
+function setCompressionSoundEnabled(enabled){
+  var generation=++_compressionAlertGeneration;
+  _compressionAlertBaselinePromise=null;_compressionAlertPollPromise=null;
+  localStorage.setItem(COMPRESSION_ALERT_SOUND_KEY,'0');
+  if(!enabled){updateCompressionSoundControls();return Promise.resolve();}
+  return activateCompressionAudio().then(function(active){return active&&ensureCompressionAlertBaseline(generation);}).then(function(ready){if(ready&&generation===_compressionAlertGeneration) localStorage.setItem(COMPRESSION_ALERT_SOUND_KEY,'1');updateCompressionSoundControls();});
+}
+function pollCompressionAlerts(){
+  if(localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
+  if(_compressionAlertPollPromise) return _compressionAlertPollPromise;
+  var generation=_compressionAlertGeneration;
+  var work=ensureCompressionAlertBaseline(generation).then(function(ready){if(!ready||generation!==_compressionAlertGeneration||localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)!=='1') return null;var cursor=parseInt(localStorage.getItem(COMPRESSION_ALERT_CURSOR_KEY),10);if(!isFinite(cursor)) return null;return fetch('/api/compression/alerts?after='+cursor).then(function(response){if(!response.ok) throw new Error('compression alert poll failed');return response.json();}).then(function(data){return {cursor:cursor,data:data};});}).then(function(result){if(!result||!Array.isArray(result.data.events)||!result.data.events.length||generation!==_compressionAlertGeneration) return;return playCompressionCoinSound(function(){return generation===_compressionAlertGeneration&&localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';}).then(function(played){if(played&&generation===_compressionAlertGeneration) storeCompressionAlertCursor(result.data.latest_alert_id||result.cursor);});}).catch(function(){});
+  _compressionAlertPollPromise=work.then(function(value){_compressionAlertPollPromise=null;return value;});
+  return _compressionAlertPollPromise;
+}
+function testCompressionCoinSound(){return playCompressionCoinSound();}
+function initCompressionAlertSound(){
+  ensureCompressionAlertBaseline(_compressionAlertGeneration);
+  if(!_compressionAlertTimer) _compressionAlertTimer=setInterval(pollCompressionAlerts,2000);
+}
+
 // ===== SCANNING =====
 function setScanning(s){
   document.getElementById('scanBtn').disabled=s;
@@ -1913,10 +2050,11 @@ function doScan(){
   if(cur==='trader'){selectTab('breakout_1h'); return;}
   _pollingScan=true;
   setScanning(true);
-  var url=cur==='funding'?'/scan/funding':'/scan/'+cur.split('_')[0]+'/'+cur.split('_')[1];
+  var url=cur==='funding'?'/scan/funding':cur==='compression_15m'?'/scan/compression/15m':'/scan/'+cur.split('_')[0]+'/'+cur.split('_')[1];
   document.getElementById('progressBar').style.width='10%';
   fetch(url).then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusText').textContent=d.status||'';
+    if(cur==='compression_15m') refreshCompressionStatus();
     if(!pollTimer) pollTimer=setInterval(pollResults, 1500);
   }).catch(function(e){setScanning(false);});
 }
@@ -1933,6 +2071,7 @@ function pollResults(){
       if(parts.length===2) document.getElementById('progressBar').style.width=(parseInt(parts[0])/parseInt(parts[1])*90+10)+'%';
     }
     if(cur==='reflow_1h') show(cur, null);
+    if(cur==='compression_15m') refreshCompressionStatus();
     if(!d.scanning){
       if(wasScanning){
         setScanning(false);
@@ -3818,6 +3957,7 @@ if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||
   document.getElementById('scanLabel').textContent='首次使用，点击开始扫描';
 }
 initReflowAlertSound();
+initCompressionAlertSound();
 </script></body></html>"""
 
 @app.route("/")

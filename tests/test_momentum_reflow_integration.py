@@ -121,11 +121,12 @@ Promise.resolve().then(function(){{return Promise.resolve();}}).then(function(){
 }});
 """
     completed = subprocess.run(
-        ["node", "-e", script],
+        ["node", "-"],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 
