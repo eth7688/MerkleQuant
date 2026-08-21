@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -121,6 +122,119 @@ class CompressionMonitorPriceTests(unittest.TestCase):
             status = monitor.set_auto_enabled(False)
             self.assertFalse(status["running"])
             self.assertEqual(status["pool_size"], 1)
+
+    def test_overflow_price_row_is_dropped_and_later_valid_price_is_applied(self):
+        class OverflowingValue:
+            def __float__(self):
+                raise OverflowError("too large")
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+            applied = {}
+            monitor._apply_prices = lambda prices, now_ms: applied.update(prices)
+            self.assertIsNone(monitor._finite_price(OverflowingValue()))
+            monitor.handle_message(json.dumps([
+                {"s": "POOLUSDT", "c": "1e1000000"},
+                {"s": "POOLUSDT", "c": "10.5"},
+            ]), now_ms=2_000)
+
+        self.assertEqual(applied, {"POOLUSDT": 10.5})
+
+
+class CompressionMonitorScanTests(unittest.TestCase):
+    def _monitor(self, root, scan, callback=lambda events: None):
+        from momentum_compression_monitor import CompressionMonitor
+
+        state_path = root / "state.json"
+        save_compression_state(state_path, default_state())
+        return CompressionMonitor(state_path, root, callback, scan=scan)
+
+    def test_scan_holds_state_lock_until_scan_returns_before_price_batch_can_run(self):
+        with TemporaryDirectory() as folder:
+            scan_started = threading.Event()
+            release_scan = threading.Event()
+            price_finished = threading.Event()
+
+            def scan(state_path, snapshot_dir):
+                scan_started.set()
+                release_scan.wait(1)
+                return {"evaluated_at": 1, "events": []}
+
+            monitor = self._monitor(Path(folder), scan)
+            scan_thread = threading.Thread(target=lambda: monitor.scan_now("manual"))
+            price_thread = threading.Thread(target=lambda: (monitor._apply_prices({"POOLUSDT": 10.5}, 2), price_finished.set()))
+            scan_thread.start()
+            self.assertTrue(scan_started.wait(1))
+            price_thread.start()
+            self.assertFalse(price_finished.wait(0.05))
+            release_scan.set()
+            scan_thread.join(1)
+            price_thread.join(1)
+
+        self.assertTrue(price_finished.is_set())
+
+    def test_scan_dispatches_only_events_newer_than_enable_cursor_baseline(self):
+        events = []
+        reports = iter((
+            {"evaluated_at": 1, "events": [{"event_id": 1, "name": "old"}]},
+            {"evaluated_at": 2, "events": [{"event_id": 2, "name": "new"}]},
+        ))
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            class DormantThread:
+                def __init__(self, **kwargs):
+                    return None
+
+                def start(self):
+                    return None
+
+                def join(self, timeout):
+                    return None
+
+                def is_alive(self):
+                    return False
+
+            monitor = self._monitor(root, lambda *args: next(reports), events.extend)
+            monitor.thread_factory = DormantThread
+            state = default_state()
+            state["next_event_id"] = 2
+            save_compression_state(root / "state.json", state)
+            monitor.set_auto_enabled(True)
+            monitor.stop()
+            monitor.scan_now("manual")
+            monitor.scan_now("manual")
+
+        self.assertEqual(events, [{"event_id": 2, "name": "new"}])
+
+    def test_successful_socket_session_resets_next_retry_delay_to_one_second(self):
+        from momentum_compression_monitor import CompressionMonitor
+
+        delays, apps = [], []
+
+        class App:
+            def __init__(self, **callbacks):
+                self.callbacks = callbacks
+                apps.append(self)
+
+            def run_forever(self):
+                if len(apps) == 1:
+                    raise RuntimeError("offline")
+                self.callbacks["on_open"](self)
+                self.callbacks["on_close"](self)
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), lambda *args: {"events": []})
+            monitor.websocket_factory = lambda url, **callbacks: App(**callbacks)
+
+            def sleep(delay):
+                delays.append(delay)
+                if len(delays) == 2:
+                    monitor._stop.set()
+
+            monitor.sleep = sleep
+            monitor._stream_loop()
+
+        self.assertEqual(delays, [1, 1])
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ class CompressionMonitor:
     def _finite_price(value):
         try:
             price = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return price if math.isfinite(price) and price > 0 else None
 
@@ -200,8 +200,10 @@ class CompressionMonitor:
             if self._stop.is_set():
                 break
             self._price_stream_status = "reconnecting"
+            if self._stream_ever_connected:
+                attempt = 0
             self.sleep(self.reconnect_delay(attempt))
-            attempt = 0 if self._stream_ever_connected else attempt + 1
+            attempt += 1
 
     def _fallback_loop(self):
         while not self._stop.is_set():
@@ -223,9 +225,22 @@ class CompressionMonitor:
         if not self._scan_lock.acquire(blocking=False):
             return False
         try:
-            report = self.scan(self.state_path, self.snapshot_dir)
+            with self._state_lock:
+                report = self.scan(self.state_path, self.snapshot_dir)
+                events = [
+                    event for event in report.get("events", [])
+                    if isinstance(event, dict) and isinstance(event.get("event_id"), int)
+                    and event["event_id"] > self._event_cursor
+                ]
+                if events:
+                    self._event_cursor = max(event["event_id"] for event in events)
             self._last_scan_at = report.get("evaluated_at", self.time_ms())
             self._last_error = ""
+            if events:
+                try:
+                    self.event_callback(events)
+                except Exception as error:
+                    self._last_error = f"event callback: {error}"
             return True
         except Exception as error:
             self._last_error = f"{trigger} scan: {error}"
@@ -273,7 +288,7 @@ class CompressionMonitor:
             state["auto_enabled"] = enabled
             save_compression_state(self.state_path, state)
             if enabled:
-                self._event_cursor = state["next_event_id"]
+                self._event_cursor = state["next_event_id"] - 1
         if enabled:
             self.start()
         else:
