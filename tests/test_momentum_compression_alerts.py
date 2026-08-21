@@ -8,6 +8,8 @@ from unittest.mock import Mock, patch
 from momentum_compression_alerts import (
     append_compression_alerts,
     baseline_compression_alerts,
+    compression_delivery_statuses,
+    compression_sound_available_ids,
     deliver_due_compression_wechat,
     read_public_compression_alerts,
 )
@@ -50,6 +52,18 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(created), 3)
             self.assertEqual(self.public_symbols(events), ["AUSDT", "BUSDT", "CUSDT"])
             self.assertEqual(self.queued_symbols(state), ["AUSDT"])
+            self.assertEqual(compression_sound_available_ids(events), {"AUSDT-long-1", "BUSDT-long-1", "CUSDT-long-1"})
+
+    def test_delivery_statuses_are_keyed_by_confirmed_compression_identity(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            created = append_compression_alerts(events, state, [fresh("AUSDT")], 10_000)
+            self.assertEqual(compression_delivery_statuses(state), {created[0]["compression_id"]: "pending"})
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            deliver_due_compression_wechat(settings, state, events, 10_000, post=Mock(return_value=response))
+            self.assertEqual(compression_delivery_statuses(state), {created[0]["compression_id"]: "delivered"})
 
     def test_same_compression_id_is_idempotent(self):
         with TemporaryDirectory() as folder:

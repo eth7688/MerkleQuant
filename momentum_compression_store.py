@@ -70,6 +70,10 @@ def _validate_item(compression_id, item, *, allow_failed=False):
         raise ValueError("invalid pool state")
     if item["state"] in _POST_FRESH_STATES and not item["fresh_emitted"]:
         raise ValueError("post-fresh state missing fresh marker")
+    has_breakout_facts = "breakout_at" in item or "breakout_price" in item
+    if has_breakout_facts:
+        _require_nonnegative_int(item.get("breakout_at"), "breakout_at")
+        _require_finite_number(item.get("breakout_price"), "breakout_price")
     if item["state"].endswith("_LONG") and item["side"] != "LONG":
         raise ValueError("pool state does not match side")
     if item["state"].endswith("_SHORT") and item["side"] != "SHORT":
@@ -161,6 +165,10 @@ def _pool_item(evaluation, now_ms, previous=None):
     item["last_verified_at"] = now_ms
     item["fresh_emitted"] = previous.get("fresh_emitted", False) if previous else False
     item["state"] = previous.get("state", evaluation["state"]) if previous else evaluation["state"]
+    if previous:
+        for key in ("breakout_at", "breakout_price"):
+            if key in previous:
+                item[key] = previous[key]
     return item
 
 
@@ -251,6 +259,8 @@ def apply_live_prices(state: dict, prices: dict[str, float], now_ms: int) -> tup
         if emits_fresh:
             item["fresh_emitted"] = True
             item["state"] = next_state
+            item["breakout_at"] = now_ms
+            item["breakout_price"] = float(price)
             fresh_events.append(_event(out, item, next_state, float(price), now_ms))
         else:
             item["state"] = next_state

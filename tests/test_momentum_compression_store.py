@@ -57,6 +57,21 @@ class CompressionStateMachineTests(unittest.TestCase):
         self.assertEqual(second, [])
         self.assertTrue(state["pool"]["long-episode-1"]["fresh_emitted"])
 
+    def test_breakout_facts_survive_later_ticks_and_restart(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 111.0}, 3_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.25}, 4_000)
+        item = state["pool"]["long-episode-1"]
+        self.assertEqual((item["breakout_at"], item["breakout_price"]), (2_000, 110.6))
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            save_compression_state(path, state)
+            restarted = load_compression_state(path)
+        restarted, _ = apply_live_prices(restarted, {"TESTUSDT": 111.2}, 5_000)
+        item = restarted["pool"]["long-episode-1"]
+        self.assertEqual((item["breakout_at"], item["breakout_price"]), (2_000, 110.6))
+
     def test_unconfirmed_fresh_active_retracing_failed_transition(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
         transitions = []

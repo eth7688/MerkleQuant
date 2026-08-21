@@ -56,6 +56,20 @@ class CompressionApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["can_manage"])
 
+    def test_status_maps_alert_and_delivery_facts_to_pool_and_terminal_rows(self):
+        self._login()
+        current = {"compression_id": "current", "symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG"}
+        terminal = {"compression_id": "terminal", "symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED"}
+        with patch.object(web_ui, "load_compression_state", return_value={"pool": {"current": current}, "episodes": {"terminal": terminal}}), \
+             patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value={"current"}), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={"current": "delivered", "terminal": "failed"}):
+            payload = self.client.get("/api/compression/status").get_json()
+        self.assertEqual(payload["pool_rows"][0]["sound_status"], "available")
+        self.assertEqual(payload["pool_rows"][0]["wechat_status"], "delivered")
+        self.assertEqual(payload["episode_rows"][0]["sound_status"], "unknown")
+        self.assertEqual(payload["episode_rows"][0]["wechat_status"], "failed")
+
     def test_only_15m_manual_compression_scan_is_valid(self):
         self.assertEqual(self.client.get("/scan/compression/1h").status_code, 400)
         with patch.object(web_ui._compression_monitor, "scan_now", return_value=True) as scan_now:
@@ -199,17 +213,17 @@ class CompressionDashboardUiTests(unittest.TestCase):
 
     def test_renderer_escapes_payload_and_formats_nonfinite_values(self):
         result = render_compression_payload({
-            "monitor": {"auto_enabled": True, "running": True, "last_scan_at": 0, "next_scan_at": "2026-08-21T12:15:05+00:00", "last_error": "<b>stream failed</b>"},
+            "monitor": {"auto_enabled": True, "running": True, "last_scan_at": 0, "next_scan_at": "2026-08-21T12:15:05+00:00", "last_error": "<b>stream failed</b>", "today_fresh": 1, "dropped_price_rows": 7},
             "scan": {"scanned": 200, "eligible": 12, "errors": 3},
             "alert": {"last_delivery_at": 1720000000000, "last_error": "<i>wechat</i>"},
             "can_manage": False,
             "pool_rows": [
                 {"symbol": "<script>alert(1)</script>", "side": "LONG", "state": "PRE_BREAKOUT", "live_price": float("nan"), "compression_bars": float("inf")},
-                {"symbol": "FRESHUSDT", "side": "SHORT", "state": "BREAKOUT_FRESH_SHORT", "live_price": 12.5, "quality_score": 98, "upper_boundary_price": 13, "lower_boundary_price": 12, "breakout_buffer_price": 11.95, "directional_touch_count": 4, "contraction_ratio": 0.5, "ema8": 12.6, "ema21": 12.4, "atr14": 0.2, "compression_bars": 22, "htf_alignment": "CONFIRMED", "first_seen_at": 1720000000000, "last_price_at": 1720000001000, "last_verified_at": 1720000002000},
+                {"symbol": "FRESHUSDT", "side": "SHORT", "state": "BREAKOUT_ACTIVE_SHORT", "live_price": 12.5, "breakout_at": 1720000000000, "breakout_price": 11.9, "sound_status": "available", "wechat_status": "delivered", "quality_score": 98, "upper_boundary_price": 13, "lower_boundary_price": 12, "breakout_buffer_price": 11.95, "directional_touch_count": 4, "contraction_ratio": 0.5, "ema8": 12.6, "ema21": 12.4, "atr14": 0.2, "compression_bars": 22, "htf_alignment": "CONFIRMED", "first_seen_at": 1720000000000, "last_price_at": 1720000001000, "last_verified_at": 1720000002000},
                 {"symbol": "LOWUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT", "live_price": 12.1, "quality_score": 10},
                 {"symbol": "WAITUSDT", "side": "LONG", "state": "BREAKOUT_UNCONFIRMED_LONG", "live_price": 11.1, "quality_score": 99},
             ],
-            "episode_rows": [{"symbol": "FAILEDUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "live_price": 12.5, "quality_score": 20}],
+            "episode_rows": [{"symbol": "FAILEDUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "live_price": 12.5, "breakout_at": 1720000000000, "breakout_price": 11.9, "sound_status": "unknown", "wechat_status": "failed", "quality_score": 20}],
             "rejection_counts": {"<img src=x>": float("inf")},
         })
         rendered = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
@@ -219,13 +233,15 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("终止结构", rendered)
         self.assertIn("拒绝统计", rendered)
         self.assertIn("微信错误", rendered)
-        for label in ("压缩K线", "大周期", "入池时间", "边界距离", "触碰", "收敛", "EMA8/21", "ATR", "质量", "下次扫描", "监控错误", "已扫描", "合格候选", "错误数", "突破时间", "缓冲", "声音提醒", "微信投递"):
+        self.assertNotIn("本轮新突破", rendered)
+        for label in ("压缩K线", "大周期", "入池时间", "边界距离", "触碰", "收敛", "EMA8/21", "ATR", "质量", "下次扫描", "监控错误", "已扫描", "合格候选", "错误数", "当前已触发结构数", "丢弃价格行", "突破时间", "突破价格", "最新价格", "最新时间", "声音", "微信", "缓冲", "声音提醒", "微信投递"):
             self.assertIn(label, rendered)
-        for value in (">200<", ">12<", ">3<", ">22<", "CONFIRMED", "12.500000", "11.950000", "2.50 ATR"):
+        for value in (">200<", ">12<", ">3<", ">7<", ">22<", "CONFIRMED", "11.900000", "12.500000", "11.950000", "2.50 ATR", "已投递", "投递失败"):
             self.assertIn(value, rendered)
         self.assertLess(rendered.index("FRESH"), rendered.index("LOW"))
         breakout_section = rendered[rendered.index("当前突破"):rendered.index("终止结构")]
         self.assertIn("FRESH", breakout_section)
+        self.assertIn("BREAKOUT_ACTIVE_SHORT", breakout_section)
         self.assertNotIn("WAIT", breakout_section)
         self.assertIn("仅管理员可修改", rendered)
         self.assertNotIn("<script>alert(1)</script>", rendered)

@@ -31,6 +31,8 @@ from momentum_reflow_alerts import (
 )
 from momentum_compression_alerts import (
     append_compression_alerts,
+    compression_delivery_statuses,
+    compression_sound_available_ids,
     deliver_due_compression_wechat,
     read_public_compression_alerts,
 )
@@ -1924,6 +1926,14 @@ function compressionTime(value){
   return isNaN(date.getTime())?'--':escapeRHtml(date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',hour12:false}));
 }
 function compressionDirection(row){return row&&row.side==='SHORT'?'SHORT':'LONG';}
+function compressionDeliveryStatus(row, key){
+  var value=String((row&&row[key])||'unknown');
+  if(value==='available') return '可用';
+  if(value==='pending') return '待投递';
+  if(value==='delivered') return '已投递';
+  if(value==='failed') return '投递失败';
+  return '未知';
+}
 function compressionRows(rows, side){
   return (Array.isArray(rows)?rows:[]).filter(function(row){return compressionDirection(row)===side;});
 }
@@ -1966,14 +1976,14 @@ function renderMomentumCompression(payload){
   var rejections=payload.rejection_counts&&typeof payload.rejection_counts==='object'?payload.rejection_counts:{};
   var canManage=payload.can_manage===true, running=monitor.running===true, auto=monitor.auto_enabled===true;
   var status=running?'运行中':(auto?'待启动':'已关闭');
-  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>已扫描</span><b>'+compressionNumber(scan.scanned,0)+'</b></div><div class="reflow-status-card"><span>合格候选</span><b class="g">'+compressionNumber(scan.eligible,0)+'</b></div><div class="reflow-status-card"><span>错误数</span><b class="r">'+compressionNumber(scan.errors,0)+'</b></div><div class="reflow-status-card"><span>本轮新突破</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>下次扫描</span><b>'+compressionTime(monitor.next_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div><div class="reflow-status-card"><span>监控错误</span><b class="r">'+escapeRHtml(monitor.last_error||'--')+'</b></div><div class="reflow-status-card"><span>声音提醒</span><b>'+((localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1')?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>微信投递</span><b>'+compressionTime(alert.last_delivery_at)+'</b></div><div class="reflow-status-card"><span>微信错误</span><b class="r">'+escapeRHtml(alert.last_error||'--')+'</b></div></div>';
+  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>已扫描</span><b>'+compressionNumber(scan.scanned,0)+'</b></div><div class="reflow-status-card"><span>合格候选</span><b class="g">'+compressionNumber(scan.eligible,0)+'</b></div><div class="reflow-status-card"><span>错误数</span><b class="r">'+compressionNumber(scan.errors,0)+'</b></div><div class="reflow-status-card"><span>当前已触发结构数</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>丢弃价格行</span><b class="r">'+compressionNumber(monitor.dropped_price_rows,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>下次扫描</span><b>'+compressionTime(monitor.next_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div><div class="reflow-status-card"><span>监控错误</span><b class="r">'+escapeRHtml(monitor.last_error||'--')+'</b></div><div class="reflow-status-card"><span>声音提醒</span><b>'+((localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1')?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>微信投递</span><b>'+compressionTime(alert.last_delivery_at)+'</b></div><div class="reflow-status-card"><span>微信错误</span><b class="r">'+escapeRHtml(alert.last_error||'--')+'</b></div></div>';
   document.getElementById('stats').innerHTML=stats;
   var toggle='<button type="button" class="btn" '+(canManage?'':'disabled title="仅管理员可修改"')+' onclick="setCompressionAutoEnabled('+(!auto)+')">'+(auto?'关闭自动监控':'开启自动监控')+'</button>';
   var controls='<div class="reflow-filter-bar"><span class="reflow-filter-label">15M 已收盘结构 · 池内实时突破 · 只监控不交易</span>'+toggle+(canManage?'':'<span style="color:var(--muted);font-size:11px">仅管理员可修改</span>')+compressionSoundControls()+'</div>';
   var currentBreakoutStates={BREAKOUT_FRESH_LONG:true,BREAKOUT_FRESH_SHORT:true,BREAKOUT_ACTIVE_LONG:true,BREAKOUT_ACTIVE_SHORT:true,BREAKOUT_RETRACING_LONG:true,BREAKOUT_RETRACING_SHORT:true};
   var breakouts=pool.filter(function(row){return currentBreakoutStates[String((row||{}).state||'')]===true;}).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);});
-  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">当前突破 <span class="g">'+breakouts.length+'</span></div>'+(breakouts.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>突破时间</th><th>突破价格</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>质量</th></tr></thead><tbody>'+breakouts.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at||row.last_price_at||row.last_verified_at||row.evaluated_at)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无当前突破</p></div>')+'</section>';
-  var terminalHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">终止结构 <span style="color:var(--muted)">'+episodes.length+'</span></div>'+(episodes.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>终止状态</th><th>终止时间</th><th>终止价格</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>质量</th></tr></thead><tbody>'+episodes.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.last_price_at||row.last_verified_at||row.evaluated_at)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无终止结构</p></div>')+'</section>';
+  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">当前突破 <span class="g">'+breakouts.length+'</span></div>'+(breakouts.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>突破时间</th><th>突破价格</th><th>最新价格</th><th>最新时间</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>声音</th><th>微信</th><th>质量</th></tr></thead><tbody>'+breakouts.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at)+'</td><td>'+compressionNumber(row.breakout_price,6)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionTime(row.last_price_at)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionDeliveryStatus(row,'sound_status')+'</td><td>'+compressionDeliveryStatus(row,'wechat_status')+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无当前突破</p></div>')+'</section>';
+  var terminalHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">终止结构 <span style="color:var(--muted)">'+episodes.length+'</span></div>'+(episodes.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>终止状态</th><th>突破时间</th><th>突破价格</th><th>最新价格</th><th>最新时间</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>声音</th><th>微信</th><th>质量</th></tr></thead><tbody>'+episodes.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at)+'</td><td>'+compressionNumber(row.breakout_price,6)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionTime(row.last_price_at)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionDeliveryStatus(row,'sound_status')+'</td><td>'+compressionDeliveryStatus(row,'wechat_status')+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无终止结构</p></div>')+'</section>';
   var rejectionKeys=Object.keys(rejections).sort();
   var rejectionHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">拒绝统计</div><div style="padding:12px 14px;color:var(--text2);font-size:12px">'+(rejectionKeys.length?rejectionKeys.map(function(key){return '<span style="display:inline-block;margin:0 12px 8px 0">'+escapeRHtml(key)+' <b>'+compressionNumber(rejections[key],0)+'</b></span>';}).join(''):'本轮无拒绝统计')+'</div></section>';
   document.getElementById('main').innerHTML=controls+compressionTable('LONG 观察池',pool,'LONG')+compressionTable('SHORT 观察池',pool,'SHORT')+freshHtml+terminalHtml+rejectionHtml;
@@ -4468,10 +4478,29 @@ def compression_status():
         scan_summary = dict(_compression_scan_summary)
     with _compression_alert_lock:
         alert_status = dict(_compression_alert_status)
+    try:
+        sound_available_ids = compression_sound_available_ids(MOMENTUM_COMPRESSION_EVENTS)
+    except ValueError:
+        sound_available_ids = set()
+    try:
+        wechat_statuses = compression_delivery_statuses(MOMENTUM_COMPRESSION_ALERT_STATE)
+    except ValueError:
+        wechat_statuses = {}
+
+    def alert_facts(rows):
+        mapped = []
+        for row in rows:
+            item = dict(row)
+            compression_id = item.get("compression_id")
+            item["sound_status"] = "available" if compression_id in sound_available_ids else "unknown"
+            item["wechat_status"] = wechat_statuses.get(compression_id, "unknown")
+            mapped.append(item)
+        return mapped
+
     return jsonify({
         "monitor": monitor,
-        "pool_rows": list(compression_state["pool"].values()),
-        "episode_rows": list(compression_state["episodes"].values()),
+        "pool_rows": alert_facts(compression_state["pool"].values()),
+        "episode_rows": alert_facts(compression_state["episodes"].values()),
         "rejection_counts": rejection_counts,
         "scan": scan_summary,
         "alert": alert_status,

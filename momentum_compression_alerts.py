@@ -248,9 +248,25 @@ def read_public_compression_alerts(events_path: Path, after_id: int) -> dict:
         return {"latest_alert_id": len(events), "events": copy.deepcopy([event for event in events if event["alert_id"] > after_id][-20:])}
 
 
+def compression_sound_available_ids(events_path: Path) -> set[str]:
+    """Return all durable browser-alert identities without the public polling cap."""
+    with _event_lock(Path(events_path)):
+        return {event["compression_id"] for event in _read_events_unlocked(Path(events_path))}
+
+
 def baseline_compression_alerts(events_path: Path) -> int:
     with _event_lock(Path(events_path)):
         return len(_read_events_unlocked(Path(events_path)))
+
+
+def compression_delivery_statuses(state_path: Path) -> dict[str, str]:
+    """Return the durable WeChat queue state by immutable compression identity."""
+    with _delivery_lock(Path(state_path)):
+        state = _load_state_unlocked(Path(state_path))
+        return {
+            item["event"]["compression_id"]: item["status"]
+            for item in state["delivery_queue"]
+        }
 
 
 def _safe_error(error: object, webhook: str) -> str:
