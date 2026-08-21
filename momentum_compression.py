@@ -110,12 +110,12 @@ def _non_length_rules(frame: pd.DataFrame, side: str, params: CompressionParams)
     atr = frame["atr14"].replace(0, np.nan)
     ema8, ema21 = frame["ema8"], frame["ema21"]
     if side == "LONG":
-        if not bool((ema8.iloc[1:] > ema21.iloc[1:]).all()): reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"].iloc[1:] > pd.concat((ema8, ema21), axis=1).max(axis=1).iloc[1:]).all()): reasons.append("CLOSE_IN_EMA_BAND")
+        if not bool((ema8 > ema21).all()): reasons.append("EMA_DIRECTION")
+        if not bool((frame["c"] > pd.concat((ema8, ema21), axis=1).max(axis=1)).all()): reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = _touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
     else:
-        if not bool((ema8.iloc[1:] < ema21.iloc[1:]).all()): reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"].iloc[1:] < pd.concat((ema8, ema21), axis=1).min(axis=1).iloc[1:]).all()): reasons.append("CLOSE_IN_EMA_BAND")
+        if not bool((ema8 < ema21).all()): reasons.append("EMA_DIRECTION")
+        if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()): reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = _touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
     if not math.isfinite(float(atr.iloc[-1])) or abs(float(ema8.iloc[-1] - ema21.iloc[-1])) > float(atr.iloc[-1]) * params.max_ema_distance_atr:
         reasons.append("EMA_DISTANCE_TOO_WIDE")
@@ -213,11 +213,16 @@ def evaluate_side(symbol: str, side: str, closed_15m: pd.DataFrame, live_price: 
         reasons.append("MISSING_REQUIRED_COLUMNS")
     if reasons:
         return _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params)
+    # Callers may include their currently forming candle.  A 15m candle is
+    # eligible only after its complete interval ends at evaluated_at_ms.
     frame = closed_15m.loc[:, REQUIRED_COLUMNS].copy().reset_index(drop=True)
     for column in REQUIRED_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if not np.isfinite(frame.to_numpy(dtype=float)).all():
         return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NONFINITE_OHLCV"], params, len(frame), frame)
+    frame = frame[frame["ot"] + 900_000 <= evaluated_at_ms].reset_index(drop=True)
+    if frame.empty:
+        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NO_CLOSED_CANDLES"], params)
     indicators = add_compression_indicators(frame)
     window, metrics = _maximal_structural_suffix(indicators, side, params)
     bars = len(window)

@@ -7,6 +7,8 @@ from momentum_compression import (
     CompressionParams,
     _classify_without_episode,
     _quality_score,
+    _non_length_rules,
+    _maximal_structural_suffix,
     _touch_events,
     add_compression_indicators,
     evaluate_both_sides,
@@ -35,6 +37,19 @@ def compression_frame(bars=20, side="LONG"):
     return frame
 
 
+def valid_compression_frame(bars=40):
+    indexes = np.arange(bars, dtype=float)
+    pulse = np.sin(indexes * np.pi / 3)
+    return pd.DataFrame({
+        "ot": BASE_OT + (indexes.astype(int) * 900_000),
+        "o": 100.0 + 0.4 * indexes,
+        "h": 105.0 + 0.3 * indexes + pulse,
+        "l": 95.0 + 0.5 * indexes + pulse,
+        "c": 100.0 + 0.4 * indexes,
+        "v": np.full(bars, 1000.0),
+    })
+
+
 class CompressionIndicatorTests(unittest.TestCase):
     def test_default_parameters_match_approved_spec(self):
         params = CompressionParams()
@@ -53,18 +68,20 @@ class CompressionIndicatorTests(unittest.TestCase):
         self.assertNotIn("ema8", frame)
         self.assertTrue({"ema8", "ema21", "atr14"}.issubset(result.columns))
 
-    def test_unclosed_bar_cannot_change_structure(self):
-        closed = compression_frame()
+    def test_unfinished_trailing_bar_is_excluded_using_evaluated_time(self):
+        closed = valid_compression_frame()
         poisoned_live_bar = closed.iloc[-1].copy()
         poisoned_live_bar["ot"] += 900_000
         poisoned_live_bar["h"] *= 4
         with_live = pd.concat([closed, poisoned_live_bar.to_frame().T], ignore_index=True)
-        first = evaluate_side("TESTUSDT", "LONG", closed, 101.0,
-                              evaluated_at_ms=2_000_000_000_000,
+        evaluated_at_ms = int(closed["ot"].iloc[-1] + 900_000)
+        first = evaluate_side("TESTUSDT", "LONG", closed, 115.0,
+                              evaluated_at_ms=evaluated_at_ms,
                               htf_alignment="UNKNOWN")
-        second = evaluate_side("TESTUSDT", "LONG", with_live.iloc[:-1], 101.0,
-                               evaluated_at_ms=2_000_000_000_000,
+        second = evaluate_side("TESTUSDT", "LONG", with_live, 115.0,
+                               evaluated_at_ms=evaluated_at_ms,
                                htf_alignment="UNKNOWN")
+        self.assertNotEqual(first["state"], "REJECTED")
         self.assertEqual(first["compression_id"], second["compression_id"])
         self.assertEqual(first["upper_boundary_price"], second["upper_boundary_price"])
 
@@ -85,21 +102,24 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertIn("EMPTY_DATA", result["rejection_reasons"])
 
     def test_boundary_requires_two_pivot_highs_and_two_pivot_lows(self):
-        result = evaluate_side("TESTUSDT", "LONG", compression_frame(15), 100.0,
-                               evaluated_at_ms=1, htf_alignment="UNKNOWN")
+        frame = compression_frame(15)
+        result = evaluate_side("TESTUSDT", "LONG", frame, 100.0,
+                               evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("INSUFFICIENT_PIVOTS", result["rejection_reasons"])
 
     def test_14_bars_rejects_without_silent_padding(self):
-        result = evaluate_side("TESTUSDT", "LONG", compression_frame(14), 100.0,
-                               evaluated_at_ms=1, htf_alignment="UNKNOWN")
+        frame = compression_frame(14)
+        result = evaluate_side("TESTUSDT", "LONG", frame, 100.0,
+                               evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_SHORT", result["rejection_reasons"])
         self.assertEqual(result["compression_bars"], 14)
 
     def test_101_bars_rejects_without_truncating_to_100(self):
-        result = evaluate_side("TESTUSDT", "LONG", compression_frame(101), 100.0,
-                               evaluated_at_ms=1, htf_alignment="UNKNOWN")
+        frame = compression_frame(101)
+        result = evaluate_side("TESTUSDT", "LONG", frame, 100.0,
+                               evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_LONG", result["rejection_reasons"])
         self.assertEqual(result["compression_bars"], 101)
@@ -145,6 +165,63 @@ class CompressionRuleTests(unittest.TestCase):
                                evaluated_at_ms=1, htf_alignment="UNKNOWN")
         self.assertGreater(score, 0.0)
         self.assertEqual(result["state"], "REJECTED")
+
+    def test_full_candidate_window_includes_first_bar_in_ema_order_rule(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        indicators.loc[indicators.index[0], "ema8"] = indicators.loc[indicators.index[0], "ema21"]
+        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        self.assertIn("EMA_DIRECTION", rules["rejection_reasons"])
+
+    def test_close_in_ema_band_is_a_hard_rejection(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        indicators.loc[indicators.index[-1], "c"] = indicators.loc[indicators.index[-1], "ema8"]
+        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        self.assertIn("CLOSE_IN_EMA_BAND", rules["rejection_reasons"])
+
+    def test_ema_distance_is_a_hard_rejection(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        indicators.loc[indicators.index[-1], "ema8"] = indicators.loc[indicators.index[-1], "ema21"] + indicators.loc[indicators.index[-1], "atr14"] * 2
+        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        self.assertIn("EMA_DISTANCE_TOO_WIDE", rules["rejection_reasons"])
+
+    def test_long_requires_three_lower_wick_events(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        rules = _non_length_rules(indicators, "LONG", CompressionParams(
+            min_directional_boundary_touches=4))
+        self.assertEqual(len(rules["directional_events"]), 3)
+        self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
+
+    def test_short_requires_three_upper_wick_events(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        rules = _non_length_rules(indicators, "SHORT", CompressionParams(
+            min_directional_boundary_touches=4))
+        self.assertEqual(len(rules["directional_events"]), 3)
+        self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
+
+    def test_higher_high_and_higher_low_are_required_for_long(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        indicators.loc[34, "l"] = indicators["l"].iloc[28] - 10
+        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        self.assertIn("INVALID_SWING_STRUCTURE", rules["rejection_reasons"])
+
+    def test_lower_low_and_lower_high_are_required_for_short(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        rules = _non_length_rules(indicators, "SHORT", CompressionParams())
+        self.assertIn("INVALID_SWING_STRUCTURE", rules["rejection_reasons"])
+
+    def test_contraction_ratio_is_a_hard_rejection(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        indicators["h"] = 110.0 + 0.5 * np.arange(len(indicators)) + np.sin(np.arange(len(indicators)) * np.pi / 3)
+        indicators["l"] = 90.0 + 0.1 * np.arange(len(indicators)) + np.sin(np.arange(len(indicators)) * np.pi / 3)
+        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        self.assertIn("INSUFFICIENT_CONTRACTION", rules["rejection_reasons"])
+
+    def test_maximal_suffix_extends_until_the_first_invalid_bar(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        window, rules = _maximal_structural_suffix(indicators, "LONG", CompressionParams())
+        self.assertEqual(int(window["ot"].iloc[0]), int(indicators["ot"].iloc[1]))
+        self.assertEqual(len(window), len(indicators) - 1)
+        self.assertEqual(rules["rejection_reasons"], [])
 
 
 if __name__ == "__main__":
