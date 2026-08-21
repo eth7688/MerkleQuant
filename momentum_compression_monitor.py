@@ -252,8 +252,10 @@ class CompressionMonitor:
         if self._running:
             return False
         with self._state_lock:
-            if not load_compression_state(self.state_path)["auto_enabled"]:
+            state = load_compression_state(self.state_path)
+            if not state["auto_enabled"]:
                 return False
+            self._event_cursor = state["next_event_id"] - 1
         self._stop.clear()
         self._running = True
         self._threads = [

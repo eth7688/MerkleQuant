@@ -206,6 +206,41 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
         self.assertEqual(events, [{"event_id": 2, "name": "new"}])
 
+    def test_start_baselines_persisted_auto_enabled_events_before_threads_begin(self):
+        events = []
+        reports = iter((
+            {"evaluated_at": 1, "events": [{"event_id": 1, "name": "historic"}]},
+            {"evaluated_at": 2, "events": [{"event_id": 2, "name": "new"}]},
+        ))
+
+        class DormantThread:
+            def __init__(self, **kwargs):
+                return None
+
+            def start(self):
+                return None
+
+            def join(self, timeout):
+                return None
+
+            def is_alive(self):
+                return False
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root, lambda *args: next(reports), events.extend)
+            monitor.thread_factory = DormantThread
+            state = default_state()
+            state["auto_enabled"] = True
+            state["next_event_id"] = 2
+            save_compression_state(root / "state.json", state)
+            self.assertTrue(monitor.start())
+            monitor.stop()
+            monitor.scan_now("manual")
+            monitor.scan_now("manual")
+
+        self.assertEqual(events, [{"event_id": 2, "name": "new"}])
+
     def test_successful_socket_session_resets_next_retry_delay_to_one_second(self):
         from momentum_compression_monitor import CompressionMonitor
 
