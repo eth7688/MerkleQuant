@@ -31,6 +31,7 @@ def default_state():
         "next_event_id": 1,
         "pool": {},
         "episodes": {},
+        "emitted_event_ids": {},
         "delivery_queue": [],
         "last_structure_scan_at": 0,
         "last_closed_15m_close_time": 0,
@@ -92,6 +93,11 @@ def _validate_state(state):
             raise ValueError(f"invalid {key}")
         for compression_id, item in state[key].items():
             _validate_item(compression_id, item, allow_failed=key == "episodes")
+    if not isinstance(state["emitted_event_ids"], dict):
+        raise ValueError("invalid emitted event registry")
+    for compression_id, event_id in state["emitted_event_ids"].items():
+        if not isinstance(compression_id, str) or not compression_id or not _is_int(event_id) or event_id <= 0:
+            raise ValueError("invalid emitted event registry")
     if not isinstance(state["delivery_queue"], list) or not all(isinstance(event, dict) for event in state["delivery_queue"]):
         raise ValueError("invalid delivery queue")
 
@@ -157,7 +163,7 @@ def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int) 
                 report["added_compression_ids"].append(compression_id)
             item = _pool_item(evaluation, now_ms, prior)
             terminal = out["episodes"].get(compression_id)
-            if terminal is not None and terminal["fresh_emitted"]:
+            if compression_id in out["emitted_event_ids"] or (terminal is not None and terminal["fresh_emitted"]):
                 item["fresh_emitted"] = True
             out["pool"][compression_id] = item
             continue
@@ -179,6 +185,7 @@ def _event(state, item, event_state, price, now_ms):
         "htf_alignment": item.get("htf_alignment", "UNKNOWN"),
         "structure": copy.deepcopy(item),
     }
+    state["emitted_event_ids"][item["compression_id"]] = event["event_id"]
     state["next_event_id"] += 1
     if event["htf_alignment"] == "CONFIRMED":
         state["delivery_queue"].append(copy.deepcopy(event))

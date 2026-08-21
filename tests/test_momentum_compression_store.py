@@ -132,6 +132,24 @@ class CompressionStateMachineTests(unittest.TestCase):
         self.assertEqual([event["event_id"] for event in first], [1])
         self.assertEqual(replay, [])
 
+    def test_structurally_removed_identity_cannot_emit_again_but_new_identity_can(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = reconcile_structure_scan(
+            state, [evaluation(state="REJECTED")], 3_000,
+        )
+        self.assertNotIn("long-episode-1", state["pool"])
+
+        state, _ = reconcile_structure_scan(state, [evaluation()], 4_000)
+        state, replay = apply_live_prices(state, {"TESTUSDT": 110.6}, 5_000)
+        self.assertEqual(replay, [])
+
+        state, _ = reconcile_structure_scan(
+            state, [evaluation(compression_id="long-episode-2", compression_start_time=200)], 6_000,
+        )
+        _, second = apply_live_prices(state, {"TESTUSDT": 110.6}, 7_000)
+        self.assertEqual([event["event_id"] for event in first + second], [1, 2])
+
     def test_nonfinite_live_price_does_not_mutate_pool(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
         with self.assertRaises(ValueError):
