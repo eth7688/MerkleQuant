@@ -119,6 +119,19 @@ class CompressionStateMachineTests(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(replay, [])
 
+    def test_terminal_identity_rediscovery_cannot_emit_a_second_fresh_event(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 105.0}, 3_000)
+        self.assertIn("long-episode-1", state["episodes"])
+
+        state, _ = reconcile_structure_scan(state, [evaluation()], 4_000)
+        state, replay = apply_live_prices(state, {"TESTUSDT": 110.6}, 5_000)
+
+        self.assertTrue(state["pool"]["long-episode-1"]["fresh_emitted"])
+        self.assertEqual([event["event_id"] for event in first], [1])
+        self.assertEqual(replay, [])
+
     def test_nonfinite_live_price_does_not_mutate_pool(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
         with self.assertRaises(ValueError):

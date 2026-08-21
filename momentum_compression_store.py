@@ -155,7 +155,11 @@ def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int) 
         if _eligible(evaluation):
             if prior is None:
                 report["added_compression_ids"].append(compression_id)
-            out["pool"][compression_id] = _pool_item(evaluation, now_ms, prior)
+            item = _pool_item(evaluation, now_ms, prior)
+            terminal = out["episodes"].get(compression_id)
+            if terminal is not None and terminal["fresh_emitted"]:
+                item["fresh_emitted"] = True
+            out["pool"][compression_id] = item
             continue
         if compression_id in out["pool"]:
             del out["pool"][compression_id]
