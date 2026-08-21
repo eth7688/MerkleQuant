@@ -50,6 +50,22 @@ def valid_compression_frame(bars=40):
     })
 
 
+def two_touch_frame():
+    indexes = np.arange(15, dtype=float)
+    high = 105.0 + 0.3 * indexes
+    low = 95.0 + 0.5 * indexes
+    high[[3, 9]] += 2.0
+    low[[5, 11]] -= 2.0
+    return pd.DataFrame({
+        "ot": BASE_OT + (indexes.astype(int) * 900_000),
+        "o": 100.0 + 0.4 * indexes,
+        "h": high,
+        "l": low,
+        "c": 100.0 + 0.4 * indexes,
+        "v": np.full(len(indexes), 1000.0),
+    })
+
+
 class CompressionIndicatorTests(unittest.TestCase):
     def test_default_parameters_match_approved_spec(self):
         params = CompressionParams()
@@ -82,6 +98,20 @@ class CompressionIndicatorTests(unittest.TestCase):
                                evaluated_at_ms=evaluated_at_ms,
                                htf_alignment="UNKNOWN")
         self.assertNotEqual(first["state"], "REJECTED")
+        self.assertEqual(first["compression_id"], second["compression_id"])
+        self.assertEqual(first["upper_boundary_price"], second["upper_boundary_price"])
+
+    def test_nonfinite_unfinished_trailing_bar_is_ignored_before_validation(self):
+        closed = valid_compression_frame()
+        unfinished = closed.iloc[-1].copy()
+        unfinished["ot"] += 900_000
+        unfinished["h"] = np.nan
+        with_unfinished = pd.concat([closed, unfinished.to_frame().T], ignore_index=True)
+        evaluated_at_ms = int(closed["ot"].iloc[-1] + 900_000)
+        first = evaluate_side("TESTUSDT", "LONG", closed, 115.0,
+                              evaluated_at_ms=evaluated_at_ms, htf_alignment="UNKNOWN")
+        second = evaluate_side("TESTUSDT", "LONG", with_unfinished, 115.0,
+                               evaluated_at_ms=evaluated_at_ms, htf_alignment="UNKNOWN")
         self.assertEqual(first["compression_id"], second["compression_id"])
         self.assertEqual(first["upper_boundary_price"], second["upper_boundary_price"])
 
@@ -196,6 +226,16 @@ class CompressionRuleTests(unittest.TestCase):
         rules = _non_length_rules(indicators, "SHORT", CompressionParams(
             min_directional_boundary_touches=4))
         self.assertEqual(len(rules["directional_events"]), 3)
+        self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
+
+    def test_long_default_threshold_rejects_exactly_two_lower_wick_runs(self):
+        rules = _non_length_rules(add_compression_indicators(two_touch_frame()), "LONG", CompressionParams())
+        self.assertEqual(len(rules["directional_events"]), 2)
+        self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
+
+    def test_short_default_threshold_rejects_exactly_two_upper_wick_runs(self):
+        rules = _non_length_rules(add_compression_indicators(two_touch_frame()), "SHORT", CompressionParams())
+        self.assertEqual(len(rules["directional_events"]), 2)
         self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
 
     def test_higher_high_and_higher_low_are_required_for_long(self):

@@ -216,13 +216,14 @@ def evaluate_side(symbol: str, side: str, closed_15m: pd.DataFrame, live_price: 
     # Callers may include their currently forming candle.  A 15m candle is
     # eligible only after its complete interval ends at evaluated_at_ms.
     frame = closed_15m.loc[:, REQUIRED_COLUMNS].copy().reset_index(drop=True)
+    frame["ot"] = pd.to_numeric(frame["ot"], errors="coerce")
+    frame = frame[frame["ot"] + 900_000 <= evaluated_at_ms].reset_index(drop=True)
+    if frame.empty:
+        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NO_CLOSED_CANDLES"], params)
     for column in REQUIRED_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if not np.isfinite(frame.to_numpy(dtype=float)).all():
         return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NONFINITE_OHLCV"], params, len(frame), frame)
-    frame = frame[frame["ot"] + 900_000 <= evaluated_at_ms].reset_index(drop=True)
-    if frame.empty:
-        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NO_CLOSED_CANDLES"], params)
     indicators = add_compression_indicators(frame)
     window, metrics = _maximal_structural_suffix(indicators, side, params)
     bars = len(window)
