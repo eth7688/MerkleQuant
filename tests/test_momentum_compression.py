@@ -75,6 +75,7 @@ class CompressionIndicatorTests(unittest.TestCase):
         self.assertEqual(params.max_ema_distance_atr, 1.0)
         self.assertEqual(params.pre_breakout_distance_atr, 0.35)
         self.assertEqual(params.breakout_buffer_atr, 0.05)
+        self.assertEqual(params.min_directional_boundary_touches, 3)
         self.assertEqual(params.min_bars, 15)
         self.assertEqual(params.max_bars, 100)
 
