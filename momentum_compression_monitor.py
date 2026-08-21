@@ -316,8 +316,12 @@ class CompressionMonitor:
                 app.close()
             except Exception:
                 pass
+        deadline = time.monotonic() + timeout
         for thread in threads:
-            thread.join(timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
         self._stream_connected = False
         with self._lifecycle_lock:
             still_running = self._running and self._active_worker_count > 0

@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from momentum_compression_store import default_state, save_compression_state
 
@@ -278,6 +279,32 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
         self.assertEqual(len(created), 6)
         self.assertTrue(monitor.status()["running"])
+
+    def test_stop_uses_one_total_timeout_budget_for_blocking_workers(self):
+        class BlockingThread:
+            def __init__(self):
+                self.join_timeouts = []
+
+            def join(self, timeout):
+                self.join_timeouts.append(timeout)
+                clock[0] += timeout
+
+            def is_alive(self):
+                return True
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), lambda *args: {"events": []})
+            workers = [BlockingThread() for _ in range(3)]
+            monitor._threads = workers
+            monitor._running = True
+            monitor._active_worker_count = 3
+            clock = [100.0]
+            with patch("momentum_compression_monitor.time.monotonic", side_effect=lambda: clock[0]):
+                self.assertFalse(monitor.stop(timeout=2))
+
+        self.assertEqual(workers[0].join_timeouts, [2])
+        self.assertEqual(workers[1].join_timeouts, [])
+        self.assertEqual(workers[2].join_timeouts, [])
 
     def test_disable_during_worker_start_never_joins_an_unstarted_thread(self):
         created = []
