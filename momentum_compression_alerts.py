@@ -185,6 +185,23 @@ def _public_event(source: dict, alert_id: int, now_ms: int) -> dict:
     return event
 
 
+def _recover_confirmed_queue_unlocked(state: dict, events: list[dict]) -> bool:
+    """Restore queue rows lost after a durable JSONL append but before state write."""
+    queued_ids = {item["alert_id"] for item in state["delivery_queue"]}
+    recovered = False
+    for event in events:
+        if event["htf_alignment"] != "CONFIRMED" or event["alert_id"] in queued_ids:
+            continue
+        state["delivery_queue"].append({
+            "alert_id": event["alert_id"], "event": copy.deepcopy(event),
+            "status": "pending", "attempts": 0, "last_attempt_at": 0,
+            "next_attempt_at": event["created_at"], "last_error": "",
+        })
+        queued_ids.add(event["alert_id"])
+        recovered = True
+    return recovered
+
+
 def append_compression_alerts(events_path: Path, state_path: Path, events: list[dict], now_ms: int) -> list[dict]:
     if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
         raise TypeError("compression alert events must be a list of objects")
@@ -196,6 +213,7 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
     with _event_lock(events_path):
         stored = _read_events_unlocked(events_path)
         state = _load_state_unlocked(state_path)
+        recovered = _recover_confirmed_queue_unlocked(state, stored)
         known = {event["compression_id"] for event in stored}
         created = []
         for source in events:
@@ -216,6 +234,8 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
                 for event in created:
                     handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
                 handle.flush(); os.fsync(handle.fileno())
+            _atomic_write(state_path, state)
+        elif recovered:
             _atomic_write(state_path, state)
         return copy.deepcopy(created)
 
@@ -269,6 +289,8 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             return {"status": "disabled"}
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
+            if _recover_confirmed_queue_unlocked(state, _read_events_unlocked(events_path)):
+                _atomic_write(state_path, state)
             item = next((item for item in state["delivery_queue"] if item["status"] == "pending"), None)
             if item is None:
                 return {"status": "idle"}

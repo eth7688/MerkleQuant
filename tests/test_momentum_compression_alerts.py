@@ -3,7 +3,7 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from momentum_compression_alerts import (
     append_compression_alerts,
@@ -58,6 +58,29 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(append_compression_alerts(events, state, [item], 10)), 1)
             self.assertEqual(append_compression_alerts(events, state, [item], 11), [])
             self.assertEqual(read_public_compression_alerts(events, 0)["latest_alert_id"], 1)
+
+    def test_retry_recovers_confirmed_queue_after_state_write_fails_post_append(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            item = fresh(compression_id="recover-me")
+            with patch("momentum_compression_alerts._atomic_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    append_compression_alerts(events, state, [item], 10)
+
+            self.assertEqual(read_public_compression_alerts(events, 0)["latest_alert_id"], 1)
+            self.assertEqual(append_compression_alerts(events, state, [item], 11), [])
+            self.assertEqual(self.queued_symbols(state), ["AUSDT"])
+
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            self.assertEqual(
+                deliver_due_compression_wechat(settings, state, events, 11, post=Mock(return_value=response))["status"],
+                "delivered",
+            )
+            self.assertEqual(append_compression_alerts(events, state, [item], 12), [])
+            self.assertEqual(self.public_symbols(events), ["AUSDT"])
+            self.assertEqual(self.queued_symbols(state), ["AUSDT"])
 
     def test_baseline_uses_latest_event_without_replaying_history(self):
         with TemporaryDirectory() as folder:
