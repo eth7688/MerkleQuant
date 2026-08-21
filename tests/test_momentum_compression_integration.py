@@ -177,10 +177,10 @@ def run_compression_sound_javascript(body):
         source.index("// ===== SCANNING =====")
     ]
     harness = """
-const assert=require('assert');let storage={},fetchPayload={latest_alert_id:0,events:[]};
+const assert=require('assert');let storage={},fetchPayload={latest_alert_id:0,events:[]},fetches=[];
 global.localStorage={getItem:k=>storage[k]??null,setItem:(k,v)=>storage[k]=String(v)};
 global.window=global;global.document={getElementById:()=>null};
-global.fetch=url=>Promise.resolve({ok:true,json:()=>Promise.resolve(fetchPayload)});
+global.fetch=url=>{fetches.push(url);return Promise.resolve({ok:true,json:()=>Promise.resolve(fetchPayload)});};
 global.setInterval=()=>9;global.clearInterval=()=>{};
 """
     completed = subprocess.run(["node", "-e", harness + script + body], check=True, capture_output=True, text=True, encoding="utf-8")
@@ -199,17 +199,25 @@ class CompressionDashboardUiTests(unittest.TestCase):
 
     def test_renderer_escapes_payload_and_formats_nonfinite_values(self):
         result = render_compression_payload({
-            "monitor": {"auto_enabled": True, "running": True, "last_scan_at": 0},
+            "monitor": {"auto_enabled": True, "running": True, "last_scan_at": 0, "next_scan_at": "2026-08-21T12:15:05+00:00", "last_error": "<b>stream failed</b>"},
             "can_manage": False,
-            "pool_rows": [{"symbol": "<script>alert(1)</script>", "side": "LONG", "state": "PRE_BREAKOUT", "live_price": float("nan"), "compression_bars": float("inf")}],
-            "episode_rows": [{"symbol": "SAFEUSDT", "side": "SHORT", "state": "BREAKOUT_FRESH_SHORT", "live_price": 12.5}],
+            "pool_rows": [
+                {"symbol": "<script>alert(1)</script>", "side": "LONG", "state": "PRE_BREAKOUT", "live_price": float("nan"), "compression_bars": float("inf")},
+                {"symbol": "FRESHUSDT", "side": "SHORT", "state": "BREAKOUT_FRESH_SHORT", "live_price": 12.5, "quality_score": 98, "upper_boundary_price": 13, "lower_boundary_price": 12, "directional_touch_count": 4, "contraction_ratio": 0.5, "ema8": 12.6, "ema21": 12.4, "atr14": 0.2, "last_verified_at": 1},
+                {"symbol": "LOWUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT", "live_price": 12.1, "quality_score": 10},
+            ],
+            "episode_rows": [{"symbol": "FAILEDUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "live_price": 12.5, "quality_score": 20}],
             "rejection_counts": {"<img src=x>": float("inf")},
         })
         rendered = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
         self.assertIn("LONG 观察池", rendered)
         self.assertIn("SHORT 观察池", rendered)
-        self.assertIn("新突破", rendered)
+        self.assertIn("当前突破", rendered)
+        self.assertIn("终止结构", rendered)
         self.assertIn("拒绝统计", rendered)
+        for label in ("边界距离", "触碰", "收敛", "EMA8/21", "ATR", "质量", "下次扫描", "监控错误"):
+            self.assertIn(label, rendered)
+        self.assertLess(rendered.index("FRESH"), rendered.index("LOW"))
         self.assertIn("仅管理员可修改", rendered)
         self.assertNotIn("<script>alert(1)</script>", rendered)
         self.assertIn("&lt;script&gt;", rendered)
@@ -222,9 +230,17 @@ playCompressionCoinSound=()=>{plays++;return Promise.resolve(true);};
 (async()=>{fetchPayload={latest_alert_id:4,events:[]};await setCompressionSoundEnabled(true);
 assert.equal(plays,0);assert.equal(storage[COMPRESSION_ALERT_CURSOR_KEY],'4');
 fetchPayload={latest_alert_id:6,events:[{alert_id:5},{alert_id:6}]};await pollCompressionAlerts();
+assert.deepEqual(fetches,['/api/compression/alerts?after=0','/api/compression/alerts?after=4']);
 assert.equal(plays,1);assert.equal(storage[COMPRESSION_ALERT_CURSOR_KEY],'6');process.stdout.write('ok');})()
 """
         self.assertEqual(run_compression_sound_javascript(body), "ok")
+
+    def test_manual_compression_scan_uses_status_not_global_scan_polling(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+        scan = source[source.index("function doScan()") : source.index("function pollResults()")]
+        self.assertIn("startCompressionManualScan()", scan)
+        self.assertLess(scan.index("startCompressionManualScan()"), scan.index("_pollingScan"))
+        self.assertIn("structure_scanning", source)
 
 
 if __name__ == "__main__":

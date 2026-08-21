@@ -156,11 +156,12 @@ global.clearedTimer=null;global.clearInterval=id=>{global.clearedTimer=id;};
 """
     try:
         completed = subprocess.run(
-            ["node", "-e", harness + script + test_body],
+            ["node", "-"],
             check=True,
             capture_output=True,
             text=True,
             encoding="utf-8",
+            input=harness + script + test_body,
         )
     except subprocess.CalledProcessError as error:
         raise AssertionError(error.stderr) from error
