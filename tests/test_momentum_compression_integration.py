@@ -58,8 +58,8 @@ class CompressionApiTests(unittest.TestCase):
 
     def test_status_maps_alert_and_delivery_facts_to_pool_and_terminal_rows(self):
         self._login()
-        current = {"compression_id": "current", "symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG"}
-        terminal = {"compression_id": "terminal", "symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED"}
+        current = {"compression_id": "current", "symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG", "htf_alignment": "CONFIRMED"}
+        terminal = {"compression_id": "terminal", "symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "htf_alignment": "CONFIRMED"}
         with patch.object(web_ui, "load_compression_state", return_value={"pool": {"current": current}, "episodes": {"terminal": terminal}}), \
              patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
              patch.object(web_ui, "compression_sound_available_ids", return_value={"current"}), \
@@ -69,6 +69,21 @@ class CompressionApiTests(unittest.TestCase):
         self.assertEqual(payload["pool_rows"][0]["wechat_status"], "delivered")
         self.assertEqual(payload["episode_rows"][0]["sound_status"], "unknown")
         self.assertEqual(payload["episode_rows"][0]["wechat_status"], "failed")
+
+    def test_status_marks_unknown_conflict_and_nonconfirmed_rows_not_eligible_for_wechat(self):
+        self._login()
+        pool = {
+            "unknown": {"compression_id": "unknown", "symbol": "UNKNOWNUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG", "htf_alignment": "UNKNOWN"},
+            "conflict": {"compression_id": "conflict", "symbol": "CONFLICTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG", "htf_alignment": "CONFLICT"},
+            "missing": {"compression_id": "missing", "symbol": "MISSINGUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG"},
+        }
+        with patch.object(web_ui, "load_compression_state", return_value={"pool": pool, "episodes": {}}), \
+             patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value=set()), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        self.assertEqual({row["wechat_status"] for row in payload["pool_rows"]}, {"not_eligible"})
 
     def test_only_15m_manual_compression_scan_is_valid(self):
         self.assertEqual(self.client.get("/scan/compression/15m").status_code, 401)
@@ -256,6 +271,19 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", rendered)
         self.assertIn("&lt;i&gt;wechat&lt;/i&gt;", rendered)
         self.assertNotRegex(rendered, r"NaN|Infinity")
+
+    def test_renderer_gives_each_wechat_delivery_state_a_distinct_chinese_label(self):
+        statuses = ("not_eligible", "pending", "delivered", "failed", "indeterminate", "unknown")
+        rows = [
+            {"symbol": f"{index}USDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG",
+             "wechat_status": status}
+            for index, status in enumerate(statuses, 1)
+        ]
+        result = render_compression_payload({"pool_rows": rows, "episode_rows": []})
+        rendered = result["main"]["innerHTML"]
+
+        for label in ("不符合投递条件", "待投递", "已投递", "投递失败", "投递结果待确认", "无投递记录"):
+            self.assertIn(label, rendered)
 
     def test_sound_enable_baselines_then_plays_once_for_new_batch(self):
         body = """

@@ -5,6 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
+import requests
+
 from momentum_compression_alerts import (
     append_compression_alerts,
     baseline_compression_alerts,
@@ -184,31 +186,51 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(sent.call_count, 1)
             self.assertEqual(compression_delivery_statuses(state), {"AUSDT-long-1": "indeterminate"})
 
-    def test_webhook_error_is_sanitized_and_retried(self):
-        with TemporaryDirectory() as folder:
-            events, state, settings = self.paths(Path(folder))
-            webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-1234"
-            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=webhook, updated_by="7", now_ms=1)
-            append_compression_alerts(events, state, [fresh()], 10)
-            failed = Mock(); failed.raise_for_status.side_effect = RuntimeError(f"failed {webhook}")
-            result = deliver_due_compression_wechat(settings, state, events, 10, post=Mock(return_value=failed))
-            raw = state.read_text(encoding="utf-8")
-            self.assertEqual(result["status"], "retry_pending")
-            self.assertNotIn(webhook, raw); self.assertNotIn("secret-1234", raw)
-            self.assertEqual(json.loads(raw)["delivery_queue"][0]["next_attempt_at"], 10 + RETRY_DELAYS_MS[0])
-
-    def test_fifth_failure_marks_terminal_failed(self):
+    def test_read_timeout_after_recorded_request_is_indeterminate_and_never_resent(self):
         with TemporaryDirectory() as folder:
             events, state, settings = self.paths(Path(folder))
             save_alert_settings(settings, wechat_enabled=True,
                 wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
             append_compression_alerts(events, state, [fresh()], 10)
-            failure = Mock(); failure.raise_for_status.side_effect = TimeoutError("timeout")
-            now = 10
-            for _ in range(5):
-                result = deliver_due_compression_wechat(settings, state, events, now, post=Mock(return_value=failure))
-                now = json.loads(state.read_text(encoding="utf-8"))["delivery_queue"][0]["next_attempt_at"]
+            calls = []
+
+            def post(*args, **kwargs):
+                calls.append((args, kwargs))
+                raise requests.ReadTimeout("response timed out after request was sent")
+
+            first = deliver_due_compression_wechat(settings, state, events, 10, post=post)
+            restarted = deliver_due_compression_wechat(settings, state, events, 1_000_000, post=post)
+
+            self.assertEqual(first["status"], "indeterminate")
+            self.assertEqual(restarted["status"], "idle")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(compression_delivery_statuses(state), {"AUSDT-long-1": "indeterminate"})
+
+    def test_rejected_wecom_response_is_sanitized_and_terminal_failed(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-1234"
+            save_alert_settings(settings, wechat_enabled=True, wechat_webhook=webhook, updated_by="7", now_ms=1)
+            append_compression_alerts(events, state, [fresh()], 10)
+            failed = Mock(); failed.raise_for_status.return_value = None; failed.json.return_value = {"errcode": 93000}
+            result = deliver_due_compression_wechat(settings, state, events, 10, post=Mock(return_value=failed))
+            raw = state.read_text(encoding="utf-8")
             self.assertEqual(result["status"], "failed")
+            self.assertNotIn(webhook, raw); self.assertNotIn("secret-1234", raw)
+            self.assertEqual(json.loads(raw)["delivery_queue"][0]["next_attempt_at"], 0)
+
+    def test_explicit_presend_validation_failure_is_retryable_without_http_call(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            append_compression_alerts(events, state, [fresh()], 10)
+            post = Mock()
+            with patch("momentum_compression_alerts.validate_wechat_webhook", side_effect=ValueError("invalid webhook")):
+                result = deliver_due_compression_wechat(settings, state, events, 10, post=post)
+            self.assertEqual(result["status"], "retry_pending")
+            self.assertEqual(post.call_count, 0)
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["delivery_queue"][0]["next_attempt_at"], 10 + RETRY_DELAYS_MS[0])
 
 
 if __name__ == "__main__":

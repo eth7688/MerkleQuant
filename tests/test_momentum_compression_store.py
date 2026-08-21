@@ -265,6 +265,22 @@ class CompressionStatePersistenceTests(unittest.TestCase):
         self.assertEqual(migrated["fresh_outbox"], [])
         self.assertEqual(events, [])
 
+    def test_v1_queue_only_confirmed_event_is_recovered_with_its_original_facts(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, queued = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        queued_event = json.loads(json.dumps(queued[0]))
+        historical = json.loads(json.dumps(state))
+        historical.update(version=1, pool={}, episodes={}, delivery_queue=[queued_event])
+
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(historical), encoding="utf-8")
+            migrated = load_compression_state(path)
+
+        self.assertEqual(migrated["fresh_outbox"], [queued_event])
+        self.assertEqual(migrated["emitted_event_ids"], {queued_event["compression_id"]: queued_event["event_id"]})
+        self.assertEqual(migrated["legacy_unpublished_event_ids"], [])
+
     def test_missing_file_returns_default_state(self):
         with TemporaryDirectory() as folder:
             self.assertEqual(load_compression_state(Path(folder) / "missing.json"), default_state())

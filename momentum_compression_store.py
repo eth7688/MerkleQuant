@@ -193,10 +193,37 @@ def _migrate_v1_state(state: dict) -> dict:
     """Preserve every historic FRESH identity even where v1 queued only CONFIRMED alerts."""
     migrated = dict(state)
     migrated["version"] = STATE_VERSION
-    migrated.pop("delivery_queue", None)
-    events = []
+    queued_events = migrated.pop("delivery_queue", [])
+    events_by_compression_id = {}
+    event_ids = {}
+    for event in queued_events:
+        _validate_fresh_event(event)
+        if event["htf_alignment"] != "CONFIRMED":
+            raise ValueError("v1 delivery queue contains a non-confirmed event")
+        existing = events_by_compression_id.get(event["compression_id"])
+        if existing is not None:
+            if existing != event:
+                raise ValueError("v1 delivery queue contains conflicting compression events")
+            continue
+        existing = event_ids.get(event["event_id"])
+        if existing is not None:
+            raise ValueError("v1 delivery queue contains conflicting event ids")
+        copied = copy.deepcopy(event)
+        events_by_compression_id[copied["compression_id"]] = copied
+        event_ids[copied["event_id"]] = copied
+
+    emitted_event_ids = dict(migrated.get("emitted_event_ids", {}))
+    for compression_id, event in events_by_compression_id.items():
+        existing_id = emitted_event_ids.get(compression_id)
+        if existing_id is not None and existing_id != event["event_id"]:
+            raise ValueError("v1 delivery queue conflicts with emitted event registry")
+        emitted_event_ids[compression_id] = event["event_id"]
+
+    events = list(events_by_compression_id.values())
     unpublished_ids = []
-    for compression_id, event_id in migrated.get("emitted_event_ids", {}).items():
+    for compression_id, event_id in emitted_event_ids.items():
+        if compression_id in events_by_compression_id:
+            continue
         source = migrated.get("pool", {}).get(compression_id) or migrated.get("episodes", {}).get(compression_id)
         if not isinstance(source, dict):
             unpublished_ids.append(event_id)
@@ -219,6 +246,9 @@ def _migrate_v1_state(state: dict) -> dict:
             "htf_alignment": structure.get("htf_alignment") if structure.get("htf_alignment") in {"CONFIRMED", "CONFLICT", "UNKNOWN"} else "UNKNOWN",
             "structure": structure,
         })
+    migrated["emitted_event_ids"] = emitted_event_ids
+    if event_ids:
+        migrated["next_event_id"] = max(migrated["next_event_id"], max(event_ids) + 1)
     migrated["fresh_outbox"] = sorted(events, key=lambda event: event["event_id"])
     migrated["legacy_unpublished_event_ids"] = sorted(unpublished_ids)
     return migrated

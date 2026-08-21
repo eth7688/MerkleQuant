@@ -20,7 +20,7 @@ from momentum_reflow_alerts import (
     RETRY_DELAYS_MS,
     WEBHOOK_PREFIX,
     load_alert_settings,
-    send_wechat_markdown,
+    validate_wechat_webhook,
 )
 from momentum_compression_store import load_compression_state
 
@@ -31,6 +31,14 @@ _EVENT_THREAD_LOCK = threading.RLock()
 _DELIVERY_THREAD_LOCK = threading.Lock()
 _STATE_VERSION = 1
 _DEFAULT_STATE = {"version": _STATE_VERSION, "delivery_queue": []}
+
+
+class _CompressionPreSendValidationError(Exception):
+    pass
+
+
+class _CompressionWeComRejectedError(Exception):
+    pass
 
 
 def _acquire_file_lock(handle) -> None:
@@ -314,6 +322,20 @@ def format_compression_wechat_markdown(event: dict) -> str:
     ))
 
 
+def _send_compression_wechat_markdown(webhook: str, content: str, *, post) -> None:
+    """Keep compression's at-most-once outcome policy independent from reflow."""
+    try:
+        validate_wechat_webhook(webhook)
+    except ValueError as error:
+        raise _CompressionPreSendValidationError(str(error)) from error
+    response = post(webhook, json={"msgtype": "text", "text": {"content": content}}, timeout=5.0)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("errcode") != 0:
+        errcode = payload.get("errcode", "invalid") if isinstance(payload, dict) else "invalid"
+        raise _CompressionWeComRejectedError(f"enterprise wechat rejected request: {errcode}")
+
+
 def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events_path: Path, now_ms: int, *, post=requests.post) -> dict:
     if not _is_int(now_ms):
         raise TypeError("now_ms must be an integer")
@@ -346,16 +368,26 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             item["last_error"] = ""
             _atomic_write(state_path, state)
         try:
-            send_wechat_markdown(settings["wechat_webhook"], format_compression_wechat_markdown(event), post=post)
+            _send_compression_wechat_markdown(
+                settings["wechat_webhook"], format_compression_wechat_markdown(event), post=post,
+            )
             outcome, error_text = "delivered", ""
-        except Exception as error:
+        except _CompressionPreSendValidationError as error:
             outcome, error_text = "retry_pending", _safe_error(error, settings["wechat_webhook"])
+        except (requests.ReadTimeout, requests.ConnectionError) as error:
+            outcome, error_text = "indeterminate", _safe_error(error, settings["wechat_webhook"])
+        except (_CompressionWeComRejectedError, requests.HTTPError) as error:
+            outcome, error_text = "failed", _safe_error(error, settings["wechat_webhook"])
+        except Exception as error:
+            outcome, error_text = "indeterminate", _safe_error(error, settings["wechat_webhook"])
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
             current = next(item for item in state["delivery_queue"] if item["alert_id"] == event["alert_id"])
             current["last_error"] = error_text
             if outcome == "delivered":
                 current["status"] = "delivered"; current["next_attempt_at"] = 0
+            elif outcome in {"failed", "indeterminate"}:
+                current["status"] = outcome; current["next_attempt_at"] = 0
             elif current["attempts"] >= MAX_ATTEMPTS:
                 current["status"] = "failed"; current["next_attempt_at"] = 0; outcome = "failed"
             else:

@@ -1931,10 +1931,12 @@ function compressionDirection(row){return row&&row.side==='SHORT'?'SHORT':'LONG'
 function compressionDeliveryStatus(row, key){
   var value=String((row&&row[key])||'unknown');
   if(value==='available') return '可用';
+  if(value==='not_eligible') return '不符合投递条件';
   if(value==='pending') return '待投递';
   if(value==='delivered') return '已投递';
   if(value==='failed') return '投递失败';
-  return '未知';
+  if(value==='indeterminate') return '投递结果待确认';
+  return '无投递记录';
 }
 function compressionRows(rows, side){
   return (Array.isArray(rows)?rows:[]).filter(function(row){return compressionDirection(row)===side;});
@@ -4503,7 +4505,10 @@ def compression_status():
             item = dict(row)
             compression_id = item.get("compression_id")
             item["sound_status"] = "available" if compression_id in sound_available_ids else "unknown"
-            item["wechat_status"] = wechat_statuses.get(compression_id, "unknown")
+            item["wechat_status"] = (
+                wechat_statuses.get(compression_id, "unknown")
+                if item.get("htf_alignment") == "CONFIRMED" else "not_eligible"
+            )
             mapped.append(item)
         return mapped
 
