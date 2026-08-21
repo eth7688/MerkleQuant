@@ -22,6 +22,11 @@ _POOL_STATES = {
 _ELIGIBLE_DISCOVERY_STATES = {
     "PRE_BREAKOUT", "COMPRESSION_ACTIVE_LONG", "COMPRESSION_ACTIVE_SHORT",
 }
+_POST_FRESH_STATES = {
+    "BREAKOUT_FRESH_LONG", "BREAKOUT_FRESH_SHORT",
+    "BREAKOUT_ACTIVE_LONG", "BREAKOUT_ACTIVE_SHORT",
+    "BREAKOUT_RETRACING_LONG", "BREAKOUT_RETRACING_SHORT",
+}
 
 
 def default_state():
@@ -63,6 +68,8 @@ def _validate_item(compression_id, item, *, allow_failed=False):
     allowed_states = {"BREAKOUT_FAILED"} if allow_failed else _POOL_STATES
     if item.get("state") not in allowed_states or not isinstance(item.get("fresh_emitted"), bool):
         raise ValueError("invalid pool state")
+    if item["state"] in _POST_FRESH_STATES and not item["fresh_emitted"]:
+        raise ValueError("post-fresh state missing fresh marker")
     if item["state"].endswith("_LONG") and item["side"] != "LONG":
         raise ValueError("pool state does not match side")
     if item["state"].endswith("_SHORT") and item["side"] != "SHORT":
@@ -178,7 +185,7 @@ def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int) 
                 item["fresh_emitted"] = True
             out["pool"][compression_id] = item
             continue
-        if compression_id in out["pool"]:
+        if evaluation.get("state") == "REJECTED" and compression_id in out["pool"]:
             del out["pool"][compression_id]
             report["removed_compression_ids"].append(compression_id)
     out["last_structure_scan_at"] = now_ms

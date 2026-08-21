@@ -88,6 +88,15 @@ class CompressionStateMachineTests(unittest.TestCase):
         self.assertNotIn("long-episode-1", state["pool"])
         self.assertEqual(report["removed_compression_ids"], ["long-episode-1"])
 
+    def test_unconfirmed_structure_evaluation_does_not_remove_existing_pool_identity(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, report = reconcile_structure_scan(
+            state, [evaluation(state="BREAKOUT_UNCONFIRMED_LONG")], 2_000,
+        )
+        self.assertIn("long-episode-1", state["pool"])
+        self.assertEqual(state["pool"]["long-episode-1"]["state"], "PRE_BREAKOUT")
+        self.assertEqual(report["removed_compression_ids"], [])
+
     def test_same_identity_boundary_update_does_not_duplicate_or_reset_fresh(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
         state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
@@ -233,6 +242,17 @@ class CompressionStatePersistenceTests(unittest.TestCase):
                     path.write_text(json.dumps(corrupt), encoding="utf-8")
                     with self.assertRaises(ValueError):
                         load_compression_state(path)
+
+    def test_restart_rejects_post_fresh_pool_state_without_fresh_marker(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        item = state["pool"]["long-episode-1"]
+        item["state"] = "BREAKOUT_FRESH_LONG"
+        item["fresh_emitted"] = False
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_compression_state(path)
 
     def test_repeated_save_and_load_are_consistent(self):
         with TemporaryDirectory() as folder:
