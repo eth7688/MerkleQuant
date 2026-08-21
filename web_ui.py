@@ -489,12 +489,14 @@ _compression_alert_stop = threading.Event()
 _compression_alert_wakeup = threading.Event()
 _compression_alert_status = {"running": False, "last_error": "", "last_delivery_at": 0}
 _compression_rejection_counts = {}
+_compression_scan_summary = {"scanned": 0, "eligible": 0, "errors": 0}
 
 def _run_compression_scan(state_path, snapshot_dir):
     report = scan_compression_market(state_path, snapshot_dir)
-    global _compression_rejection_counts
+    global _compression_rejection_counts, _compression_scan_summary
     with _compression_monitor_lock:
         _compression_rejection_counts = dict(report.get("rejection_counts", {}))
+        _compression_scan_summary = {key: int(report.get(key, 0) or 0) for key in ("scanned", "eligible", "errors")}
     return report
 
 _compression_monitor = CompressionMonitor(
@@ -1932,14 +1934,14 @@ function compressionRowHtml(row, index){
   var boundary=finiteRNumber(side==='LONG'?row.upper_boundary_price:row.lower_boundary_price),live=finiteRNumber(row.live_price);
   var distance=boundary===null||live===null||atr===null||atr<=0?'--':(Math.abs(boundary-live)/atr).toFixed(2)+' ATR';
   var bars=compressionNumber(row.compression_bars,0),touches=compressionNumber(row.directional_touch_count,0),contraction=compressionNumber(row.contraction_ratio,3);
-  var ema8=compressionNumber(row.ema8,6),ema21=compressionNumber(row.ema21,6),quality=compressionNumber(row.quality_score,2),verified=compressionTime(row.last_verified_at||row.evaluated_at);
-  return '<tr><td>'+index+'</td><td><b>'+symbol.replace('USDT','')+'</b></td><td class="'+tone+'">'+side+'</td><td>'+state+'</td><td>'+price+'</td><td>'+distance+'</td><td>'+touches+'</td><td>'+contraction+'</td><td>'+ema8+' / '+ema21+'</td><td>'+compressionNumber(row.atr14,6)+'</td><td>'+quality+'</td><td>'+verified+'</td></tr>';
+  var ema8=compressionNumber(row.ema8,6),ema21=compressionNumber(row.ema21,6),quality=compressionNumber(row.quality_score,2),verified=compressionTime(row.last_verified_at||row.evaluated_at),firstSeen=compressionTime(row.first_seen_at);
+  return '<tr><td>'+index+'</td><td><b>'+symbol.replace('USDT','')+'</b></td><td class="'+tone+'">'+side+'</td><td>'+state+'</td><td>'+price+'</td><td>'+bars+'</td><td>'+escapeRHtml(row.htf_alignment||'UNKNOWN')+'</td><td>'+firstSeen+'</td><td>'+distance+'</td><td>'+touches+'</td><td>'+contraction+'</td><td>'+ema8+' / '+ema21+'</td><td>'+compressionNumber(row.atr14,6)+'</td><td>'+quality+'</td><td>'+verified+'</td></tr>';
 }
 function compressionTable(title, rows, side){
   var selected=compressionRows(rows,side).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);}),tone=side==='LONG'?'g':'r';
   var html='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text)"><span class="'+tone+'">'+title+'</span> <span style="color:var(--muted)">'+selected.length+'</span></div>';
-  html+='<table><thead><tr><th>#</th><th>交易对</th><th>方向</th><th>当前状态</th><th>实时价格</th><th>边界距离</th><th>触碰</th><th>收敛</th><th>EMA8/21</th><th>ATR</th><th>质量</th><th>验证时间</th></tr></thead><tbody>';
-  if(!selected.length) html+='<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:18px">暂无候选</td></tr>';
+  html+='<table><thead><tr><th>#</th><th>交易对</th><th>方向</th><th>当前状态</th><th>实时价格</th><th>压缩K线</th><th>大周期</th><th>入池时间</th><th>边界距离</th><th>触碰</th><th>收敛</th><th>EMA8/21</th><th>ATR</th><th>质量</th><th>验证时间</th></tr></thead><tbody>';
+  if(!selected.length) html+='<tr><td colspan="15" style="text-align:center;color:var(--muted);padding:18px">暂无候选</td></tr>';
   for(var i=0;i<selected.length;i++) html+=compressionRowHtml(selected[i],i+1);
   return html+'</tbody></table></section>';
 }
@@ -1957,18 +1959,21 @@ function renderMomentumCompression(payload){
   payload=payload&&typeof payload==='object'?payload:{};
   _compressionPayload=payload;
   var monitor=payload.monitor&&typeof payload.monitor==='object'?payload.monitor:{};
+  var scan=payload.scan&&typeof payload.scan==='object'?payload.scan:{};
+  var alert=payload.alert&&typeof payload.alert==='object'?payload.alert:{};
   var pool=Array.isArray(payload.pool_rows)?payload.pool_rows:[];
   var episodes=Array.isArray(payload.episode_rows)?payload.episode_rows:[];
   var rejections=payload.rejection_counts&&typeof payload.rejection_counts==='object'?payload.rejection_counts:{};
   var canManage=payload.can_manage===true, running=monitor.running===true, auto=monitor.auto_enabled===true;
   var status=running?'运行中':(auto?'待启动':'已关闭');
-  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>本轮新突破</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>下次扫描</span><b>'+compressionTime(monitor.next_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div><div class="reflow-status-card"><span>监控错误</span><b class="r">'+escapeRHtml(monitor.last_error||'--')+'</b></div></div>';
+  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>已扫描</span><b>'+compressionNumber(scan.scanned,0)+'</b></div><div class="reflow-status-card"><span>合格候选</span><b class="g">'+compressionNumber(scan.eligible,0)+'</b></div><div class="reflow-status-card"><span>错误数</span><b class="r">'+compressionNumber(scan.errors,0)+'</b></div><div class="reflow-status-card"><span>本轮新突破</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>下次扫描</span><b>'+compressionTime(monitor.next_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div><div class="reflow-status-card"><span>监控错误</span><b class="r">'+escapeRHtml(monitor.last_error||'--')+'</b></div><div class="reflow-status-card"><span>声音提醒</span><b>'+((localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1')?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>微信投递</span><b>'+compressionTime(alert.last_delivery_at)+'</b></div><div class="reflow-status-card"><span>微信错误</span><b class="r">'+escapeRHtml(alert.last_error||'--')+'</b></div></div>';
   document.getElementById('stats').innerHTML=stats;
   var toggle='<button type="button" class="btn" '+(canManage?'':'disabled title="仅管理员可修改"')+' onclick="setCompressionAutoEnabled('+(!auto)+')">'+(auto?'关闭自动监控':'开启自动监控')+'</button>';
   var controls='<div class="reflow-filter-bar"><span class="reflow-filter-label">15M 已收盘结构 · 池内实时突破 · 只监控不交易</span>'+toggle+(canManage?'':'<span style="color:var(--muted);font-size:11px">仅管理员可修改</span>')+compressionSoundControls()+'</div>';
-  var breakouts=pool.filter(function(row){return String((row||{}).state||'').indexOf('BREAKOUT_')===0;}).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);});
-  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">当前突破 <span class="g">'+breakouts.length+'</span></div>'+(breakouts.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>价格</th><th>质量</th><th>验证时间</th></tr></thead><tbody>'+breakouts.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row);return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(row.quality_score,2)+'</td><td>'+compressionTime(row.last_verified_at||row.evaluated_at)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无当前突破</p></div>')+'</section>';
-  var terminalHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">终止结构 <span style="color:var(--muted)">'+episodes.length+'</span></div>'+(episodes.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>终止状态</th><th>价格</th><th>质量</th></tr></thead><tbody>'+episodes.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row);return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无终止结构</p></div>')+'</section>';
+  var currentBreakoutStates={BREAKOUT_FRESH_LONG:true,BREAKOUT_FRESH_SHORT:true,BREAKOUT_ACTIVE_LONG:true,BREAKOUT_ACTIVE_SHORT:true,BREAKOUT_RETRACING_LONG:true,BREAKOUT_RETRACING_SHORT:true};
+  var breakouts=pool.filter(function(row){return currentBreakoutStates[String((row||{}).state||'')]===true;}).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);});
+  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">当前突破 <span class="g">'+breakouts.length+'</span></div>'+(breakouts.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>突破时间</th><th>突破价格</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>质量</th></tr></thead><tbody>'+breakouts.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at||row.last_price_at||row.last_verified_at||row.evaluated_at)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无当前突破</p></div>')+'</section>';
+  var terminalHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">终止结构 <span style="color:var(--muted)">'+episodes.length+'</span></div>'+(episodes.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>终止状态</th><th>终止时间</th><th>终止价格</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>质量</th></tr></thead><tbody>'+episodes.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--').replace('USDT','')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.last_price_at||row.last_verified_at||row.evaluated_at)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无终止结构</p></div>')+'</section>';
   var rejectionKeys=Object.keys(rejections).sort();
   var rejectionHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">拒绝统计</div><div style="padding:12px 14px;color:var(--text2);font-size:12px">'+(rejectionKeys.length?rejectionKeys.map(function(key){return '<span style="display:inline-block;margin:0 12px 8px 0">'+escapeRHtml(key)+' <b>'+compressionNumber(rejections[key],0)+'</b></span>';}).join(''):'本轮无拒绝统计')+'</div></section>';
   document.getElementById('main').innerHTML=controls+compressionTable('LONG 观察池',pool,'LONG')+compressionTable('SHORT 观察池',pool,'SHORT')+freshHtml+terminalHtml+rejectionHtml;
@@ -2021,8 +2026,10 @@ function ensureCompressionAlertBaseline(generation){
   if(generation!==_compressionAlertGeneration) return Promise.resolve(false);
   if(_compressionAlertBaselinedGeneration===generation) return Promise.resolve(true);
   if(_compressionAlertBaselinePromise) return _compressionAlertBaselinePromise;
-  _compressionAlertBaselinePromise=fetch('/api/compression/alerts?after=0').then(function(response){if(!response.ok) throw new Error('compression baseline failed');return response.json();}).then(function(data){if(generation!==_compressionAlertGeneration) return false;storeCompressionAlertCursor(data.latest_alert_id);_compressionAlertBaselinedGeneration=generation;return true;}).catch(function(){return false;}).then(function(ready){_compressionAlertBaselinePromise=null;return ready;});
-  return _compressionAlertBaselinePromise;
+  var pending=fetch('/api/compression/alerts?after=0').then(function(response){if(!response.ok) throw new Error('compression baseline failed');return response.json();}).then(function(data){if(generation!==_compressionAlertGeneration) return false;storeCompressionAlertCursor(data.latest_alert_id);_compressionAlertBaselinedGeneration=generation;return true;}).catch(function(){return false;});
+  var tracked=pending.then(function(ready){if(_compressionAlertBaselinePromise===tracked) _compressionAlertBaselinePromise=null;return ready;});
+  _compressionAlertBaselinePromise=tracked;
+  return tracked;
 }
 function setCompressionSoundEnabled(enabled){
   var generation=++_compressionAlertGeneration;
@@ -2036,8 +2043,9 @@ function pollCompressionAlerts(){
   if(_compressionAlertPollPromise) return _compressionAlertPollPromise;
   var generation=_compressionAlertGeneration;
   var work=ensureCompressionAlertBaseline(generation).then(function(ready){if(!ready||generation!==_compressionAlertGeneration||localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)!=='1') return null;var cursor=parseInt(localStorage.getItem(COMPRESSION_ALERT_CURSOR_KEY),10);if(!isFinite(cursor)) return null;return fetch('/api/compression/alerts?after='+cursor).then(function(response){if(!response.ok) throw new Error('compression alert poll failed');return response.json();}).then(function(data){return {cursor:cursor,data:data};});}).then(function(result){if(!result||!Array.isArray(result.data.events)||!result.data.events.length||generation!==_compressionAlertGeneration) return;return playCompressionCoinSound(function(){return generation===_compressionAlertGeneration&&localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';}).then(function(played){if(played&&generation===_compressionAlertGeneration) storeCompressionAlertCursor(result.data.latest_alert_id||result.cursor);});}).catch(function(){});
-  _compressionAlertPollPromise=work.then(function(value){_compressionAlertPollPromise=null;return value;});
-  return _compressionAlertPollPromise;
+  var tracked=work.then(function(value){if(_compressionAlertPollPromise===tracked) _compressionAlertPollPromise=null;return value;});
+  _compressionAlertPollPromise=tracked;
+  return tracked;
 }
 function testCompressionCoinSound(){return playCompressionCoinSound();}
 function initCompressionAlertSound(){
@@ -4457,11 +4465,16 @@ def compression_status():
         return jsonify({"error": "压缩监控暂不可用"}), 503
     with _compression_monitor_lock:
         rejection_counts = dict(_compression_rejection_counts)
+        scan_summary = dict(_compression_scan_summary)
+    with _compression_alert_lock:
+        alert_status = dict(_compression_alert_status)
     return jsonify({
         "monitor": monitor,
         "pool_rows": list(compression_state["pool"].values()),
         "episode_rows": list(compression_state["episodes"].values()),
         "rejection_counts": rejection_counts,
+        "scan": scan_summary,
+        "alert": alert_status,
         "can_manage": session.get("role") == "admin",
     })
 

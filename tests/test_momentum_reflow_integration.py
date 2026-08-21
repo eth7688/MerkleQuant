@@ -50,11 +50,12 @@ renderMomentumReflow({json.dumps(payload)});
 process.stdout.write(JSON.stringify(nodes));
 """
     completed = subprocess.run(
-        ["node", "-e", script],
+        ["node", "-"],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 
@@ -82,11 +83,12 @@ setReflowFilter({json.dumps(filter_name)}, {json.dumps(filter_value)});
 process.stdout.write(JSON.stringify({{nodes:nodes,sourceLength:payload.rows.length}}));
 """
     completed = subprocess.run(
-        ["node", "-e", script],
+        ["node", "-"],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 
@@ -185,11 +187,12 @@ global.document={{
 process.stdout.write(nodes.scanLabel.textContent ? 'prompt' : 'empty');
 """
     completed = subprocess.run(
-        ["node", "-e", script],
+        ["node", "-"],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        input=script,
     )
     return completed.stdout
 
