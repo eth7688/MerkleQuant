@@ -775,6 +775,7 @@ process.stdout.write('ok');})()
         response = web_ui.app.test_client().get("/scan/reflow/4h")
 
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "reflow only supports 1h")
 
     def test_renderer_escapes_payload_and_formats_reflow_values(self):
         result = render_reflow_payload({

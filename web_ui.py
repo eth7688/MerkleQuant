@@ -29,6 +29,14 @@ from momentum_reflow_alerts import (
     observe_reflow_alerts,
     read_public_alerts,
 )
+from momentum_compression_alerts import (
+    append_compression_alerts,
+    deliver_due_compression_wechat,
+    read_public_compression_alerts,
+)
+from momentum_compression_monitor import CompressionMonitor
+from momentum_compression_service import scan_compression_market
+from momentum_compression_store import load_compression_state
 
 # 交易引擎实例 (全局单例)
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
@@ -37,6 +45,11 @@ MOMENTUM_REFLOW_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_settings.json"
 MOMENTUM_REFLOW_HISTORY = Path(_BASE_DIR) / "momentum_reflow_daily_signals.json"
 MOMENTUM_REFLOW_ALERT_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_alert_settings.json"
 MOMENTUM_REFLOW_ALERT_LEDGER = Path(_BASE_DIR) / "momentum_reflow_alerts.json"
+MOMENTUM_COMPRESSION_STATE = Path(_BASE_DIR) / "momentum_compression_state.json"
+MOMENTUM_COMPRESSION_EVENTS = Path(_BASE_DIR) / "momentum_compression_events.jsonl"
+MOMENTUM_COMPRESSION_SNAPSHOTS = Path(_BASE_DIR) / "momentum_compression_snapshots"
+MOMENTUM_COMPRESSION_ALERT_STATE = Path(_BASE_DIR) / "momentum_compression_alert_state.json"
+MOMENTUM_COMPRESSION_ALERT_SETTINGS = Path(_BASE_DIR) / "momentum_compression_alert_settings.json"
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -467,6 +480,29 @@ _reflow_alert_status = {
     "last_error": "",
     "last_delivery_at": 0,
 }
+_compression_monitor_lock = threading.Lock()
+_compression_monitor_started = False
+_compression_manual_scan_lock = threading.Lock()
+_compression_alert_lock = threading.Lock()
+_compression_alert_thread = None
+_compression_alert_stop = threading.Event()
+_compression_alert_wakeup = threading.Event()
+_compression_alert_status = {"running": False, "last_error": "", "last_delivery_at": 0}
+_compression_rejection_counts = {}
+
+def _run_compression_scan(state_path, snapshot_dir):
+    report = scan_compression_market(state_path, snapshot_dir)
+    global _compression_rejection_counts
+    with _compression_monitor_lock:
+        _compression_rejection_counts = dict(report.get("rejection_counts", {}))
+    return report
+
+_compression_monitor = CompressionMonitor(
+    MOMENTUM_COMPRESSION_STATE,
+    MOMENTUM_COMPRESSION_SNAPSHOTS,
+    lambda events: _process_compression_events(events, int(time.time() * 1000)),
+    scan=_run_compression_scan,
+)
 
 def _sanitize_reflow_alert_error(error):
     return re.sub(
@@ -4169,6 +4205,142 @@ def _stop_reflow_alert_worker_for_tests():
         ):
             _reflow_alert_thread = None
 
+def _sanitize_compression_alert_error(error):
+    return _sanitize_reflow_alert_error(error)
+
+def _process_compression_events(events, now_ms):
+    try:
+        created = append_compression_alerts(
+            MOMENTUM_COMPRESSION_EVENTS,
+            MOMENTUM_COMPRESSION_ALERT_STATE,
+            events,
+            now_ms,
+        )
+    except Exception as error:
+        with _compression_alert_lock:
+            _compression_alert_status["last_error"] = _sanitize_compression_alert_error(error)
+        return []
+    if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+        _compression_alert_wakeup.set()
+    return created
+
+def _start_compression_monitor():
+    global _compression_monitor_started
+    with _compression_monitor_lock:
+        if _compression_monitor_started:
+            return False
+        started = _compression_monitor.start()
+        if started:
+            _compression_monitor_started = True
+        return started
+
+def _stop_compression_monitor_for_tests():
+    global _compression_monitor_started
+    _compression_monitor.stop(timeout=2)
+    with _compression_monitor_lock:
+        _compression_monitor_started = False
+
+def _compression_alert_worker_loop():
+    with _compression_alert_lock:
+        _compression_alert_status["running"] = True
+    try:
+        while not _compression_alert_stop.is_set():
+            try:
+                result = deliver_due_compression_wechat(
+                    MOMENTUM_COMPRESSION_ALERT_SETTINGS,
+                    MOMENTUM_COMPRESSION_ALERT_STATE,
+                    MOMENTUM_COMPRESSION_EVENTS,
+                    int(time.time() * 1000),
+                )
+                with _compression_alert_lock:
+                    _compression_alert_status["last_error"] = _sanitize_compression_alert_error(result.get("error", ""))
+                    if result.get("status") == "delivered":
+                        _compression_alert_status["last_delivery_at"] = int(time.time() * 1000)
+            except Exception as error:
+                with _compression_alert_lock:
+                    _compression_alert_status["last_error"] = _sanitize_compression_alert_error(error)
+            _compression_alert_wakeup.wait(30)
+            _compression_alert_wakeup.clear()
+    finally:
+        with _compression_alert_lock:
+            _compression_alert_status["running"] = False
+
+def _start_compression_alert_worker():
+    global _compression_alert_thread
+    with _compression_alert_lock:
+        if _compression_alert_thread is not None and _compression_alert_thread.is_alive():
+            return False
+        _compression_alert_stop.clear()
+        worker = threading.Thread(target=_compression_alert_worker_loop, daemon=True)
+        _compression_alert_thread = worker
+        try:
+            worker.start()
+        except Exception:
+            _compression_alert_thread = None
+            raise
+    return True
+
+def _stop_compression_alert_worker_for_tests():
+    global _compression_alert_thread
+    _compression_alert_stop.set()
+    _compression_alert_wakeup.set()
+    with _compression_alert_lock:
+        worker = _compression_alert_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _compression_alert_lock:
+        if _compression_alert_thread is worker and (worker is None or not worker.is_alive()):
+            _compression_alert_thread = None
+
+@app.route("/api/compression/status")
+def compression_status():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    try:
+        compression_state = load_compression_state(MOMENTUM_COMPRESSION_STATE)
+        monitor = _compression_monitor.status()
+    except ValueError:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+    with _compression_monitor_lock:
+        rejection_counts = dict(_compression_rejection_counts)
+    return jsonify({
+        "monitor": monitor,
+        "pool_rows": list(compression_state["pool"].values()),
+        "episode_rows": list(compression_state["episodes"].values()),
+        "rejection_counts": rejection_counts,
+        "can_manage": session.get("role") == "admin",
+    })
+
+@app.route("/api/compression/automation", methods=["POST"])
+def compression_automation():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    if session.get("role") != "admin":
+        return jsonify({"error": "无权限"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+        return jsonify({"error": "enabled must be a boolean"}), 400
+    try:
+        return jsonify(_compression_monitor.set_auto_enabled(payload["enabled"]))
+    except ValueError as error:
+        return jsonify({"error": str(error)[:80]}), 400
+
+@app.route("/api/compression/alerts")
+def compression_alert_events():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    raw = request.args.get("after", "0")
+    try:
+        after_id = int(raw)
+        if after_id < 0:
+            raise ValueError("negative cursor")
+    except (TypeError, ValueError):
+        return jsonify({"error": "after must be a nonnegative integer"}), 400
+    try:
+        return jsonify(read_public_compression_alerts(MOMENTUM_COMPRESSION_EVENTS, after_id))
+    except ValueError:
+        return jsonify({"error": "警报暂不可用"}), 503
+
 @app.route("/api/reflow/automation/status")
 def reflow_automation_status():
     with _reflow_automation_lock:
@@ -4207,10 +4379,21 @@ def reflow_alert_events():
 def do_scan(mode, interval):
     if mode == "reflow" and interval != "1h":
         return jsonify({"error":"reflow only supports 1h"}), 400
+    if mode == "compression" and interval != "15m":
+        return jsonify({"error":"compression only supports 15m"}), 400
     if mode == "reflow":
         if not _start_reflow_scan("manual"):
             return jsonify({"scanning":True,"status":"扫描中..."})
         return jsonify({"scanning":True})
+    if mode == "compression":
+        if not _compression_manual_scan_lock.acquire(blocking=False):
+            return jsonify({"scanning":True,"status":"扫描中..."})
+        try:
+            if not _compression_monitor.scan_now("manual"):
+                return jsonify({"scanning":True,"status":"扫描中..."})
+            return jsonify({"scanning":True})
+        finally:
+            _compression_manual_scan_lock.release()
 
     key = f"{mode}_{interval}"
     def work(progress):
@@ -4651,4 +4834,6 @@ if __name__=="__main__":
     print("  http://127.0.0.1:5000\n")
     _start_reflow_scheduler()
     _start_reflow_alert_worker()
+    _start_compression_monitor()
+    _start_compression_alert_worker()
     app.run(host="0.0.0.0",port=5000,debug=False,threaded=True)
