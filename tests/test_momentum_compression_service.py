@@ -122,8 +122,36 @@ class HtfAlignmentTests(unittest.TestCase):
         self.assertEqual(evaluate_htf_alignment("KEEPUSDT", "LONG", fetch=conflict_fetch)["alignment"], "CONFLICT")
         self.assertEqual(evaluate_htf_alignment("KEEPUSDT", "LONG", fetch=lambda *args, **kwargs: None)["alignment"], "UNKNOWN")
 
+    def test_monotonic_no_pivot_htf_is_unknown_not_explicitly_opposite(self):
+        from momentum_compression_service import evaluate_htf_alignment
+
+        frame = trend_frame("LONG").assign(h=lambda data: data["c"] + 1, l=lambda data: data["c"] - 1)
+        result = evaluate_htf_alignment("KEEPUSDT", "LONG", fetch=lambda *args, **kwargs: frame)
+
+        self.assertEqual(result["alignment"], "UNKNOWN")
+        self.assertEqual(result["timeframes"], {"1h": "UNKNOWN", "4h": "UNKNOWN"})
+
 
 class CompressionScanFailureIsolationTests(unittest.TestCase):
+    def test_live_ticker_rejects_nan_and_infinity(self):
+        from momentum_compression_service import fetch_live_price
+
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    fetch_live_price("KEEPUSDT", get=lambda *args, **kwargs: FakeResponse({"price": value}))
+
+    def test_scan_evaluated_at_uses_actual_scan_time_not_last_candle_close(self):
+        from momentum_compression_service import _scan_symbol
+
+        frame = trend_frame("LONG", 220)
+        with patch("momentum_compression_service.fetch_klines", return_value=frame), \
+             patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+             patch("momentum_compression_service.evaluate_both_sides", return_value=[]) as evaluate:
+            _scan_symbol("KEEPUSDT", evaluated_at_ms=9_999_999)
+
+        self.assertEqual(evaluate.call_args.kwargs["evaluated_at_ms"], 9_999_999)
+
     def test_discovery_uses_current_ticker_and_rejects_already_crossed_structure(self):
         from momentum_compression_service import _scan_symbol
 
@@ -159,6 +187,29 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
 
         self.assertEqual(list(stored["pool"]), ["old"])
         self.assertEqual(stored["pool"]["old"]["compression_end_time"], BASE_TIME + 900_000)
+
+    def test_continuation_snapshot_keeps_original_identity_and_never_creates_new_id_file(self):
+        from momentum_compression_service import scan_compression_market
+
+        frame = trend_frame("LONG", 220)
+        old = eligible_evaluation(compression_id="old", compression_start_time=BASE_TIME)
+        continued = eligible_evaluation(compression_id="new", compression_start_time=BASE_TIME,
+                                        compression_end_time=BASE_TIME + 900_000)
+        rejected = {**eligible_evaluation(), "side": "SHORT", "compression_id": "short", "state": "REJECTED"}
+        with TemporaryDirectory() as folder:
+            root, state_path = Path(folder), Path(folder) / "state.json"
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_klines", return_value=frame), \
+                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": "ALIGNED", "4h": "ALIGNED"}}), \
+                 patch("momentum_compression_service.evaluate_both_sides", side_effect=([old, rejected], [continued, rejected])):
+                scan_compression_market(state_path, root / "momentum_compression_snapshots")
+                scan_compression_market(state_path, root / "momentum_compression_snapshots")
+            item = load_compression_state(state_path)["pool"]["old"]
+            snapshot = root / item["ohlcv_snapshot_ref"]
+            self.assertEqual(item["ohlcv_snapshot_ref"], "momentum_compression_snapshots/old.json")
+            self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8"))["compression_id"], "old")
+            self.assertFalse((root / "momentum_compression_snapshots" / "new.json").exists())
 
     def test_snapshot_is_selected_window_and_reference_is_persisted_before_reconcile(self):
         from momentum_compression_service import scan_compression_market

@@ -42,6 +42,32 @@ def evaluation(**overrides):
 
 
 class CompressionStateMachineTests(unittest.TestCase):
+    def test_new_start_retires_old_symbol_side_before_any_new_live_fresh(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="old", compression_start_time=100)], 1_000)
+        state, _ = reconcile_structure_scan(state, [evaluation(compression_id="new", compression_start_time=200)], 2_000)
+
+        self.assertEqual(list(state["pool"]), ["new"])
+        _, events = apply_live_prices(state, {"TESTUSDT": 110.6}, 3_000)
+        self.assertEqual([event["compression_id"] for event in events], ["new"])
+
+    def test_successful_rejected_result_retires_matching_old_lineage(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="old")], 1_000)
+        state, report = reconcile_structure_scan(
+            state, [evaluation(compression_id="new", compression_start_time=200, state="REJECTED")], 2_000,
+        )
+
+        self.assertEqual(state["pool"], {})
+        self.assertEqual(report["removed_compression_ids"], ["old"])
+
+    def test_successful_universe_omission_retires_old_symbol_but_failed_omission_preserves_it(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        preserved, _ = reconcile_structure_scan(state, [], 2_000, successful_symbols=set())
+        removed, report = reconcile_structure_scan(state, [], 2_000, successful_symbols={"TESTUSDT"})
+
+        self.assertIn("long-episode-1", preserved["pool"])
+        self.assertEqual(removed["pool"], {})
+        self.assertEqual(report["removed_compression_ids"], ["long-episode-1"])
+
     def test_every_fresh_is_added_to_the_durable_outbox(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
         state, events = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
@@ -194,6 +220,51 @@ class CompressionStateMachineTests(unittest.TestCase):
 
 
 class CompressionStatePersistenceTests(unittest.TestCase):
+    def test_v1_migration_builds_outbox_for_all_historical_fresh_tiers(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="pool")], 1)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2)
+        for compression_id, event_id, alignment in (("episode-unknown", 2, "UNKNOWN"), ("episode-conflict", 3, "CONFLICT")):
+            episode = json.loads(json.dumps(state["pool"]["pool"]))
+            episode.update({"compression_id": compression_id, "state": "BREAKOUT_FAILED", "htf_alignment": alignment})
+            state["episodes"][compression_id] = episode
+            state["emitted_event_ids"][compression_id] = event_id
+        state["next_event_id"] = 4
+        historical = json.loads(json.dumps(state))
+        historical["version"] = 1
+        historical["delivery_queue"] = [historical.pop("fresh_outbox")[0]]
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(historical), encoding="utf-8")
+            migrated = load_compression_state(path)
+
+        self.assertEqual(migrated["version"], STATE_VERSION)
+        self.assertEqual(
+            {event["compression_id"] for event in migrated["fresh_outbox"]},
+            {"pool", "episode-unknown", "episode-conflict"},
+        )
+        self.assertEqual({event["event_id"] for event in migrated["fresh_outbox"]}, {1, 2, 3})
+        self.assertEqual(
+            {event["htf_alignment"] for event in migrated["fresh_outbox"]},
+            {"CONFIRMED", "UNKNOWN", "CONFLICT"},
+        )
+
+    def test_v1_orphan_registry_is_retained_without_fabricating_a_public_event(self):
+        legacy = {
+            "version": 1, "auto_enabled": False, "next_event_id": 2,
+            "pool": {}, "episodes": {}, "emitted_event_ids": {"lost-history": 1},
+            "delivery_queue": [], "last_structure_scan_at": 0,
+            "last_closed_15m_close_time": 0, "last_error": "",
+        }
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = load_compression_state(path)
+            migrated, _ = reconcile_structure_scan(migrated, [evaluation(compression_id="lost-history")], 1)
+            _, events = apply_live_prices(migrated, {"TESTUSDT": 110.6}, 2)
+
+        self.assertEqual(migrated["fresh_outbox"], [])
+        self.assertEqual(events, [])
+
     def test_missing_file_returns_default_state(self):
         with TemporaryDirectory() as folder:
             self.assertEqual(load_compression_state(Path(folder) / "missing.json"), default_state())

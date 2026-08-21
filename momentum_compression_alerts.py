@@ -162,7 +162,7 @@ def _load_state_unlocked(state_path: Path) -> dict:
         event = item.get("event") if isinstance(item, dict) else None
         if (not isinstance(item, dict) or set(item) != {"alert_id", "event", "status", "attempts", "last_attempt_at", "next_attempt_at", "last_error"}
                 or not _is_int(item.get("alert_id")) or item["alert_id"] <= 0
-                or item["status"] not in {"pending", "delivered", "failed"}
+                or item["status"] not in {"pending", "in_flight", "delivered", "failed", "indeterminate"}
                 or not _is_int(item["attempts"]) or not 0 <= item["attempts"] <= MAX_ATTEMPTS
                 or not _is_int(item["last_attempt_at"]) or item["last_attempt_at"] < 0
                 or not _is_int(item["next_attempt_at"]) or item["next_attempt_at"] < 0
@@ -200,6 +200,18 @@ def _recover_confirmed_queue_unlocked(state: dict, events: list[dict]) -> bool:
         })
         queued_ids.add(event["alert_id"])
         recovered = True
+    return recovered
+
+
+def _mark_interrupted_deliveries_unlocked(state: dict) -> bool:
+    """A WeCom send may have succeeded before a crash; never auto-send it again."""
+    recovered = False
+    for item in state["delivery_queue"]:
+        if item["status"] == "in_flight":
+            item["status"] = "indeterminate"
+            item["last_error"] = "delivery outcome is indeterminate after interrupted HTTP attempt"
+            item["next_attempt_at"] = 0
+            recovered = True
     return recovered
 
 
@@ -271,7 +283,7 @@ def compression_delivery_statuses(state_path: Path) -> dict[str, str]:
     with _delivery_lock(Path(state_path)):
         state = _load_state_unlocked(Path(state_path))
         return {
-            item["event"]["compression_id"]: item["status"]
+            item["event"]["compression_id"]: ("indeterminate" if item["status"] == "in_flight" else item["status"])
             for item in state["delivery_queue"]
         }
 
@@ -316,7 +328,8 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             return {"status": "disabled"}
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
-            if _recover_confirmed_queue_unlocked(state, _read_events_unlocked(events_path)):
+            if (_recover_confirmed_queue_unlocked(state, _read_events_unlocked(events_path))
+                    or _mark_interrupted_deliveries_unlocked(state)):
                 _atomic_write(state_path, state)
             item = next((item for item in state["delivery_queue"] if item["status"] == "pending"), None)
             if item is None:
@@ -324,6 +337,14 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             if item["next_attempt_at"] > now_ms:
                 return {"status": "waiting_retry", "alert_id": item["alert_id"]}
             event = copy.deepcopy(item["event"])
+            # WeCom has no idempotency key: persist intent before HTTP so a
+            # post-send crash is reported as indeterminate, not duplicated.
+            item["status"] = "in_flight"
+            item["attempts"] += 1
+            item["last_attempt_at"] = now_ms
+            item["next_attempt_at"] = 0
+            item["last_error"] = ""
+            _atomic_write(state_path, state)
         try:
             send_wechat_markdown(settings["wechat_webhook"], format_compression_wechat_markdown(event), post=post)
             outcome, error_text = "delivered", ""
@@ -332,14 +353,13 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
             current = next(item for item in state["delivery_queue"] if item["alert_id"] == event["alert_id"])
-            current["attempts"] += 1
-            current["last_attempt_at"] = now_ms
             current["last_error"] = error_text
             if outcome == "delivered":
                 current["status"] = "delivered"; current["next_attempt_at"] = 0
             elif current["attempts"] >= MAX_ATTEMPTS:
                 current["status"] = "failed"; current["next_attempt_at"] = 0; outcome = "failed"
             else:
+                current["status"] = "pending"
                 current["next_attempt_at"] = now_ms + RETRY_DELAYS_MS[min(current["attempts"] - 1, len(RETRY_DELAYS_MS) - 1)]
             _atomic_write(state_path, state)
         return {"status": outcome, "alert_id": event["alert_id"], "error": error_text}

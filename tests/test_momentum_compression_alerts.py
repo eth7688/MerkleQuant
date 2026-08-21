@@ -156,6 +156,34 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(sorted(item["status"] for item in results), ["delivered", "idle"])
 
+    def test_post_send_state_write_failure_becomes_indeterminate_and_never_resends(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            append_compression_alerts(events, state, [fresh()], 10)
+            response = Mock(); response.raise_for_status.return_value = None; response.json.return_value = {"errcode": 0}
+            sent = Mock(return_value=response)
+            from momentum_compression_alerts import _atomic_write as real_atomic_write
+            writes = 0
+
+            def fail_final_write(path, payload):
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("post-send disk full")
+                real_atomic_write(path, payload)
+
+            with patch("momentum_compression_alerts._atomic_write", side_effect=fail_final_write):
+                with self.assertRaisesRegex(OSError, "post-send"):
+                    deliver_due_compression_wechat(settings, state, events, 10, post=sent)
+
+            self.assertEqual(sent.call_count, 1)
+            restarted = deliver_due_compression_wechat(settings, state, events, 20, post=sent)
+            self.assertEqual(restarted["status"], "idle")
+            self.assertEqual(sent.call_count, 1)
+            self.assertEqual(compression_delivery_statuses(state), {"AUSDT-long-1": "indeterminate"})
+
     def test_webhook_error_is_sanitized_and_retried(self):
         with TemporaryDirectory() as folder:
             events, state, settings = self.paths(Path(folder))

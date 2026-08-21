@@ -1,6 +1,7 @@
 """Binance Futures market scan coordinator for 15 minute compression signals."""
 
 import copy
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -17,6 +18,7 @@ from momentum_compression import (
 from momentum_compression_store import (
     compression_state_lock,
     load_compression_state,
+    effective_compression_id,
     reconcile_structure_scan,
     save_compression_state,
     write_compression_snapshot,
@@ -36,7 +38,7 @@ def fetch_live_price(symbol: str, *, get=requests.get) -> float:
     response = get(f"{FUTURES_BASE}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
     response.raise_for_status()
     price = float(response.json()["price"])
-    if price <= 0:
+    if not math.isfinite(price) or price <= 0:
         raise ValueError("ticker price is unavailable")
     return price
 
@@ -65,22 +67,29 @@ def fetch_compression_universe(*, get=requests.get) -> tuple[list[str], dict[str
     return symbols, volumes
 
 
-def _htf_direction(frame: pd.DataFrame, side: str) -> bool | None:
+def _htf_direction(frame: pd.DataFrame, side: str) -> str:
     required = {"ot", "o", "h", "l", "c", "v"}
     if not isinstance(frame, pd.DataFrame) or len(frame) < 5 or not required.issubset(frame):
-        return None
+        return "UNKNOWN"
     try:
         indicators = add_compression_indicators(frame.loc[:, ["ot", "o", "h", "l", "c", "v"]])
         if not pd.notna(indicators[["ema8", "ema21"]].to_numpy()).all():
-            return None
+            return "UNKNOWN"
         pivots_high, pivots_low = _pivots(indicators, 2)
         swing = _swing_structure(indicators, pivots_high, pivots_low, side)
         last = indicators.iloc[-1]
         if side == "LONG":
-            return bool(last["ema8"] > last["ema21"] and last["c"] > max(last["ema8"], last["ema21"]) and swing["valid"])
-        return bool(last["ema8"] < last["ema21"] and last["c"] < min(last["ema8"], last["ema21"]) and swing["valid"])
+            aligned = last["ema8"] > last["ema21"] and last["c"] > max(last["ema8"], last["ema21"])
+            opposite = last["ema8"] < last["ema21"] and last["c"] < min(last["ema8"], last["ema21"])
+        else:
+            aligned = last["ema8"] < last["ema21"] and last["c"] < min(last["ema8"], last["ema21"])
+            opposite = last["ema8"] > last["ema21"] and last["c"] > max(last["ema8"], last["ema21"])
+        if aligned and swing["valid"]:
+            return "ALIGNED"
+        opposite_swing = _swing_structure(indicators, pivots_high, pivots_low, "SHORT" if side == "LONG" else "LONG")
+        return "OPPOSITE" if opposite and opposite_swing["valid"] else "UNKNOWN"
     except (KeyError, TypeError, ValueError):
-        return None
+        return "UNKNOWN"
 
 
 def evaluate_htf_alignment(symbol: str, side: str, *, fetch=fetch_klines) -> dict:
@@ -95,26 +104,26 @@ def evaluate_htf_alignment(symbol: str, side: str, *, fetch=fetch_klines) -> dic
         except Exception:
             frame = None
         verdicts[interval] = _htf_direction(frame, side)
-    if any(verdict is None for verdict in verdicts.values()):
-        alignment = "UNKNOWN"
-    elif all(verdicts.values()):
+    if all(verdict == "ALIGNED" for verdict in verdicts.values()):
         alignment = "CONFIRMED"
-    else:
+    elif any(verdict == "OPPOSITE" for verdict in verdicts.values()):
         alignment = "CONFLICT"
+    else:
+        alignment = "UNKNOWN"
     return {"alignment": alignment, "timeframes": verdicts}
 
 
-def _scan_symbol(symbol: str) -> tuple[list[dict], dict[str, pd.DataFrame], int]:
+def _scan_symbol(symbol: str, *, evaluated_at_ms: int | None = None) -> tuple[list[dict], dict[str, pd.DataFrame], int]:
     frame = fetch_klines(
         symbol, "15m", 220, exchange="binance", closed_only=True,
         market_type="futures", testnet=False,
     )
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError("15m candle history is unavailable")
-    close_ms = int(frame["ot"].iloc[-1]) + 900_000
+    evaluated_at_ms = int(time.time() * 1000) if evaluated_at_ms is None else evaluated_at_ms
     price = fetch_live_price(symbol)
     evaluations = evaluate_both_sides(
-        symbol, frame, price, evaluated_at_ms=close_ms,
+        symbol, frame, price, evaluated_at_ms=evaluated_at_ms,
         htf_alignment_by_side={"LONG": "UNKNOWN", "SHORT": "UNKNOWN"},
     )
     for evaluation in evaluations:
@@ -124,7 +133,7 @@ def _scan_symbol(symbol: str) -> tuple[list[dict], dict[str, pd.DataFrame], int]
             evaluation["htf_timeframes"] = htf.get("timeframes", {"1h": None, "4h": None})
         if evaluation["state"] not in _ELIGIBLE_STATES:
             evaluation["htf_timeframes"] = {"1h": None, "4h": None}
-    return evaluations, {row["compression_id"]: frame for row in evaluations if row["state"] in _ELIGIBLE_STATES}, close_ms
+    return evaluations, {symbol: frame}, int(frame["ot"].iloc[-1]) + 900_000
 
 
 def _mark_unavailable(state: dict, symbol: str) -> None:
@@ -147,7 +156,7 @@ def scan_compression_market(
     errors, close_times, failed_symbols = 0, [], []
     workers = min(12, max(1, max_workers))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_scan_symbol, symbol): symbol for symbol in symbols}
+        futures = {executor.submit(_scan_symbol, symbol, evaluated_at_ms=now_ms): symbol for symbol in symbols}
         for completed, future in enumerate(as_completed(futures), start=1):
             symbol = futures[future]
             try:
@@ -161,18 +170,26 @@ def scan_compression_market(
                 close_times.append(close_ms)
             if progress is not None:
                 progress(completed, len(symbols))
-    for row in evaluations:
-        if row["state"] in _ELIGIBLE_STATES:
-            selected = frames[row["compression_id"]]
-            selected = selected[(selected["ot"] >= row["compression_start_time"]) & (selected["ot"] <= row["compression_end_time"])].reset_index(drop=True)
-            row["ohlcv_snapshot_ref"] = write_compression_snapshot(snapshot_dir, row, selected)
     # Reload only for the short persistence transaction: live prices may have
     # advanced while network-bound discovery was in progress.
     with compression_state_lock(state_path):
         state = load_compression_state(state_path)
         for symbol in failed_symbols:
             _mark_unavailable(state, symbol)
-        state, reconciliation = reconcile_structure_scan(state, evaluations, now_ms)
+        for row in evaluations:
+            if row["state"] not in _ELIGIBLE_STATES:
+                continue
+            row["compression_id"] = effective_compression_id(state, row)
+            prior = state["pool"].get(row["compression_id"])
+            if prior and prior.get("ohlcv_snapshot_ref"):
+                row["ohlcv_snapshot_ref"] = prior["ohlcv_snapshot_ref"]
+                continue
+            selected = frames[row["symbol"]]
+            selected = selected[(selected["ot"] >= row["compression_start_time"]) & (selected["ot"] <= row["compression_end_time"])].reset_index(drop=True)
+            row["ohlcv_snapshot_ref"] = write_compression_snapshot(snapshot_dir, row, selected)
+        state, reconciliation = reconcile_structure_scan(
+            state, evaluations, now_ms, successful_symbols=set(symbols) - set(failed_symbols),
+        )
         state["last_closed_15m_close_time"] = max(
             close_times, default=state["last_closed_15m_close_time"]
         )

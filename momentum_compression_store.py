@@ -42,6 +42,7 @@ def default_state():
         "episodes": {},
         "emitted_event_ids": {},
         "fresh_outbox": [],
+        "legacy_unpublished_event_ids": [],
         "last_structure_scan_at": 0,
         "last_closed_15m_close_time": 0,
         "last_error": "",
@@ -178,8 +179,49 @@ def _validate_state(state):
         if event["event_id"] in outbox_ids or state["emitted_event_ids"].get(event["compression_id"]) != event["event_id"]:
             raise ValueError("invalid fresh outbox")
         outbox_ids.add(event["event_id"])
-    if outbox_ids != set(state["emitted_event_ids"].values()):
+    if (not isinstance(state["legacy_unpublished_event_ids"], list)
+            or not all(_is_int(event_id) and event_id > 0 for event_id in state["legacy_unpublished_event_ids"])):
+        raise ValueError("invalid legacy unpublished event registry")
+    legacy_unpublished_ids = set(state["legacy_unpublished_event_ids"])
+    if len(legacy_unpublished_ids) != len(state["legacy_unpublished_event_ids"]) or not legacy_unpublished_ids.issubset(event_ids):
+        raise ValueError("invalid legacy unpublished event registry")
+    if outbox_ids != set(state["emitted_event_ids"].values()) - legacy_unpublished_ids:
         raise ValueError("fresh outbox does not match emitted registry")
+
+
+def _migrate_v1_state(state: dict) -> dict:
+    """Preserve every historic FRESH identity even where v1 queued only CONFIRMED alerts."""
+    migrated = dict(state)
+    migrated["version"] = STATE_VERSION
+    migrated.pop("delivery_queue", None)
+    events = []
+    unpublished_ids = []
+    for compression_id, event_id in migrated.get("emitted_event_ids", {}).items():
+        source = migrated.get("pool", {}).get(compression_id) or migrated.get("episodes", {}).get(compression_id)
+        if not isinstance(source, dict):
+            unpublished_ids.append(event_id)
+            continue
+        structure = copy.deepcopy(source)
+        side = structure.get("side")
+        structure["compression_id"] = compression_id
+        structure["fresh_emitted"] = True
+        structure["state"] = f"BREAKOUT_ACTIVE_{side}"
+        price = structure.get("breakout_price", structure.get("live_price"))
+        if price is None:
+            price = (structure.get("upper_boundary_price", 0) + structure.get("breakout_buffer_price", 0)
+                     if side == "LONG" else structure.get("lower_boundary_price", 0) - structure.get("breakout_buffer_price", 0))
+        events.append({
+            "event_id": event_id,
+            "compression_id": compression_id,
+            "state": f"BREAKOUT_FRESH_{side}",
+            "event_at": structure.get("breakout_at", structure.get("last_price_at", structure.get("last_verified_at", 0))),
+            "live_price": price,
+            "htf_alignment": structure.get("htf_alignment") if structure.get("htf_alignment") in {"CONFIRMED", "CONFLICT", "UNKNOWN"} else "UNKNOWN",
+            "structure": structure,
+        })
+    migrated["fresh_outbox"] = sorted(events, key=lambda event: event["event_id"])
+    migrated["legacy_unpublished_event_ids"] = sorted(unpublished_ids)
+    return migrated
 
 
 def load_compression_state(path: Path) -> dict:
@@ -191,9 +233,10 @@ def load_compression_state(path: Path) -> dict:
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("compression state is corrupt") from error
     if state.get("version") == 1 and "delivery_queue" in state:
+        state = _migrate_v1_state(state)
+    elif state.get("version") == STATE_VERSION and set(state) == set(default_state()) - {"legacy_unpublished_event_ids"}:
         state = dict(state)
-        state["version"] = STATE_VERSION
-        state["fresh_outbox"] = list(state.pop("delivery_queue"))
+        state["legacy_unpublished_event_ids"] = []
     _validate_state(state)
     return state
 
@@ -231,33 +274,57 @@ def _pool_item(evaluation, now_ms, previous=None):
         for key in ("breakout_at", "breakout_price"):
             if key in previous:
                 item[key] = previous[key]
+        if "ohlcv_snapshot_ref" in previous:
+            item["ohlcv_snapshot_ref"] = previous["ohlcv_snapshot_ref"]
     return item
 
 
-def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int) -> tuple[dict, dict]:
+def effective_compression_id(state: dict, evaluation: dict) -> str:
+    """Return the durable identity only for a same-start, same-symbol continuation."""
+    compression_id = evaluation.get("compression_id")
+    if not isinstance(compression_id, str) or not compression_id:
+        raise ValueError("evaluation compression_id is required")
+    if not _eligible(evaluation):
+        return compression_id
+    for prior_id, prior in state["pool"].items():
+        if (prior.get("symbol") == evaluation.get("symbol") and prior.get("side") == evaluation.get("side")
+                and prior.get("compression_start_time") == evaluation.get("compression_start_time")):
+            return prior_id
+    return compression_id
+
+
+def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int, *, successful_symbols=None) -> tuple[dict, dict]:
     _validate_state(state)
     _require_nonnegative_int(now_ms, "now_ms")
     if not isinstance(evaluations, list) or not all(isinstance(row, dict) for row in evaluations):
         raise ValueError("evaluations must be a list of dictionaries")
+    if successful_symbols is not None and (not isinstance(successful_symbols, set)
+                                            or not all(isinstance(symbol, str) and symbol for symbol in successful_symbols)):
+        raise ValueError("successful_symbols must be a set of symbols")
     out = copy.deepcopy(state)
     report = {"fresh_events": [], "added_compression_ids": [], "removed_compression_ids": []}
+    observed_pairs = set()
     for evaluation in evaluations:
         compression_id = evaluation.get("compression_id")
         if not isinstance(compression_id, str) or not compression_id:
             raise ValueError("evaluation compression_id is required")
-        prior = out["pool"].get(compression_id)
-        if prior is None and _eligible(evaluation):
-            # A still-valid episode naturally receives a new end-candle in its
-            # hash.  Keep its durable identity while its original window start
-            # is unchanged, rather than creating concurrent watches/FRESHes.
-            prior_id, prior = next(((key, item) for key, item in out["pool"].items()
-                                    if item.get("symbol") == evaluation.get("symbol")
-                                    and item.get("side") == evaluation.get("side")
-                                    and item.get("compression_start_time") == evaluation.get("compression_start_time")), (None, None))
-            if prior is not None:
+        symbol, side = evaluation.get("symbol"), evaluation.get("side")
+        if not isinstance(symbol, str) or not symbol or side not in {"LONG", "SHORT"}:
+            raise ValueError("evaluation symbol and side are required")
+        observed_pairs.add((symbol, side))
+        if _eligible(evaluation):
+            durable_id = effective_compression_id(out, evaluation)
+            if durable_id != compression_id:
                 evaluation = copy.deepcopy(evaluation)
-                evaluation["compression_id"] = prior_id
-                compression_id = prior_id
+                evaluation["compression_id"] = durable_id
+                compression_id = durable_id
+            # A changed start is a new structure: remove its predecessor before
+            # it can receive another live tick or coexist in the pool.
+            for stale_id, stale in list(out["pool"].items()):
+                if stale_id != compression_id and stale.get("symbol") == symbol and stale.get("side") == side:
+                    del out["pool"][stale_id]
+                    report["removed_compression_ids"].append(stale_id)
+        prior = out["pool"].get(compression_id)
         if _eligible(evaluation):
             if prior is None:
                 report["added_compression_ids"].append(compression_id)
@@ -267,9 +334,16 @@ def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int) 
                 item["fresh_emitted"] = True
             out["pool"][compression_id] = item
             continue
-        if evaluation.get("state") == "REJECTED" and compression_id in out["pool"]:
-            del out["pool"][compression_id]
-            report["removed_compression_ids"].append(compression_id)
+        if evaluation.get("state") == "REJECTED":
+            for stale_id, stale in list(out["pool"].items()):
+                if stale.get("symbol") == symbol and stale.get("side") == side:
+                    del out["pool"][stale_id]
+                    report["removed_compression_ids"].append(stale_id)
+    if successful_symbols is not None:
+        for stale_id, stale in list(out["pool"].items()):
+            if stale.get("symbol") in successful_symbols and (stale.get("symbol"), stale.get("side")) not in observed_pairs:
+                del out["pool"][stale_id]
+                report["removed_compression_ids"].append(stale_id)
     out["last_structure_scan_at"] = now_ms
     _validate_state(out)
     return out, report
