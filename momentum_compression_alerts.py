@@ -22,6 +22,7 @@ from momentum_reflow_alerts import (
     load_alert_settings,
     send_wechat_markdown,
 )
+from momentum_compression_store import load_compression_state
 
 
 _EVENT_LOCK_NAME = ".momentum_compression_alerts.lock"
@@ -240,6 +241,12 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
         return copy.deepcopy(created)
 
 
+def drain_compression_outbox(compression_state_path: Path, events_path: Path, alert_state_path: Path, now_ms: int) -> list[dict]:
+    """Idempotently publish every durable FRESH event after a restart or callback failure."""
+    state = load_compression_state(Path(compression_state_path))
+    return append_compression_alerts(events_path, alert_state_path, state["fresh_outbox"], now_ms)
+
+
 def read_public_compression_alerts(events_path: Path, after_id: int) -> dict:
     if not _is_int(after_id) or after_id < 0:
         raise ValueError("after_id must be a nonnegative integer")
@@ -282,10 +289,14 @@ def format_compression_wechat_markdown(event: dict) -> str:
     return "\n".join((
         "【AXIOM 动能压缩破位警报】", "",
         f"{structure['symbol']} · {structure['side']}",
-        f"破位价格：{event['live_price']}", f"状态：{event['state']}",
-        f"高周期确认：{event['htf_alignment']}",
+        f"触发价格：{event['live_price']}", f"状态：{event['state']}",
+        f"突破边界/缓冲：{structure.get('upper_boundary_price', '--') if structure['side'] == 'LONG' else structure.get('lower_boundary_price', '--')} / {structure.get('breakout_buffer_price', '--')}",
         f"上沿：{structure.get('upper_boundary_price', '--')}",
         f"下沿：{structure.get('lower_boundary_price', '--')}",
+        f"ATR14：{structure.get('atr14', '--')} · 质量：{structure.get('quality_score', '--')}",
+        f"K线：{structure.get('compression_bars', '--')} · 方向触碰：{structure.get('directional_touch_count', '--')} · 收敛：{structure.get('contraction_ratio', '--')}",
+        f"1H：{structure.get('htf_timeframes', {}).get('1h', '--')} · 4H：{structure.get('htf_timeframes', {}).get('4h', '--')} · 汇总：{event['htf_alignment']}",
+        f"快照：{structure.get('ohlcv_snapshot_ref', '--')}",
         f"压缩标识：{event['compression_id']}",
         f"触发时间：{observed:%Y-%m-%d %H:%M} 北京时间",
     ))

@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -67,14 +68,16 @@ def pool_item(symbol="KEEPUSDT"):
     }
 
 
-def eligible_evaluation(symbol="KEEPUSDT"):
-    return {
+def eligible_evaluation(symbol="KEEPUSDT", **overrides):
+    row = {
         **pool_item(symbol), "evaluated_at": BASE_TIME + 900_000,
         "htf_alignment": "UNKNOWN", "parameter_version": "15m-compression-v1",
         "compression_start_time": BASE_TIME, "compression_end_time": BASE_TIME,
         "atr14": 1.0, "compression_bars": 20, "rejection_reasons": [],
         "directional_touch_times": [],
     }
+    row.update(overrides)
+    return row
 
 
 class CompressionUniverseTests(unittest.TestCase):
@@ -121,6 +124,61 @@ class HtfAlignmentTests(unittest.TestCase):
 
 
 class CompressionScanFailureIsolationTests(unittest.TestCase):
+    def test_discovery_uses_current_ticker_and_rejects_already_crossed_structure(self):
+        from momentum_compression_service import _scan_symbol
+
+        frame = trend_frame("LONG", 220)
+        candidate = eligible_evaluation()
+        rejected = {**eligible_evaluation(), "side": "SHORT", "compression_id": "keep-short", "state": "REJECTED"}
+        with patch("momentum_compression_service.fetch_klines", return_value=frame), \
+             patch("momentum_compression_service.fetch_live_price", return_value=111.0) as live, \
+             patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]) as evaluate:
+            rows, _, _ = _scan_symbol("KEEPUSDT")
+
+        live.assert_called_once_with("KEEPUSDT")
+        self.assertEqual(evaluate.call_args.args[2], 111.0)
+
+    def test_appended_closed_candle_continues_one_symbol_side_without_second_pool_identity(self):
+        from momentum_compression_service import scan_compression_market
+
+        frame = trend_frame("LONG", 220)
+        old = eligible_evaluation(compression_id="old", compression_start_time=BASE_TIME)
+        new = eligible_evaluation(compression_id="new", compression_start_time=BASE_TIME,
+                                  compression_end_time=BASE_TIME + 900_000)
+        rejected = {**eligible_evaluation(), "side": "SHORT", "compression_id": "short", "state": "REJECTED"}
+        with TemporaryDirectory() as folder:
+            root, state_path = Path(folder), Path(folder) / "state.json"
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_klines", return_value=frame), \
+                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": True, "4h": True}}), \
+                 patch("momentum_compression_service.evaluate_both_sides", side_effect=([old, rejected], [new, rejected])):
+                scan_compression_market(state_path, root)
+                scan_compression_market(state_path, root)
+            stored = load_compression_state(state_path)
+
+        self.assertEqual(list(stored["pool"]), ["old"])
+        self.assertEqual(stored["pool"]["old"]["compression_end_time"], BASE_TIME + 900_000)
+
+    def test_snapshot_is_selected_window_and_reference_is_persisted_before_reconcile(self):
+        from momentum_compression_service import scan_compression_market
+
+        frame = trend_frame("LONG", 220)
+        candidate = eligible_evaluation(compression_start_time=int(frame["ot"].iloc[-3]), compression_end_time=int(frame["ot"].iloc[-1]))
+        rejected = {**eligible_evaluation(), "side": "SHORT", "compression_id": "short", "state": "REJECTED"}
+        with TemporaryDirectory() as folder:
+            root, state_path = Path(folder), Path(folder) / "state.json"
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_klines", return_value=frame), \
+                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": True, "4h": True}}), \
+                 patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]):
+                scan_compression_market(state_path, root / "momentum_compression_snapshots")
+            item = load_compression_state(state_path)["pool"]["keep-long"]
+            payload = json.loads((root / item["ohlcv_snapshot_ref"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["ohlcv"]["ot"], frame["ot"].iloc[-3:].tolist())
+        self.assertEqual(item["ohlcv_snapshot_ref"], "momentum_compression_snapshots/keep-long.json")
     def test_symbol_data_failure_preserves_existing_pool_and_marks_unavailable(self):
         from momentum_compression_service import scan_compression_market
 
@@ -167,6 +225,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             state_path = root / "state.json"
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_klines", return_value=frame), \
+                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
                  patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]), \
                  patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED"}):
                 first = scan_compression_market(state_path, root)

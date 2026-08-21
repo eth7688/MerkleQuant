@@ -71,21 +71,29 @@ class CompressionApiTests(unittest.TestCase):
         self.assertEqual(payload["episode_rows"][0]["wechat_status"], "failed")
 
     def test_only_15m_manual_compression_scan_is_valid(self):
+        self.assertEqual(self.client.get("/scan/compression/15m").status_code, 401)
+        self._login()
         self.assertEqual(self.client.get("/scan/compression/1h").status_code, 400)
-        with patch.object(web_ui._compression_monitor, "scan_now", return_value=True) as scan_now:
+        with patch.object(web_ui._compression_monitor, "scan_now", return_value=True) as scan_now, \
+             patch.object(web_ui.threading, "Thread") as worker:
             response = self.client.get("/scan/compression/15m")
         self.assertEqual(response.status_code, 200)
-        scan_now.assert_called_once_with("manual")
+        worker.assert_called_once()
+        scan_now.assert_not_called()
+        if web_ui._compression_manual_scan_lock.locked():
+            web_ui._compression_manual_scan_lock.release()
 
     def test_overlapping_manual_scans_start_only_one_monitor_scan(self):
         started, release = threading.Event(), threading.Event()
         def scan_now(trigger):
             started.set(); release.wait(1); return True
+        self._login()
         with patch.object(web_ui._compression_monitor, "scan_now", side_effect=scan_now) as scan:
-            first = threading.Thread(target=lambda: self.client.get("/scan/compression/15m"))
-            first.start(); self.assertTrue(started.wait(1))
+            first = self.client.get("/scan/compression/15m")
+            self.assertEqual(first.status_code, 200)
+            self.assertTrue(started.wait(1))
             second = self.client.get("/scan/compression/15m")
-            release.set(); first.join(2)
+            release.set()
         self.assertEqual(second.status_code, 200)
         self.assertEqual(scan.call_count, 1)
 
@@ -101,7 +109,7 @@ class CompressionLifecycleTests(unittest.TestCase):
         web_ui._stop_compression_alert_worker_for_tests()
 
     def test_confirmed_events_append_alerts_and_wake_independent_worker(self):
-        with patch.object(web_ui, "append_compression_alerts", return_value=[dict(_fresh_event())]) as append:
+        with patch.object(web_ui, "drain_compression_outbox", return_value=[dict(_fresh_event())]) as append:
             web_ui._compression_alert_wakeup.clear()
             created = web_ui._process_compression_events([_fresh_event()], 11)
         self.assertEqual(len(created), 1)
@@ -109,7 +117,7 @@ class CompressionLifecycleTests(unittest.TestCase):
         self.assertTrue(web_ui._compression_alert_wakeup.is_set())
 
     def test_unconfirmed_events_do_not_wake_delivery_worker(self):
-        with patch.object(web_ui, "append_compression_alerts", return_value=[_fresh_event("UNKNOWN")]):
+        with patch.object(web_ui, "drain_compression_outbox", return_value=[_fresh_event("UNKNOWN")]):
             web_ui._compression_alert_wakeup.clear()
             web_ui._process_compression_events([_fresh_event("UNKNOWN")], 11)
         self.assertFalse(web_ui._compression_alert_wakeup.is_set())

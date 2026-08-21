@@ -11,8 +11,11 @@ from momentum_compression_alerts import (
     compression_delivery_statuses,
     compression_sound_available_ids,
     deliver_due_compression_wechat,
+    drain_compression_outbox,
+    format_compression_wechat_markdown,
     read_public_compression_alerts,
 )
+from momentum_compression_store import apply_live_prices, default_state, reconcile_structure_scan, save_compression_state
 from momentum_reflow_alerts import RETRY_DELAYS_MS, save_alert_settings
 
 
@@ -72,6 +75,38 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(append_compression_alerts(events, state, [item], 10)), 1)
             self.assertEqual(append_compression_alerts(events, state, [item], 11), [])
             self.assertEqual(read_public_compression_alerts(events, 0)["latest_alert_id"], 1)
+
+    def test_durable_outbox_recovers_public_and_confirmed_delivery_after_callback_failure(self):
+        structure = {
+            "symbol": "AUSDT", "side": "LONG", "compression_id": "outbox-1", "state": "PRE_BREAKOUT",
+            "fresh_emitted": False, "upper_boundary_price": 100.0, "lower_boundary_price": 90.0,
+            "breakout_buffer_price": 0.5, "first_seen_at": 1, "last_verified_at": 1, "htf_alignment": "CONFIRMED",
+        }
+        with TemporaryDirectory() as folder:
+            root = Path(folder); compression_state = root / "compression.json"; events, alert_state, _ = self.paths(root)
+            state, _ = reconcile_structure_scan(default_state(), [structure], 1)
+            state, fresh_events = apply_live_prices(state, {"AUSDT": 101.0}, 2)
+            save_compression_state(compression_state, state)
+            with patch("momentum_compression_alerts._atomic_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    drain_compression_outbox(compression_state, events, alert_state, 3)
+            self.assertEqual(drain_compression_outbox(compression_state, events, alert_state, 4), [])
+            self.assertEqual(read_public_compression_alerts(events, 0)["latest_alert_id"], 1)
+            self.assertEqual(self.queued_symbols(alert_state), ["AUSDT"])
+            self.assertEqual(len(fresh_events), 1)
+
+    def test_confirmed_markdown_has_required_compression_audit_fields(self):
+        event = fresh()
+        event["structure"].update({
+            "atr14": 0.4, "quality_score": 88.0, "compression_bars": 21,
+            "directional_touch_count": 3, "contraction_ratio": 0.5,
+            "htf_timeframes": {"1h": True, "4h": True},
+            "ohlcv_snapshot_ref": "momentum_compression_snapshots/AUSDT.json",
+        })
+        event = {**event, "alert_id": 1, "created_at": 10}
+        text = format_compression_wechat_markdown(event)
+        for field in ("触发价格", "突破边界/缓冲", "上沿", "下沿", "ATR14", "质量", "K线", "方向触碰", "收敛", "1H", "4H", "快照", "北京时间"):
+            self.assertIn(field, text)
 
     def test_retry_recovers_confirmed_queue_after_state_write_fails_post_append(self):
         with TemporaryDirectory() as folder:

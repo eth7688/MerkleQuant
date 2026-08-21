@@ -42,6 +42,19 @@ def evaluation(**overrides):
 
 
 class CompressionStateMachineTests(unittest.TestCase):
+    def test_every_fresh_is_added_to_the_durable_outbox(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, events = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        self.assertEqual(state["fresh_outbox"], events)
+
+    def test_same_symbol_side_new_identity_supersedes_without_duplicate_fresh(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="old")], 1_000)
+        state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = reconcile_structure_scan(state, [evaluation(compression_id="new", compression_end_time=900)], 3_000)
+        state, replay = apply_live_prices(state, {"TESTUSDT": 111.0}, 4_000)
+        self.assertEqual(list(state["pool"]), ["old"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(replay, [])
     def test_first_scan_outside_does_not_enter_pool_or_create_event(self):
         state, report = reconcile_structure_scan(
             default_state(), [evaluation(state="OUTSIDE_AT_DISCOVERY")], 1_000,
@@ -299,7 +312,7 @@ class CompressionSnapshotTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             ref = write_compression_snapshot(root, evaluation(), frame)
-            path = root / ref
+            path = root / "long-episode-1.json"
             first = path.read_bytes()
             self.assertEqual(ref, "momentum_compression_snapshots/long-episode-1.json")
             self.assertEqual(write_compression_snapshot(root, evaluation(), frame), ref)
@@ -316,10 +329,11 @@ class CompressionSnapshotTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             ref = write_compression_snapshot(root, evaluation(), frame)
-            path = root / ref
+            path = root / "long-episode-1.json"
             original = path.read_bytes()
             later = evaluation(parameter_version="later-version", symbol="CHANGEDUSDT")
-            self.assertEqual(write_compression_snapshot(root, later, changed), ref)
+            with self.assertRaises(ValueError):
+                write_compression_snapshot(root, later, changed)
             self.assertEqual(path.read_bytes(), original)
 
 

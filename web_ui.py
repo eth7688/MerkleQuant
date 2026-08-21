@@ -30,10 +30,10 @@ from momentum_reflow_alerts import (
     read_public_alerts,
 )
 from momentum_compression_alerts import (
-    append_compression_alerts,
     compression_delivery_statuses,
     compression_sound_available_ids,
     deliver_due_compression_wechat,
+    drain_compression_outbox,
     read_public_compression_alerts,
 )
 from momentum_compression_monitor import CompressionMonitor
@@ -51,7 +51,9 @@ MOMENTUM_COMPRESSION_STATE = Path(_BASE_DIR) / "momentum_compression_state.json"
 MOMENTUM_COMPRESSION_EVENTS = Path(_BASE_DIR) / "momentum_compression_events.jsonl"
 MOMENTUM_COMPRESSION_SNAPSHOTS = Path(_BASE_DIR) / "momentum_compression_snapshots"
 MOMENTUM_COMPRESSION_ALERT_STATE = Path(_BASE_DIR) / "momentum_compression_alert_state.json"
-MOMENTUM_COMPRESSION_ALERT_SETTINGS = Path(_BASE_DIR) / "momentum_compression_alert_settings.json"
+# Compression reuses the single protected WeCom configuration; no second
+# settings file is created or exposed by this feature.
+MOMENTUM_COMPRESSION_ALERT_SETTINGS = MOMENTUM_REFLOW_ALERT_SETTINGS
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -4382,10 +4384,10 @@ def _sanitize_compression_alert_error(error):
 
 def _process_compression_events(events, now_ms):
     try:
-        created = append_compression_alerts(
+        created = drain_compression_outbox(
+            MOMENTUM_COMPRESSION_STATE,
             MOMENTUM_COMPRESSION_EVENTS,
             MOMENTUM_COMPRESSION_ALERT_STATE,
-            events,
             now_ms,
         )
     except Exception as error:
@@ -4418,6 +4420,14 @@ def _compression_alert_worker_loop():
     try:
         while not _compression_alert_stop.is_set():
             try:
+                created = drain_compression_outbox(
+                    MOMENTUM_COMPRESSION_STATE,
+                    MOMENTUM_COMPRESSION_EVENTS,
+                    MOMENTUM_COMPRESSION_ALERT_STATE,
+                    int(time.time() * 1000),
+                )
+                if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+                    _compression_alert_wakeup.set()
                 result = deliver_due_compression_wechat(
                     MOMENTUM_COMPRESSION_ALERT_SETTINGS,
                     MOMENTUM_COMPRESSION_ALERT_STATE,
@@ -4582,14 +4592,21 @@ def do_scan(mode, interval):
             return jsonify({"scanning":True,"status":"扫描中..."})
         return jsonify({"scanning":True})
     if mode == "compression":
+        if not session.get("user_id"):
+            return jsonify({"error": "未登录"}), 401
         if not _compression_manual_scan_lock.acquire(blocking=False):
             return jsonify({"scanning":True,"status":"扫描中..."})
+        def run_compression_manual_scan():
+            try:
+                _compression_monitor.scan_now("manual")
+            finally:
+                _compression_manual_scan_lock.release()
         try:
-            if not _compression_monitor.scan_now("manual"):
-                return jsonify({"scanning":True,"status":"扫描中..."})
-            return jsonify({"scanning":True})
-        finally:
+            threading.Thread(target=run_compression_manual_scan, daemon=True).start()
+        except Exception:
             _compression_manual_scan_lock.release()
+            raise
+        return jsonify({"scanning": True})
 
     key = f"{mode}_{interval}"
     def work(progress):

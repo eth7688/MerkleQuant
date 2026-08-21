@@ -114,7 +114,7 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
         self.assertEqual(len(callbacks), 1)
         self.assertEqual(callbacks[0][0][0]["state"], "BREAKOUT_FRESH_LONG")
-        self.assertEqual(callbacks[0][1]["today_fresh"], 1)
+        self.assertEqual(callbacks[0][1]["today_fresh"], 0)
 
     def test_disabling_auto_stops_monitoring_but_preserves_pool(self):
         with TemporaryDirectory() as folder:
@@ -150,7 +150,7 @@ class CompressionMonitorScanTests(unittest.TestCase):
         save_compression_state(state_path, default_state())
         return CompressionMonitor(state_path, root, callback, scan=scan)
 
-    def test_scan_holds_state_lock_until_scan_returns_before_price_batch_can_run(self):
+    def test_scan_network_work_does_not_block_live_price_updates(self):
         with TemporaryDirectory() as folder:
             scan_started = threading.Event()
             release_scan = threading.Event()
@@ -167,7 +167,7 @@ class CompressionMonitorScanTests(unittest.TestCase):
             scan_thread.start()
             self.assertTrue(scan_started.wait(1))
             price_thread.start()
-            self.assertFalse(price_finished.wait(0.05))
+            self.assertTrue(price_finished.wait(0.2))
             release_scan.set()
             scan_thread.join(1)
             price_thread.join(1)

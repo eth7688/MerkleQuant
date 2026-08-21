@@ -15,6 +15,7 @@ from momentum_compression import (
     evaluate_both_sides,
 )
 from momentum_compression_store import (
+    compression_state_lock,
     load_compression_state,
     reconcile_structure_scan,
     save_compression_state,
@@ -29,6 +30,15 @@ _ELIGIBLE_STATES = {
     "PRE_BREAKOUT", "COMPRESSION_ACTIVE_LONG", "COMPRESSION_ACTIVE_SHORT",
 }
 _HTF_LIMIT = 80
+
+
+def fetch_live_price(symbol: str, *, get=requests.get) -> float:
+    response = get(f"{FUTURES_BASE}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
+    response.raise_for_status()
+    price = float(response.json()["price"])
+    if price <= 0:
+        raise ValueError("ticker price is unavailable")
+    return price
 
 
 def fetch_compression_universe(*, get=requests.get) -> tuple[list[str], dict[str, float]]:
@@ -102,14 +112,18 @@ def _scan_symbol(symbol: str) -> tuple[list[dict], dict[str, pd.DataFrame], int]
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError("15m candle history is unavailable")
     close_ms = int(frame["ot"].iloc[-1]) + 900_000
-    price = float(frame["c"].iloc[-1])
+    price = fetch_live_price(symbol)
     evaluations = evaluate_both_sides(
         symbol, frame, price, evaluated_at_ms=close_ms,
         htf_alignment_by_side={"LONG": "UNKNOWN", "SHORT": "UNKNOWN"},
     )
     for evaluation in evaluations:
         if evaluation["state"] in _ELIGIBLE_STATES:
-            evaluation["htf_alignment"] = evaluate_htf_alignment(symbol, evaluation["side"])["alignment"]
+            htf = evaluate_htf_alignment(symbol, evaluation["side"])
+            evaluation["htf_alignment"] = htf["alignment"]
+            evaluation["htf_timeframes"] = htf.get("timeframes", {"1h": None, "4h": None})
+        if evaluation["state"] not in _ELIGIBLE_STATES:
+            evaluation["htf_timeframes"] = {"1h": None, "4h": None}
     return evaluations, {row["compression_id"]: frame for row in evaluations if row["state"] in _ELIGIBLE_STATES}, close_ms
 
 
@@ -127,11 +141,10 @@ def scan_compression_market(
     max_workers: int = 12,
 ) -> dict:
     """Scan the liquid Binance Futures universe and atomically persist successful work."""
-    state = load_compression_state(state_path)
     symbols, _ = fetch_compression_universe()
     now_ms = int(time.time() * 1000)
     evaluations, frames = [], {}
-    errors, close_times = 0, []
+    errors, close_times, failed_symbols = 0, [], []
     workers = min(12, max(1, max_workers))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_scan_symbol, symbol): symbol for symbol in symbols}
@@ -141,22 +154,30 @@ def scan_compression_market(
                 rows, symbol_frames, close_ms = future.result()
             except Exception:
                 errors += 1
-                _mark_unavailable(state, symbol)
+                failed_symbols.append(symbol)
             else:
                 evaluations.extend(rows)
                 frames.update(symbol_frames)
                 close_times.append(close_ms)
             if progress is not None:
                 progress(completed, len(symbols))
-    state, reconciliation = reconcile_structure_scan(state, evaluations, now_ms)
     for row in evaluations:
         if row["state"] in _ELIGIBLE_STATES:
-            write_compression_snapshot(snapshot_dir, row, frames[row["compression_id"]])
-    state["last_closed_15m_close_time"] = max(
-        close_times, default=state["last_closed_15m_close_time"]
-    )
-    state["last_error"] = f"{errors} symbol scan failures" if errors else ""
-    save_compression_state(state_path, state)
+            selected = frames[row["compression_id"]]
+            selected = selected[(selected["ot"] >= row["compression_start_time"]) & (selected["ot"] <= row["compression_end_time"])].reset_index(drop=True)
+            row["ohlcv_snapshot_ref"] = write_compression_snapshot(snapshot_dir, row, selected)
+    # Reload only for the short persistence transaction: live prices may have
+    # advanced while network-bound discovery was in progress.
+    with compression_state_lock(state_path):
+        state = load_compression_state(state_path)
+        for symbol in failed_symbols:
+            _mark_unavailable(state, symbol)
+        state, reconciliation = reconcile_structure_scan(state, evaluations, now_ms)
+        state["last_closed_15m_close_time"] = max(
+            close_times, default=state["last_closed_15m_close_time"]
+        )
+        state["last_error"] = f"{errors} symbol scan failures" if errors else ""
+        save_compression_state(state_path, state)
     eligible_rows = [row for row in evaluations if row["state"] in _ELIGIBLE_STATES]
     rejection_counts = {}
     for row in evaluations:

@@ -5,12 +5,13 @@ import math
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
 
 from momentum_compression_service import scan_compression_market
-from momentum_compression_store import apply_live_prices, load_compression_state, save_compression_state
+from momentum_compression_store import apply_live_prices, compression_state_lock, load_compression_state, save_compression_state
 
 try:
     import websocket
@@ -103,9 +104,10 @@ class CompressionMonitor:
         if not prices:
             return
         with self._state_lock:
-            state = load_compression_state(self.state_path)
-            state, events = apply_live_prices(state, prices, now_ms)
-            save_compression_state(self.state_path, state)
+            with compression_state_lock(self.state_path):
+                state = load_compression_state(self.state_path)
+                state, events = apply_live_prices(state, prices, now_ms)
+                save_compression_state(self.state_path, state)
         if events:
             try:
                 self.event_callback(events)
@@ -229,15 +231,14 @@ class CompressionMonitor:
         if not self._scan_lock.acquire(blocking=False):
             return False
         try:
-            with self._state_lock:
-                report = self.scan(self.state_path, self.snapshot_dir)
-                events = [
-                    event for event in report.get("events", [])
-                    if isinstance(event, dict) and isinstance(event.get("event_id"), int)
-                    and event["event_id"] > self._event_cursor
-                ]
-                if events:
-                    self._event_cursor = max(event["event_id"] for event in events)
+            report = self.scan(self.state_path, self.snapshot_dir)
+            events = [
+                event for event in report.get("events", [])
+                if isinstance(event, dict) and isinstance(event.get("event_id"), int)
+                and event["event_id"] > self._event_cursor
+            ]
+            if events:
+                self._event_cursor = max(event["event_id"] for event in events)
             self._last_scan_at = report.get("evaluated_at", self.time_ms())
             self._last_error = ""
             if events:
@@ -332,11 +333,12 @@ class CompressionMonitor:
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be boolean")
         with self._state_lock:
-            state = load_compression_state(self.state_path)
-            state["auto_enabled"] = enabled
-            save_compression_state(self.state_path, state)
-            if enabled:
-                self._event_cursor = state["next_event_id"] - 1
+            with compression_state_lock(self.state_path):
+                state = load_compression_state(self.state_path)
+                state["auto_enabled"] = enabled
+                save_compression_state(self.state_path, state)
+                if enabled:
+                    self._event_cursor = state["next_event_id"] - 1
         if enabled:
             self.start()
         else:
@@ -359,6 +361,10 @@ class CompressionMonitor:
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,
             "last_error": self._last_error or state["last_error"],
             "pool_size": len(state["pool"]),
-            "today_fresh": sum(1 for item in state["pool"].values() if item.get("fresh_emitted")),
+            "today_fresh": sum(
+                1 for event in state["fresh_outbox"]
+                if datetime.fromtimestamp(event["event_at"] / 1000, ZoneInfo("Asia/Shanghai")).date()
+                == datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            ),
             "dropped_price_rows": self._dropped_price_rows,
         }
