@@ -241,6 +241,44 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
         self.assertEqual(events, [{"event_id": 2, "name": "new"}])
 
+    def test_reenable_after_timed_out_stop_starts_one_new_generation_when_old_workers_exit(self):
+        created = []
+
+        class ControlledThread:
+            def __init__(self, *, target, **kwargs):
+                self.target = target
+                self.alive = False
+                created.append(self)
+
+            def start(self):
+                self.alive = True
+
+            def join(self, timeout):
+                return None
+
+            def is_alive(self):
+                return self.alive
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root, lambda *args: {"events": []})
+            monitor.thread_factory = ControlledThread
+            monitor._stream_loop = lambda: None
+            monitor._fallback_loop = lambda: None
+            monitor._scheduler_loop = lambda: None
+            state = default_state()
+            state["auto_enabled"] = True
+            save_compression_state(root / "state.json", state)
+            self.assertTrue(monitor.start())
+            self.assertFalse(monitor.stop(timeout=0))
+            monitor.set_auto_enabled(True)
+            self.assertEqual(len(created), 3)
+            for worker in list(created):
+                worker.target()
+
+        self.assertEqual(len(created), 6)
+        self.assertTrue(monitor.status()["running"])
+
     def test_successful_socket_session_resets_next_retry_delay_to_one_second(self):
         from momentum_compression_monitor import CompressionMonitor
 

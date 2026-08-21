@@ -65,6 +65,7 @@ class CompressionMonitor:
         self.thread_factory = thread_factory
         self._state_lock = threading.Lock()
         self._scan_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._stop = threading.Event()
         self._threads = []
         self._app = None
@@ -77,6 +78,9 @@ class CompressionMonitor:
         self._last_error = ""
         self._dropped_price_rows = 0
         self._event_cursor = 0
+        self._generation = 0
+        self._active_worker_count = 0
+        self._restart_pending = False
 
     @staticmethod
     def reconnect_delay(attempt: int) -> int:
@@ -249,23 +253,58 @@ class CompressionMonitor:
             self._scan_lock.release()
 
     def start(self) -> bool:
-        if self._running:
-            return False
         with self._state_lock:
             state = load_compression_state(self.state_path)
             if not state["auto_enabled"]:
                 return False
             self._event_cursor = state["next_event_id"] - 1
-        self._stop.clear()
-        self._running = True
-        self._threads = [
-            self.thread_factory(target=self._stream_loop, name="compression-price-stream", daemon=True),
-            self.thread_factory(target=self._fallback_loop, name="compression-price-fallback", daemon=True),
-            self.thread_factory(target=self._scheduler_loop, name="compression-15m-scheduler", daemon=True),
-        ]
+        with self._lifecycle_lock:
+            if self._running:
+                if self._stop.is_set():
+                    self._restart_pending = True
+                return False
+            self._stop.clear()
+            self._running = True
+            self._restart_pending = False
+            self._generation += 1
+            generation = self._generation
+            workers = (self._stream_loop, self._fallback_loop, self._scheduler_loop)
+            self._active_worker_count = len(workers)
+            self._threads = [
+                self.thread_factory(
+                    target=lambda worker=worker: self._run_worker(worker, generation),
+                    name=name,
+                    daemon=True,
+                )
+                for worker, name in zip(workers, (
+                    "compression-price-stream", "compression-price-fallback", "compression-15m-scheduler",
+                ))
+            ]
         for thread in self._threads:
             thread.start()
         return True
+
+    def _run_worker(self, worker, generation):
+        try:
+            worker()
+        finally:
+            self._worker_exited(generation)
+
+    def _worker_exited(self, generation):
+        restart = False
+        with self._lifecycle_lock:
+            if generation != self._generation:
+                return
+            self._active_worker_count -= 1
+            if self._active_worker_count:
+                return
+            self._running = False
+            self._stream_connected = False
+            self._price_stream_status = "stopped"
+            restart = self._restart_pending
+            self._restart_pending = False
+        if restart:
+            self.start()
 
     def stop(self, timeout: float = 2.0) -> bool:
         self._stop.set()
@@ -277,9 +316,9 @@ class CompressionMonitor:
         for thread in self._threads:
             thread.join(timeout)
         self._stream_connected = False
-        still_running = any(thread.is_alive() for thread in self._threads)
+        with self._lifecycle_lock:
+            still_running = self._running and self._active_worker_count > 0
         self._price_stream_status = "stopping" if still_running else "stopped"
-        self._running = still_running
         return not still_running
 
     def set_auto_enabled(self, enabled: bool) -> dict:
@@ -294,14 +333,18 @@ class CompressionMonitor:
         if enabled:
             self.start()
         else:
+            with self._lifecycle_lock:
+                self._restart_pending = False
             self.stop()
         return self.status()
 
     def status(self) -> dict:
         with self._state_lock:
             state = load_compression_state(self.state_path)
+        with self._lifecycle_lock:
+            running = self._running
         return {
-            "running": self._running,
+            "running": running,
             "auto_enabled": state["auto_enabled"],
             "structure_scanning": self._scan_lock.locked(),
             "price_stream_status": self._price_stream_status,
