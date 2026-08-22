@@ -75,6 +75,8 @@ class CompressionMonitor:
         self._stream_ever_connected = False
         self._price_stream_status = "stopped"
         self._last_scan_at = 0
+        self._scan_started_at = 0
+        self._scan_duration_ms = 0
         self._next_scan_at = None
         self._last_error = ""
         self._dropped_price_rows = 0
@@ -230,6 +232,7 @@ class CompressionMonitor:
     def scan_now(self, trigger: str) -> bool:
         if not self._scan_lock.acquire(blocking=False):
             return False
+        self._scan_started_at = self.time_ms()
         try:
             report = self.scan(self.state_path, self.snapshot_dir)
             events = [
@@ -251,6 +254,7 @@ class CompressionMonitor:
             self._last_error = f"{trigger} scan: {error}"
             return False
         finally:
+            self._scan_duration_ms = self.time_ms() - self._scan_started_at
             self._scan_lock.release()
 
     def start(self) -> bool:
@@ -352,10 +356,15 @@ class CompressionMonitor:
             state = load_compression_state(self.state_path)
         with self._lifecycle_lock:
             running = self._running
+        structure_scanning = self._scan_lock.locked()
         return {
             "running": running,
             "auto_enabled": state["auto_enabled"],
-            "structure_scanning": self._scan_lock.locked(),
+            "structure_scanning": structure_scanning,
+            "scan_started_at": self._scan_started_at,
+            "scan_duration_ms": self._scan_duration_ms,
+            "scan_overdue": structure_scanning and self._scan_started_at > 0
+            and self.time_ms() - self._scan_started_at >= 900_000,
             "price_stream_status": self._price_stream_status,
             "last_scan_at": self._last_scan_at or state["last_structure_scan_at"],
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,

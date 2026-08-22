@@ -133,6 +133,42 @@ class HtfAlignmentTests(unittest.TestCase):
 
 
 class CompressionScanFailureIsolationTests(unittest.TestCase):
+    def test_scan_uses_one_bulk_price_snapshot_for_all_symbols(self):
+        from momentum_compression_service import scan_compression_market
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["AUSDT", "BUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"AUSDT": 10.0, "BUSDT": 20.0}, create=True) as prices, \
+                 patch("momentum_compression_service._scan_symbol", return_value=([], {}, BASE_TIME)) as scan:
+                report = scan_compression_market(root / "state.json", root)
+
+        prices.assert_called_once_with()
+        self.assertEqual(
+            sorted((call.args[0], call.kwargs["live_price"]) for call in scan.call_args_list),
+            [("AUSDT", 10.0), ("BUSDT", 20.0)],
+        )
+        self.assertEqual(report["scanned"], 2)
+
+    def test_missing_bulk_price_preserves_pool_entry_as_unavailable(self):
+        from momentum_compression_service import scan_compression_market
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            state_path = root / "state.json"
+            state = default_state()
+            state["pool"]["keep-long"] = pool_item("AUSDT")
+            save_compression_state(state_path, state)
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["AUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={}, create=True), \
+                 patch("momentum_compression_service._scan_symbol") as scan:
+                report = scan_compression_market(state_path, root)
+            stored = load_compression_state(state_path)
+
+        scan.assert_not_called()
+        self.assertIn("AUSDT", report["failed_symbols"])
+        self.assertEqual(stored["pool"]["keep-long"]["data_status"], "unavailable")
+
     def test_live_ticker_rejects_nan_and_infinity(self):
         from momentum_compression_service import fetch_live_price
 
@@ -146,9 +182,8 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
 
         frame = trend_frame("LONG", 220)
         with patch("momentum_compression_service.fetch_klines", return_value=frame), \
-             patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
              patch("momentum_compression_service.evaluate_both_sides", return_value=[]) as evaluate:
-            _scan_symbol("KEEPUSDT", evaluated_at_ms=9_999_999)
+            _scan_symbol("KEEPUSDT", live_price=105.0, evaluated_at_ms=9_999_999)
 
         self.assertEqual(evaluate.call_args.kwargs["evaluated_at_ms"], 9_999_999)
 
@@ -159,11 +194,9 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
         candidate = eligible_evaluation()
         rejected = {**eligible_evaluation(), "side": "SHORT", "compression_id": "keep-short", "state": "REJECTED"}
         with patch("momentum_compression_service.fetch_klines", return_value=frame), \
-             patch("momentum_compression_service.fetch_live_price", return_value=111.0) as live, \
              patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]) as evaluate:
-            rows, _, _ = _scan_symbol("KEEPUSDT")
+            rows, _, _ = _scan_symbol("KEEPUSDT", live_price=111.0, evaluated_at_ms=BASE_TIME)
 
-        live.assert_called_once_with("KEEPUSDT")
         self.assertEqual(evaluate.call_args.args[2], 111.0)
 
     def test_appended_closed_candle_continues_one_symbol_side_without_second_pool_identity(self):
@@ -178,7 +211,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             root, state_path = Path(folder), Path(folder) / "state.json"
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_klines", return_value=frame), \
-                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
                  patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": True, "4h": True}}), \
                  patch("momentum_compression_service.evaluate_both_sides", side_effect=([old, rejected], [new, rejected])):
                 scan_compression_market(state_path, root)
@@ -200,7 +233,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             root, state_path = Path(folder), Path(folder) / "state.json"
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_klines", return_value=frame), \
-                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
                  patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": "ALIGNED", "4h": "ALIGNED"}}), \
                  patch("momentum_compression_service.evaluate_both_sides", side_effect=([old, rejected], [continued, rejected])):
                 scan_compression_market(state_path, root / "momentum_compression_snapshots")
@@ -221,7 +254,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             root, state_path = Path(folder), Path(folder) / "state.json"
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_klines", return_value=frame), \
-                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
                  patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED", "timeframes": {"1h": True, "4h": True}}), \
                  patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]):
                 scan_compression_market(state_path, root / "momentum_compression_snapshots")
@@ -276,7 +309,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             state_path = root / "state.json"
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_klines", return_value=frame), \
-                 patch("momentum_compression_service.fetch_live_price", return_value=105.0), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
                  patch("momentum_compression_service.evaluate_both_sides", return_value=[candidate, rejected]), \
                  patch("momentum_compression_service.evaluate_htf_alignment", return_value={"alignment": "CONFIRMED"}):
                 first = scan_compression_market(state_path, root)

@@ -43,6 +43,21 @@ def fetch_live_price(symbol: str, *, get=requests.get) -> float:
     return price
 
 
+def fetch_live_prices(*, get=requests.get) -> dict[str, float]:
+    """Return the finite positive prices from Binance's bulk futures ticker."""
+    response = get(f"{FUTURES_BASE}/fapi/v1/ticker/price", timeout=10)
+    response.raise_for_status()
+    prices = {}
+    for row in response.json():
+        try:
+            price = float(row["price"])
+            if math.isfinite(price) and price > 0:
+                prices[row["symbol"]] = price
+        except (KeyError, TypeError, ValueError):
+            continue
+    return prices
+
+
 def fetch_compression_universe(*, get=requests.get) -> tuple[list[str], dict[str, float]]:
     """Return liquid Binance USDT perpetual symbols and their 24h quote volume."""
     exchange = get(f"{FUTURES_BASE}/fapi/v1/exchangeInfo", timeout=10)
@@ -113,17 +128,15 @@ def evaluate_htf_alignment(symbol: str, side: str, *, fetch=fetch_klines) -> dic
     return {"alignment": alignment, "timeframes": verdicts}
 
 
-def _scan_symbol(symbol: str, *, evaluated_at_ms: int | None = None) -> tuple[list[dict], dict[str, pd.DataFrame], int]:
+def _scan_symbol(symbol: str, *, live_price: float, evaluated_at_ms: int) -> tuple[list[dict], dict[str, pd.DataFrame], int]:
     frame = fetch_klines(
         symbol, "15m", 220, exchange="binance", closed_only=True,
         market_type="futures", testnet=False,
     )
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError("15m candle history is unavailable")
-    evaluated_at_ms = int(time.time() * 1000) if evaluated_at_ms is None else evaluated_at_ms
-    price = fetch_live_price(symbol)
     evaluations = evaluate_both_sides(
-        symbol, frame, price, evaluated_at_ms=evaluated_at_ms,
+        symbol, frame, live_price, evaluated_at_ms=evaluated_at_ms,
         htf_alignment_by_side={"LONG": "UNKNOWN", "SHORT": "UNKNOWN"},
     )
     for evaluation in evaluations:
@@ -150,14 +163,23 @@ def scan_compression_market(
     max_workers: int = 12,
 ) -> dict:
     """Scan the liquid Binance Futures universe and atomically persist successful work."""
+    started_at = int(time.time() * 1000)
     symbols, _ = fetch_compression_universe()
+    live_prices = fetch_live_prices()
     now_ms = int(time.time() * 1000)
     evaluations, frames = [], {}
     errors, close_times, failed_symbols = 0, [], []
+    price_missing = [symbol for symbol in symbols if symbol not in live_prices]
+    failed_symbols.extend(price_missing)
+    errors += len(price_missing)
+    symbols_to_scan = [symbol for symbol in symbols if symbol in live_prices]
     workers = min(12, max(1, max_workers))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_scan_symbol, symbol, evaluated_at_ms=now_ms): symbol for symbol in symbols}
-        for completed, future in enumerate(as_completed(futures), start=1):
+        futures = {
+            executor.submit(_scan_symbol, symbol, live_price=live_prices[symbol], evaluated_at_ms=now_ms): symbol
+            for symbol in symbols_to_scan
+        }
+        for completed, future in enumerate(as_completed(futures), start=len(price_missing) + 1):
             symbol = futures[future]
             try:
                 rows, symbol_frames, close_ms = future.result()
@@ -201,6 +223,7 @@ def scan_compression_market(
         if row["state"] == "REJECTED":
             for reason in row["rejection_reasons"]:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+    finished_at = int(time.time() * 1000)
     return {
         "rows": eligible_rows,
         "events": reconciliation["fresh_events"],
@@ -211,4 +234,8 @@ def scan_compression_market(
         "rejection_counts": rejection_counts,
         "evaluated_at": now_ms,
         "last_closed_15m_close_time": state["last_closed_15m_close_time"],
+        "failed_symbols": failed_symbols,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": finished_at - started_at,
     }

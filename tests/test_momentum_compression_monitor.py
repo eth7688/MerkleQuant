@@ -174,6 +174,27 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
         self.assertTrue(price_finished.is_set())
 
+    def test_status_tracks_scan_timing_and_marks_held_lock_overdue(self):
+        clock = [1_000]
+        report = {"evaluated_at": 1, "events": []}
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), lambda *args: report)
+            monitor.time_ms = lambda: clock[0]
+            self.assertTrue(monitor.scan_now("manual"))
+            status = monitor.status()
+            self.assertEqual(status["scan_started_at"], 1_000)
+            self.assertEqual(status["scan_duration_ms"], 0)
+            self.assertFalse(status["scan_overdue"])
+
+            monitor._scan_lock.acquire()
+            try:
+                clock[0] += 900_000
+                overdue = monitor.status()
+            finally:
+                monitor._scan_lock.release()
+
+        self.assertTrue(overdue["scan_overdue"])
+
     def test_scan_dispatches_only_events_newer_than_enable_cursor_baseline(self):
         events = []
         reports = iter((
