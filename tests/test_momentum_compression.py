@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -66,6 +67,26 @@ def two_touch_frame():
     })
 
 
+def legacy_maximal_structural_suffix(indicators, side, params):
+    if indicators.empty:
+        return indicators, {"rejection_reasons": ["EMPTY_DATA"]}
+    selected = indicators
+    minimum = 2 * params.pivot_span + 1
+    selected_rules = (
+        _non_length_rules(indicators, side, params)
+        if len(indicators) >= minimum
+        else {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
+    )
+    for start in range(len(indicators)):
+        candidate = indicators.iloc[start:].reset_index(drop=True)
+        if len(candidate) < minimum:
+            continue
+        rules = _non_length_rules(candidate, side, params)
+        if not rules["rejection_reasons"]:
+            return candidate, rules
+    return selected, selected_rules
+
+
 class CompressionIndicatorTests(unittest.TestCase):
     def test_default_parameters_match_approved_spec(self):
         params = CompressionParams()
@@ -118,6 +139,44 @@ class CompressionIndicatorTests(unittest.TestCase):
 
 
 class CompressionRuleTests(unittest.TestCase):
+    def test_ema_pruning_skips_only_suffixes_that_are_provably_invalid(self):
+        indicators = add_compression_indicators(valid_compression_frame(220))
+        indicators.loc[200, "ema8"] = indicators.loc[200, "ema21"]
+        with patch("momentum_compression._non_length_rules", wraps=_non_length_rules) as rules:
+            optimized_window, optimized_rules = _maximal_structural_suffix(
+                indicators, "LONG", CompressionParams()
+            )
+        reference_window, reference_rules = legacy_maximal_structural_suffix(
+            indicators, "LONG", CompressionParams()
+        )
+        candidate_lengths = [len(call.args[0]) for call in rules.call_args_list]
+        self.assertFalse(any(20 <= length < 220 for length in candidate_lengths))
+        self.assertEqual(list(optimized_window["ot"]), list(reference_window["ot"]))
+        self.assertEqual(
+            optimized_rules["rejection_reasons"],
+            reference_rules["rejection_reasons"],
+        )
+
+    def test_pruned_suffix_matches_legacy_for_fixed_random_samples(self):
+        rng = np.random.default_rng(20260822)
+        for side in ("LONG", "SHORT"):
+            for bars in (14, 15, 40, 100, 101, 220):
+                frame = valid_compression_frame(bars)
+                frame["h"] += rng.normal(0.0, 0.05, bars)
+                frame["l"] += rng.normal(0.0, 0.05, bars)
+                indicators = add_compression_indicators(frame)
+                actual_window, actual_rules = _maximal_structural_suffix(
+                    indicators, side, CompressionParams()
+                )
+                expected_window, expected_rules = legacy_maximal_structural_suffix(
+                    indicators, side, CompressionParams()
+                )
+                self.assertEqual(list(actual_window["ot"]), list(expected_window["ot"]))
+                self.assertEqual(
+                    actual_rules["rejection_reasons"],
+                    expected_rules["rejection_reasons"],
+                )
+
     def test_touch_run_counts_once_until_non_touch_bar_separates_it(self):
         values = pd.Series([10.0, 10.01, 9.99, 9.0, 10.01, 9.99])
         boundary = pd.Series([10.0] * len(values))

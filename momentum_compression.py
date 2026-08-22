@@ -135,20 +135,36 @@ def _non_length_rules(frame: pd.DataFrame, side: str, params: CompressionParams)
     }
 
 
-def _maximal_structural_suffix(indicators: pd.DataFrame, side: str, params: CompressionParams) -> tuple[pd.DataFrame, dict]:
+def _ema_candidate_start(indicators: pd.DataFrame, side: str) -> int:
+    ema8 = indicators["ema8"].to_numpy(dtype=float, copy=False)
+    ema21 = indicators["ema21"].to_numpy(dtype=float, copy=False)
+    close = indicators["c"].to_numpy(dtype=float, copy=False)
+    if side == "LONG":
+        valid = (ema8 > ema21) & (close > np.maximum(ema8, ema21))
+    else:
+        valid = (ema8 < ema21) & (close < np.minimum(ema8, ema21))
+    invalid = np.flatnonzero(~valid)
+    return int(invalid[-1] + 1) if invalid.size else 0
+
+
+def _maximal_structural_suffix(indicators, side, params, *, common_cache=None):
     if indicators.empty:
         return indicators, {"rejection_reasons": ["EMPTY_DATA"]}
-    selected = indicators
-    selected_rules = _non_length_rules(indicators, side, params) if len(indicators) >= 2 * params.pivot_span + 1 else {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
-    for start in range(len(indicators)):
-        candidate = indicators.iloc[start:].reset_index(drop=True)
-        if len(candidate) < 2 * params.pivot_span + 1:
-            continue
+    minimum = 2 * params.pivot_span + 1
+    if len(indicators) < minimum:
+        return indicators, {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
+    selected_rules = _non_length_rules(indicators, side, params)
+    if not selected_rules["rejection_reasons"]:
+        return indicators, selected_rules
+    if "EMA_DISTANCE_TOO_WIDE" in selected_rules["rejection_reasons"]:
+        return indicators, selected_rules
+    first_start = max(1, _ema_candidate_start(indicators, side))
+    for start in range(first_start, len(indicators) - minimum + 1):
+        candidate = indicators.iloc[start:]
         rules = _non_length_rules(candidate, side, params)
         if not rules["rejection_reasons"]:
-            selected, selected_rules = candidate, rules
-            break
-    return selected, selected_rules
+            return candidate, rules
+    return indicators, selected_rules
 
 
 def _quality_score(metrics: dict, params: CompressionParams) -> tuple[float, dict]:
