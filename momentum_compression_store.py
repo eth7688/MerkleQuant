@@ -46,6 +46,7 @@ def default_state():
         "last_structure_scan_at": 0,
         "last_closed_15m_close_time": 0,
         "last_error": "",
+        "last_scan_failures": [],
     }
 
 
@@ -141,6 +142,20 @@ def _validate_fresh_event(event):
     _validate_item(event["compression_id"], event["structure"])
 
 
+def _validate_scan_failures(failures):
+    if not isinstance(failures, list) or len(failures) > 1000:
+        raise ValueError("invalid scan failures")
+    required = {"symbol", "stage", "error_type", "message", "attempts"}
+    for item in failures:
+        if not isinstance(item, dict) or set(item) != required:
+            raise ValueError("invalid scan failure")
+        for key in ("symbol", "stage", "error_type", "message"):
+            if not isinstance(item[key], str) or not item[key]:
+                raise ValueError("invalid scan failure")
+        if len(item["message"]) > 160 or not _is_int(item["attempts"]) or item["attempts"] < 0:
+            raise ValueError("invalid scan failure")
+
+
 def _validate_state(state):
     if not isinstance(state, dict) or set(state) != set(default_state()):
         raise ValueError("invalid compression state")
@@ -150,6 +165,7 @@ def _validate_state(state):
         _require_nonnegative_int(state[key], key)
     if not isinstance(state["last_error"], str):
         raise ValueError("invalid last error")
+    _validate_scan_failures(state["last_scan_failures"])
     for key in ("pool", "episodes"):
         if not isinstance(state[key], dict):
             raise ValueError(f"invalid {key}")
@@ -251,6 +267,7 @@ def _migrate_v1_state(state: dict) -> dict:
         migrated["next_event_id"] = max(migrated["next_event_id"], max(event_ids) + 1)
     migrated["fresh_outbox"] = sorted(events, key=lambda event: event["event_id"])
     migrated["legacy_unpublished_event_ids"] = sorted(unpublished_ids)
+    migrated["last_scan_failures"] = []
     return migrated
 
 
@@ -264,9 +281,12 @@ def load_compression_state(path: Path) -> dict:
         raise ValueError("compression state is corrupt") from error
     if state.get("version") == 1 and "delivery_queue" in state:
         state = _migrate_v1_state(state)
-    elif state.get("version") == STATE_VERSION and set(state) == set(default_state()) - {"legacy_unpublished_event_ids"}:
-        state = dict(state)
-        state["legacy_unpublished_event_ids"] = []
+    elif state.get("version") == STATE_VERSION:
+        missing = set(default_state()) - set(state)
+        if missing <= {"legacy_unpublished_event_ids", "last_scan_failures"} and not (set(state) - set(default_state())):
+            state = dict(state)
+            state.setdefault("legacy_unpublished_event_ids", [])
+            state.setdefault("last_scan_failures", [])
     _validate_state(state)
     return state
 

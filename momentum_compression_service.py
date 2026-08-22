@@ -128,13 +128,40 @@ def evaluate_htf_alignment(symbol: str, side: str, *, fetch=fetch_klines) -> dic
     return {"alignment": alignment, "timeframes": verdicts}
 
 
+class CompressionSymbolScanError(RuntimeError):
+    def __init__(self, detail):
+        super().__init__(detail["message"])
+        self.detail = detail
+
+
+def _failure_detail(symbol, error, *, stage, attempts):
+    message = " ".join(str(error).split())[:160] or error.__class__.__name__
+    return {
+        "symbol": symbol,
+        "stage": stage,
+        "error_type": error.__class__.__name__,
+        "message": message,
+        "attempts": attempts,
+    }
+
+
 def _scan_symbol(symbol: str, *, live_price: float, evaluated_at_ms: int) -> tuple[list[dict], dict[str, pd.DataFrame], int]:
-    frame = fetch_klines(
-        symbol, "15m", 220, exchange="binance", closed_only=True,
-        market_type="futures", testnet=False,
-    )
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        raise ValueError("15m candle history is unavailable")
+    frame = None
+    for attempt in (1, 2):
+        try:
+            frame = fetch_klines(
+                symbol, "15m", 220, exchange="binance", closed_only=True,
+                market_type="futures", testnet=False, raise_errors=True,
+            )
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise ValueError("15m candle history is unavailable")
+            break
+        except Exception as error:
+            if attempt == 2:
+                raise CompressionSymbolScanError(
+                    _failure_detail(symbol, error, stage="15m_klines", attempts=2)
+                ) from error
+            time.sleep(0.2)
     evaluations = evaluate_both_sides(
         symbol, frame, live_price, evaluated_at_ms=evaluated_at_ms,
         htf_alignment_by_side={"LONG": "UNKNOWN", "SHORT": "UNKNOWN"},
@@ -168,10 +195,15 @@ def scan_compression_market(
     live_prices = fetch_live_prices()
     now_ms = int(time.time() * 1000)
     evaluations, frames = [], {}
-    errors, close_times, failed_symbols = 0, [], []
-    price_missing = [symbol for symbol in symbols if symbol not in live_prices]
-    failed_symbols.extend(price_missing)
-    errors += len(price_missing)
+    close_times = []
+    failed_details = [
+        _failure_detail(
+            symbol, ValueError("live price unavailable"),
+            stage="live_price", attempts=0,
+        ) | {"error_type": "MissingPrice"}
+        for symbol in symbols if symbol not in live_prices
+    ]
+    price_missing = [item["symbol"] for item in failed_details]
     symbols_to_scan = [symbol for symbol in symbols if symbol in live_prices]
     workers = min(12, max(1, max_workers))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -183,15 +215,20 @@ def scan_compression_market(
             symbol = futures[future]
             try:
                 rows, symbol_frames, close_ms = future.result()
-            except Exception:
-                errors += 1
-                failed_symbols.append(symbol)
+            except CompressionSymbolScanError as error:
+                failed_details.append(error.detail)
+            except Exception as error:
+                failed_details.append(
+                    _failure_detail(symbol, error, stage="symbol_scan", attempts=1)
+                )
             else:
                 evaluations.extend(rows)
                 frames.update(symbol_frames)
                 close_times.append(close_ms)
             if progress is not None:
                 progress(completed, len(symbols))
+    failed_symbols = [item["symbol"] for item in failed_details]
+    errors = len(failed_details)
     # Reload only for the short persistence transaction: live prices may have
     # advanced while network-bound discovery was in progress.
     with compression_state_lock(state_path):
@@ -215,6 +252,7 @@ def scan_compression_market(
         state["last_closed_15m_close_time"] = max(
             close_times, default=state["last_closed_15m_close_time"]
         )
+        state["last_scan_failures"] = failed_details
         state["last_error"] = f"{errors} symbol scan failures" if errors else ""
         save_compression_state(state_path, state)
     eligible_rows = [row for row in evaluations if row["state"] in _ELIGIBLE_STATES]
@@ -235,6 +273,7 @@ def scan_compression_market(
         "evaluated_at": now_ms,
         "last_closed_15m_close_time": state["last_closed_15m_close_time"],
         "failed_symbols": failed_symbols,
+        "failed_details": failed_details,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": finished_at - started_at,

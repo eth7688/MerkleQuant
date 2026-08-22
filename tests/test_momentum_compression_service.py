@@ -167,7 +167,49 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
 
         scan.assert_not_called()
         self.assertIn("AUSDT", report["failed_symbols"])
+        self.assertEqual(report["failed_details"], [{
+            "symbol": "AUSDT", "stage": "live_price",
+            "error_type": "MissingPrice", "message": "live price unavailable", "attempts": 0,
+        }])
         self.assertEqual(stored["pool"]["keep-long"]["data_status"], "unavailable")
+
+    def test_symbol_kline_failure_retries_once_then_succeeds_without_error(self):
+        from momentum_compression_service import scan_compression_market
+
+        frame = trend_frame("LONG", 220)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
+                 patch("momentum_compression_service.fetch_klines", side_effect=[TimeoutError("slow"), frame]) as fetch, \
+                 patch("momentum_compression_service.evaluate_both_sides", return_value=[]), \
+                 patch("momentum_compression_service.time.sleep"):
+                report = scan_compression_market(root / "state.json", root, max_workers=1)
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(report["errors"], 0)
+        self.assertEqual(report["failed_details"], [])
+
+    def test_symbol_kline_failure_after_retry_records_exact_reason(self):
+        from momentum_compression_service import scan_compression_market
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
+                 patch("momentum_compression_service.fetch_klines", side_effect=TimeoutError("  upstream\nslow  ")), \
+                 patch("momentum_compression_service.evaluate_both_sides", return_value=[]), \
+                 patch("momentum_compression_service.time.sleep"):
+                report = scan_compression_market(root / "state.json", root, max_workers=1)
+            stored = load_compression_state(root / "state.json")
+
+        expected = {
+            "symbol": "KEEPUSDT", "stage": "15m_klines",
+            "error_type": "TimeoutError", "message": "upstream slow", "attempts": 2,
+        }
+        self.assertEqual(report["failed_details"], [expected])
+        self.assertEqual(report["errors"], 1)
+        self.assertEqual(stored["last_scan_failures"], [expected])
 
     def test_live_ticker_rejects_nan_and_infinity(self):
         from momentum_compression_service import fetch_live_price

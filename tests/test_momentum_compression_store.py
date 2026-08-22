@@ -220,6 +220,27 @@ class CompressionStateMachineTests(unittest.TestCase):
 
 
 class CompressionStatePersistenceTests(unittest.TestCase):
+    def test_current_version_without_failure_field_migrates_to_empty_list(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            legacy = default_state()
+            legacy.pop("last_scan_failures", None)
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            loaded = load_compression_state(path)
+
+        self.assertEqual(loaded["last_scan_failures"], [])
+
+    def test_failure_details_reject_unbounded_or_invalid_payloads(self):
+        state = default_state()
+        state["last_scan_failures"] = [{
+            "symbol": "KEEPUSDT", "stage": "15m_klines", "error_type": "TimeoutError",
+            "message": "x" * 161, "attempts": 2,
+        }]
+        with TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(ValueError, "scan failure"):
+                save_compression_state(Path(folder) / "state.json", state)
+
     def test_v1_migration_builds_outbox_for_all_historical_fresh_tiers(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="pool")], 1)
         state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2)
