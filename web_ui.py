@@ -4573,7 +4573,11 @@ def internal_compression_automation():
     if not _compression_internal_request_allowed():
         return jsonify({"error": "loopback only"}), 403
     payload = request.get_json(silent=True)
-    if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"enabled"}
+        or type(payload.get("enabled")) is not bool
+    ):
         return jsonify({"error": "enabled must be a boolean"}), 400
     try:
         return jsonify(_compression_monitor.set_auto_enabled(payload["enabled"]))

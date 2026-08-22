@@ -75,6 +75,20 @@ class CompressionInternalApiTests(unittest.TestCase):
         self.assertEqual(response.get_json(), {"auto_enabled": True})
         set_enabled.assert_called_once_with(True)
 
+    def test_loopback_automation_rejects_extra_payload_fields(self):
+        with patch.object(
+            web_ui._compression_monitor,
+            "set_auto_enabled",
+            return_value={"auto_enabled": True},
+        ) as set_enabled:
+            response = self.client.post(
+                "/internal/compression/automation",
+                json={"enabled": True, "extra": "x"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        set_enabled.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

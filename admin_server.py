@@ -178,20 +178,26 @@ def _normalize_reflow_scheduler_status(scheduler):
     }
 
 
+def _compression_monitor_facts(monitor):
+    if not isinstance(monitor, dict):
+        raise ValueError("compression monitor status must be an object")
+    monitor_fields = (
+        "running", "auto_enabled", "last_scan_at", "next_scan_at",
+        "structure_scanning", "scan_started_at", "scan_duration_ms", "last_error",
+    )
+    return {field: monitor.get(field) for field in monitor_fields}
+
+
 def _compression_status_facts(payload):
     if not isinstance(payload, dict):
         raise ValueError("compression status must be an object")
     monitor = payload.get("monitor")
     scan = payload.get("scan")
-    if not isinstance(monitor, dict) or not isinstance(scan, dict):
+    if not isinstance(scan, dict):
         raise ValueError("compression status is incomplete")
-    monitor_fields = (
-        "running", "auto_enabled", "last_scan_at", "next_scan_at",
-        "structure_scanning", "scan_started_at", "scan_duration_ms", "last_error",
-    )
     scan_fields = ("scanned", "eligible", "errors")
     return {
-        "monitor": {field: monitor.get(field) for field in monitor_fields},
+        "monitor": _compression_monitor_facts(monitor),
         "scan": {field: scan.get(field) for field in scan_fields},
     }
 
@@ -212,7 +218,7 @@ def api_compression_settings():
                 json={"enabled": enabled}, timeout=3,
             )
             response.raise_for_status()
-            return jsonify(response.json())
+            return jsonify({"monitor": _compression_monitor_facts(response.json())})
         response = _requests.get(
             f"{_WEB_UI}/internal/compression/status", timeout=3
         )

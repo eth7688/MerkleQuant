@@ -640,11 +640,45 @@ class CompressionAdminTests(unittest.TestCase):
             response = self.client.post("/api/compression/settings", json={"enabled": True})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {"auto_enabled": True})
         post.assert_called_once_with(
             "http://127.0.0.1:5000/internal/compression/automation",
             json={"enabled": True},
             timeout=3,
+        )
+
+    def test_compression_settings_post_whitelists_internal_response(self):
+        login_admin(self.client)
+        internal = Mock()
+        internal.raise_for_status.return_value = None
+        internal.json.return_value = {
+            "running": True,
+            "auto_enabled": True,
+            "last_scan_at": 10,
+            "next_scan_at": "2026-08-22T00:15:00+00:00",
+            "structure_scanning": False,
+            "scan_started_at": 5,
+            "scan_duration_ms": 123,
+            "last_error": "",
+            "secret": "must not leak",
+        }
+        with patch.object(admin_server._requests, "post", return_value=internal):
+            response = self.client.post("/api/compression/settings", json={"enabled": True})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "monitor": {
+                    "running": True,
+                    "auto_enabled": True,
+                    "last_scan_at": 10,
+                    "next_scan_at": "2026-08-22T00:15:00+00:00",
+                    "structure_scanning": False,
+                    "scan_started_at": 5,
+                    "scan_duration_ms": 123,
+                    "last_error": "",
+                }
+            },
         )
 
     def test_compression_html_exposes_navigation_and_renderer(self):
