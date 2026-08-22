@@ -177,6 +177,50 @@ def _normalize_reflow_scheduler_status(scheduler):
         "running": running,
     }
 
+
+def _compression_status_facts(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("compression status must be an object")
+    monitor = payload.get("monitor")
+    scan = payload.get("scan")
+    if not isinstance(monitor, dict) or not isinstance(scan, dict):
+        raise ValueError("compression status is incomplete")
+    monitor_fields = (
+        "running", "auto_enabled", "last_scan_at", "next_scan_at",
+        "structure_scanning", "scan_started_at", "scan_duration_ms", "last_error",
+    )
+    scan_fields = ("scanned", "eligible", "errors")
+    return {
+        "monitor": {field: monitor.get(field) for field in monitor_fields},
+        "scan": {field: scan.get(field) for field in scan_fields},
+    }
+
+
+@app.route("/api/compression/settings", methods=["GET", "POST"])
+@admin_required
+def api_compression_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True)
+            enabled = data.get("enabled") if isinstance(data, dict) else None
+            if type(enabled) is not bool:
+                return jsonify({"error": "enabled must be a boolean"}), 400
+            response = _requests.post(
+                f"{_WEB_UI}/internal/compression/automation",
+                json={"enabled": enabled}, timeout=3,
+            )
+            response.raise_for_status()
+            return jsonify(response.json())
+        response = _requests.get(
+            f"{_WEB_UI}/internal/compression/status", timeout=3
+        )
+        response.raise_for_status()
+        return jsonify(_compression_status_facts(response.json()))
+    except Exception:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+
 @app.route("/api/reflow/settings", methods=["GET", "POST"])
 @admin_required
 def api_reflow_settings():
@@ -415,6 +459,7 @@ input:focus,select:focus{outline:none;border-color:var(--brand)}
   <div class="nav-item" data-page="fuel" onclick="switchPage('fuel')">⛽ 燃料管理</div>
   <div class="nav-item" data-page="demo" onclick="switchPage('demo')">📡 回测参数</div>
   <div class="nav-item" data-page="reflow" onclick="switchPage('reflow')">↺ 动能回流</div>
+  <div class="nav-item" data-page="compression" onclick="switchPage('compression')">◈ 压缩扫描</div>
   <div class="nav-item" data-page="engine" onclick="switchPage('engine')">⚙ 演示引擎</div>
   <div style="margin-top:auto;padding:20px;border-top:1px solid var(--border)"><span style="font-size:11px;color:var(--muted)" id="loginInfo">未登录</span><br><a href="#" onclick="doLogout()" style="font-size:10px;color:var(--s-red)">退出</a></div>
 </div>
@@ -456,6 +501,7 @@ function switchPage(p){
   else if(p==='fuel') renderFuel(c);
   else if(p==='demo') renderDemoCfg(c);
   else if(p==='reflow') renderReflow(c);
+  else if(p==='compression') renderCompression(c);
   else if(p==='engine'){renderEngine(c);_refreshTimer=setInterval(renderDemoPositions,2000);}
 }
 function renderDashboard(el){
@@ -488,6 +534,59 @@ function renderFuel(el){
     });
     h+='</tbody></table></div>';el.innerHTML=h;
   });
+}
+function formatCompressionTime(value){
+  if(!value) return '--';
+  if(typeof value==='string') return value.replace('T',' ').replace('+00:00',' UTC');
+  return formatReflowTime(value);
+}
+function renderCompression(el){
+  el.innerHTML='<div class="card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">压缩扫描自动监控</h3><p style="color:var(--muted);font-size:12px;line-height:1.7">仅控制监控引擎，不修改告警或交易配置。</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer"><input type="checkbox" id="compressionAutoEnabled" style="width:auto">自动扫描</label>'+
+    '</div><div id="compressionSaveError" role="alert" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">'+
+      '<div class="stat-box"><div class="label">自动状态</div><div class="value" id="compressionEnabledState" style="font-size:18px">--</div></div>'+
+      '<div class="stat-box"><div class="label">引擎状态</div><div id="compressionRunning" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">上次扫描</div><div id="compressionLastScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">下次扫描</div><div id="compressionNextScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">当前扫描</div><div id="compressionCurrentScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">扫描耗时</div><div id="compressionDuration" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">已扫描</div><div id="compressionScanned" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">合格候选</div><div id="compressionEligible" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">错误数</div><div id="compressionErrors" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近错误</div><div id="compressionLastError" style="font-size:12px;color:var(--s-red)">--</div></div>'+
+    '</div></div>';
+  var box=document.getElementById('compressionAutoEnabled');
+  var error=document.getElementById('compressionSaveError');
+  box.disabled=true;
+  fetch('/api/compression/settings').then(function(response){return response.json().then(function(data){if(!response.ok) throw new Error(data.error||'读取设置失败');return data;});}).then(function(data){
+    if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;
+    var monitor=data.monitor||{}, scan=data.scan||{};
+    box.checked=Boolean(monitor.auto_enabled); box.dataset.savedChecked=String(box.checked); box.disabled=false;
+    document.getElementById('compressionEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('compressionRunning').textContent=monitor.running?'运行中':'已停止';
+    document.getElementById('compressionLastScan').textContent=formatCompressionTime(monitor.last_scan_at);
+    document.getElementById('compressionNextScan').textContent=formatCompressionTime(monitor.next_scan_at);
+    document.getElementById('compressionCurrentScan').textContent=monitor.structure_scanning?'扫描中':'空闲';
+    document.getElementById('compressionDuration').textContent=(monitor.scan_duration_ms||0)+' ms';
+    document.getElementById('compressionScanned').textContent=scan.scanned||0;
+    document.getElementById('compressionEligible').textContent=scan.eligible||0;
+    document.getElementById('compressionErrors').textContent=scan.errors||0;
+    document.getElementById('compressionLastError').textContent=monitor.last_error||'无';
+    box.onchange=saveCompressionSetting;
+  }).catch(function(reason){if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;error.style.display='block';error.textContent=reason.message||'读取设置失败';});
+}
+function saveCompressionSetting(){
+  var box=document.getElementById('compressionAutoEnabled');
+  var error=document.getElementById('compressionSaveError');
+  var previous=box.dataset.savedChecked==='true';
+  error.style.display='none'; error.textContent=''; box.disabled=true;
+  fetch('/api/compression/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:Boolean(box.checked)})}).then(function(response){return response.json().then(function(data){if(!response.ok) throw new Error(data.error||'保存失败');return data;});}).then(function(){
+    if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;
+    box.dataset.savedChecked=String(box.checked); document.getElementById('compressionEnabledState').textContent=box.checked?'已启用':'已关闭';
+  }).catch(function(reason){if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;box.checked=previous;error.style.display='block';error.textContent=reason.message||'保存失败';}).finally(function(){if(_currentPage==='compression'&&document.getElementById('compressionAutoEnabled')===box) box.disabled=false;});
 }
 var _reflowRenderGeneration=0;
 function isCurrentReflowRender(generation, box){

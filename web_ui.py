@@ -4536,6 +4536,50 @@ def compression_automation():
     except ValueError as error:
         return jsonify({"error": str(error)[:80]}), 400
 
+
+def _compression_internal_request_allowed():
+    return request.remote_addr in {"127.0.0.1", "::1"}
+
+
+def _compression_internal_status():
+    monitor = _compression_monitor.status()
+    with _compression_monitor_lock:
+        scan = dict(_compression_scan_summary)
+    return {
+        "monitor": {
+            key: monitor.get(key)
+            for key in (
+                "running", "auto_enabled", "last_scan_at", "next_scan_at",
+                "structure_scanning", "scan_started_at", "scan_duration_ms",
+                "last_error",
+            )
+        },
+        "scan": {key: scan.get(key, 0) for key in ("scanned", "eligible", "errors")},
+    }
+
+
+@app.route("/internal/compression/status")
+def internal_compression_status():
+    if not _compression_internal_request_allowed():
+        return jsonify({"error": "loopback only"}), 403
+    try:
+        return jsonify(_compression_internal_status())
+    except ValueError:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+
+
+@app.route("/internal/compression/automation", methods=["POST"])
+def internal_compression_automation():
+    if not _compression_internal_request_allowed():
+        return jsonify({"error": "loopback only"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+        return jsonify({"error": "enabled must be a boolean"}), 400
+    try:
+        return jsonify(_compression_monitor.set_auto_enabled(payload["enabled"]))
+    except ValueError as error:
+        return jsonify({"error": str(error)[:80]}), 400
+
 @app.route("/api/compression/alerts")
 def compression_alert_events():
     if not session.get("user_id"):

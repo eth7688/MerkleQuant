@@ -576,6 +576,86 @@ class MomentumReflowAdminTests(unittest.TestCase):
         )
 
 
+class CompressionAdminTests(unittest.TestCase):
+    def setUp(self):
+        admin_server.app.config.update(TESTING=True)
+        self.client = admin_server.app.test_client()
+
+    def test_compression_settings_require_authenticated_admin(self):
+        self.assertEqual(self.client.get("/api/compression/settings").status_code, 403)
+        self.assertEqual(
+            self.client.post("/api/compression/settings", json={"enabled": True}).status_code,
+            403,
+        )
+
+    def test_compression_settings_get_whitelists_internal_facts(self):
+        login_admin(self.client)
+        internal = Mock()
+        internal.raise_for_status.return_value = None
+        internal.json.return_value = {
+            "monitor": {
+                "auto_enabled": True,
+                "running": True,
+                "last_scan_at": 10,
+                "next_scan_at": "2026-08-22T00:15:00+00:00",
+                "structure_scanning": False,
+                "scan_started_at": 5,
+                "scan_duration_ms": 123,
+                "last_error": "",
+                "secret": "must not leak",
+            },
+            "scan": {"scanned": 9, "eligible": 2, "errors": 1, "extra": "no"},
+            "alert": {"webhook": "must not leak"},
+        }
+        with patch.object(admin_server._requests, "get", return_value=internal) as get:
+            response = self.client.get("/api/compression/settings")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "monitor": {
+                    "auto_enabled": True,
+                    "running": True,
+                    "last_scan_at": 10,
+                    "next_scan_at": "2026-08-22T00:15:00+00:00",
+                    "structure_scanning": False,
+                    "scan_started_at": 5,
+                    "scan_duration_ms": 123,
+                    "last_error": "",
+                },
+                "scan": {"scanned": 9, "eligible": 2, "errors": 1},
+            },
+        )
+        get.assert_called_once_with(
+            "http://127.0.0.1:5000/internal/compression/status", timeout=3
+        )
+
+    def test_compression_settings_post_forwards_exact_boolean(self):
+        login_admin(self.client)
+        internal = Mock()
+        internal.raise_for_status.return_value = None
+        internal.json.return_value = {"auto_enabled": True}
+        with patch.object(admin_server._requests, "post", return_value=internal) as post:
+            response = self.client.post("/api/compression/settings", json={"enabled": True})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"auto_enabled": True})
+        post.assert_called_once_with(
+            "http://127.0.0.1:5000/internal/compression/automation",
+            json={"enabled": True},
+            timeout=3,
+        )
+
+    def test_compression_html_exposes_navigation_and_renderer(self):
+        html = admin_server.ADMIN_HTML
+
+        self.assertIn('data-page="compression"', html)
+        self.assertIn("renderCompression", html)
+        self.assertIn("compressionAutoEnabled", html)
+        self.assertIn("compressionSaveError", html)
+
+
 class MomentumReflowAlertAdminTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
