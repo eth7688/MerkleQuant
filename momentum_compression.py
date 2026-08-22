@@ -219,6 +219,85 @@ def _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params, bar
     return result
 
 
+def _prepare_evaluation_frame(
+    closed_15m: pd.DataFrame,
+    evaluated_at_ms: int,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, list[str]]:
+    frame = closed_15m.loc[:, REQUIRED_COLUMNS].copy().reset_index(drop=True)
+    frame["ot"] = pd.to_numeric(frame["ot"], errors="coerce")
+    frame = frame[frame["ot"] + 900_000 <= evaluated_at_ms].reset_index(drop=True)
+    if frame.empty:
+        return frame, None, ["NO_CLOSED_CANDLES"]
+    for column in REQUIRED_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if not np.isfinite(frame.to_numpy(dtype=float)).all():
+        return frame, None, ["NONFINITE_OHLCV"]
+    return frame, add_compression_indicators(frame), []
+
+
+def _evaluate_prepared_side(
+    symbol: str,
+    side: str,
+    frame: pd.DataFrame,
+    indicators: pd.DataFrame,
+    live_price: float,
+    *,
+    evaluated_at_ms: int,
+    htf_alignment: str,
+    params: CompressionParams,
+    common_cache: dict | None = None,
+) -> dict:
+    window, metrics = _maximal_structural_suffix(
+        indicators, side, params, common_cache=common_cache
+    )
+    bars = len(window)
+    reasons = list(metrics.get("rejection_reasons", []))
+    if bars < params.min_bars:
+        reasons.append("WINDOW_TOO_SHORT")
+    if bars > params.max_bars:
+        reasons.append("WINDOW_TOO_LONG")
+    envelope = metrics.get("envelope", {})
+    if reasons:
+        return _rejected(
+            symbol, side, evaluated_at_ms, htf_alignment,
+            reasons, params, bars, window,
+        )
+    upper, lower = envelope["upper"], envelope["lower"]
+    atr14 = float(window["atr14"].iloc[-1])
+    metrics["ema_distance_atr"] = (
+        abs(float(window["ema8"].iloc[-1] - window["ema21"].iloc[-1])) / atr14
+        if atr14 else float("inf")
+    )
+    score, score_components = _quality_score(metrics, params)
+    result = {
+        "symbol": symbol, "side": side, "evaluated_at": evaluated_at_ms,
+        "htf_alignment": htf_alignment, "parameter_version": params.version,
+        "rejection_reasons": [], "compression_bars": bars,
+        "compression_start_time": int(window["ot"].iloc[0]),
+        "compression_end_time": int(window["ot"].iloc[-1]),
+        "upper_boundary_price": float(upper.iloc[-1]),
+        "lower_boundary_price": float(lower.iloc[-1]),
+        "upper_boundary_slope": envelope["upper_slope"],
+        "lower_boundary_slope": envelope["lower_slope"],
+        "atr14": atr14, "ema8": float(window["ema8"].iloc[-1]),
+        "ema21": float(window["ema21"].iloc[-1]),
+        "ema_distance_atr": metrics["ema_distance_atr"],
+        "contraction_ratio": metrics["contraction_ratio"],
+        "pivot_high_count": len(metrics["pivot_highs"]),
+        "pivot_low_count": len(metrics["pivot_lows"]),
+        "directional_touch_count": len(metrics["directional_events"]),
+        "directional_touch_times": [
+            int(window["ot"].iloc[index]) for index in metrics["directional_events"]
+        ],
+        "breakout_buffer_price": atr14 * params.breakout_buffer_atr,
+        "quality_score": score, "score_components": score_components,
+        "swing": metrics["swing"],
+    }
+    result["compression_id"] = compression_identity(result)
+    result["state"] = _classify_without_episode(result, float(live_price), params)
+    return result
+
+
 def evaluate_side(symbol: str, side: str, closed_15m: pd.DataFrame, live_price: float, *, evaluated_at_ms: int, htf_alignment: str, params: CompressionParams = CompressionParams()) -> dict:
     reasons = []
     if side not in ("LONG", "SHORT"): reasons.append("INVALID_SIDE")
@@ -229,50 +308,56 @@ def evaluate_side(symbol: str, side: str, closed_15m: pd.DataFrame, live_price: 
         reasons.append("MISSING_REQUIRED_COLUMNS")
     if reasons:
         return _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params)
-    # Callers may include their currently forming candle.  A 15m candle is
-    # eligible only after its complete interval ends at evaluated_at_ms.
-    frame = closed_15m.loc[:, REQUIRED_COLUMNS].copy().reset_index(drop=True)
-    frame["ot"] = pd.to_numeric(frame["ot"], errors="coerce")
-    frame = frame[frame["ot"] + 900_000 <= evaluated_at_ms].reset_index(drop=True)
-    if frame.empty:
-        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NO_CLOSED_CANDLES"], params)
-    for column in REQUIRED_COLUMNS:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if not np.isfinite(frame.to_numpy(dtype=float)).all():
-        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, ["NONFINITE_OHLCV"], params, len(frame), frame)
-    indicators = add_compression_indicators(frame)
-    window, metrics = _maximal_structural_suffix(indicators, side, params)
-    bars = len(window)
-    reasons = list(metrics.get("rejection_reasons", []))
-    if bars < params.min_bars: reasons.append("WINDOW_TOO_SHORT")
-    if bars > params.max_bars: reasons.append("WINDOW_TOO_LONG")
-    envelope = metrics.get("envelope", {})
-    if reasons:
-        return _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params, bars, window)
-    upper, lower = envelope["upper"], envelope["lower"]
-    atr14 = float(window["atr14"].iloc[-1])
-    metrics["ema_distance_atr"] = abs(float(window["ema8"].iloc[-1] - window["ema21"].iloc[-1])) / atr14 if atr14 else float("inf")
-    score, score_components = _quality_score(metrics, params)
-    result = {
-        "symbol": symbol, "side": side, "evaluated_at": evaluated_at_ms, "htf_alignment": htf_alignment,
-        "parameter_version": params.version, "rejection_reasons": [], "compression_bars": bars,
-        "compression_start_time": int(window["ot"].iloc[0]), "compression_end_time": int(window["ot"].iloc[-1]),
-        "upper_boundary_price": float(upper.iloc[-1]), "lower_boundary_price": float(lower.iloc[-1]),
-        "upper_boundary_slope": envelope["upper_slope"], "lower_boundary_slope": envelope["lower_slope"],
-        "atr14": atr14, "ema8": float(window["ema8"].iloc[-1]), "ema21": float(window["ema21"].iloc[-1]),
-        "ema_distance_atr": metrics["ema_distance_atr"], "contraction_ratio": metrics["contraction_ratio"],
-        "pivot_high_count": len(metrics["pivot_highs"]), "pivot_low_count": len(metrics["pivot_lows"]),
-        "directional_touch_count": len(metrics["directional_events"]),
-        "directional_touch_times": [int(window["ot"].iloc[index]) for index in metrics["directional_events"]],
-        "breakout_buffer_price": atr14 * params.breakout_buffer_atr, "quality_score": score,
-        "score_components": score_components, "swing": metrics["swing"],
-    }
-    result["compression_id"] = compression_identity(result)
-    result["state"] = _classify_without_episode(result, float(live_price), params)
-    return result
+    frame, indicators, preparation_reasons = _prepare_evaluation_frame(
+        closed_15m, evaluated_at_ms
+    )
+    if preparation_reasons:
+        return _rejected(
+            symbol, side, evaluated_at_ms, htf_alignment,
+            preparation_reasons, params, len(frame), frame,
+        )
+    return _evaluate_prepared_side(
+        symbol, side, frame, indicators, live_price,
+        evaluated_at_ms=evaluated_at_ms, htf_alignment=htf_alignment,
+        params=params,
+    )
 
 
 def evaluate_both_sides(symbol: str, closed_15m: pd.DataFrame, live_price: float, *, evaluated_at_ms: int, htf_alignment_by_side: dict[str, str], params: CompressionParams = CompressionParams()) -> list[dict]:
-    return [evaluate_side(symbol, side, closed_15m, live_price, evaluated_at_ms=evaluated_at_ms,
-                          htf_alignment=htf_alignment_by_side.get(side, "UNKNOWN"), params=params)
-            for side in ("LONG", "SHORT")]
+    reasons = []
+    if not isinstance(live_price, (int, float, np.number)) or not math.isfinite(float(live_price)):
+        reasons.append("INVALID_LIVE_PRICE")
+    if closed_15m is None or closed_15m.empty:
+        reasons.append("EMPTY_DATA")
+    elif any(column not in closed_15m.columns for column in REQUIRED_COLUMNS):
+        reasons.append("MISSING_REQUIRED_COLUMNS")
+    if reasons:
+        return [
+            _rejected(
+                symbol, side, evaluated_at_ms,
+                htf_alignment_by_side.get(side, "UNKNOWN"), reasons, params,
+            )
+            for side in ("LONG", "SHORT")
+        ]
+    frame, indicators, preparation_reasons = _prepare_evaluation_frame(
+        closed_15m, evaluated_at_ms
+    )
+    if preparation_reasons:
+        return [
+            _rejected(
+                symbol, side, evaluated_at_ms,
+                htf_alignment_by_side.get(side, "UNKNOWN"),
+                preparation_reasons, params, len(frame), frame,
+            )
+            for side in ("LONG", "SHORT")
+        ]
+    common_cache = {}
+    return [
+        _evaluate_prepared_side(
+            symbol, side, frame, indicators, live_price,
+            evaluated_at_ms=evaluated_at_ms,
+            htf_alignment=htf_alignment_by_side.get(side, "UNKNOWN"),
+            params=params, common_cache=common_cache,
+        )
+        for side in ("LONG", "SHORT")
+    ]

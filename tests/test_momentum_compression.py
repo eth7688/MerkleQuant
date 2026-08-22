@@ -4,6 +4,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+import momentum_compression as compression_module
+
 from momentum_compression import (
     CompressionParams,
     _classify_without_episode,
@@ -220,6 +222,21 @@ class CompressionRuleTests(unittest.TestCase):
                                       htf_alignment_by_side={})
         self.assertEqual([row["side"] for row in results], ["LONG", "SHORT"])
         self.assertTrue(all(row["rejection_reasons"] for row in results))
+
+    def test_evaluate_both_sides_prepares_indicators_once(self):
+        frame = valid_compression_frame(40)
+        evaluated_at = int(frame["ot"].iloc[-1] + 900_000)
+        with patch(
+            "momentum_compression.add_compression_indicators",
+            wraps=compression_module.add_compression_indicators,
+        ) as indicators:
+            rows = evaluate_both_sides(
+                "TESTUSDT", frame, 115.0,
+                evaluated_at_ms=evaluated_at,
+                htf_alignment_by_side={"LONG": "UNKNOWN", "SHORT": "UNKNOWN"},
+            )
+        self.assertEqual([row["side"] for row in rows], ["LONG", "SHORT"])
+        self.assertEqual(indicators.call_count, 1)
 
     def test_boundary_equalities_do_not_classify_as_outside(self):
         evaluation = {
