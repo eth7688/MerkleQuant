@@ -4550,7 +4550,7 @@ def _compression_internal_status():
             key: monitor.get(key)
             for key in (
                 "running", "auto_enabled", "last_scan_at", "next_scan_at",
-                "structure_scanning", "scan_started_at", "scan_duration_ms",
+                "structure_scanning", "scan_started_at", "scan_duration_ms", "scan_overdue",
                 "last_error",
             )
         },

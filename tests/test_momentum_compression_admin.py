@@ -35,6 +35,7 @@ class CompressionInternalApiTests(unittest.TestCase):
             "structure_scanning": False,
             "scan_started_at": 99,
             "scan_duration_ms": 456,
+            "scan_overdue": True,
             "last_error": "",
             "unexpected": "must not leak",
         }
@@ -55,6 +56,7 @@ class CompressionInternalApiTests(unittest.TestCase):
                     "structure_scanning": False,
                     "scan_started_at": 99,
                     "scan_duration_ms": 456,
+                    "scan_overdue": True,
                     "last_error": "",
                 },
                 "scan": {"scanned": 12, "eligible": 3, "errors": 1},

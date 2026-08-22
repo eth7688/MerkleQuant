@@ -183,7 +183,7 @@ def _compression_monitor_facts(monitor):
         raise ValueError("compression monitor status must be an object")
     monitor_fields = (
         "running", "auto_enabled", "last_scan_at", "next_scan_at",
-        "structure_scanning", "scan_started_at", "scan_duration_ms", "last_error",
+        "structure_scanning", "scan_started_at", "scan_duration_ms", "scan_overdue", "last_error",
     )
     return {field: monitor.get(field) for field in monitor_fields}
 
@@ -507,7 +507,7 @@ function switchPage(p){
   else if(p==='fuel') renderFuel(c);
   else if(p==='demo') renderDemoCfg(c);
   else if(p==='reflow') renderReflow(c);
-  else if(p==='compression') renderCompression(c);
+  else if(p==='compression'){renderCompression(c);_refreshTimer=setInterval(function(){if(_currentPage==='compression') renderCompression(document.getElementById('content'));},2000);}
   else if(p==='engine'){renderEngine(c);_refreshTimer=setInterval(renderDemoPositions,2000);}
 }
 function renderDashboard(el){
@@ -575,7 +575,7 @@ function renderCompression(el){
     document.getElementById('compressionRunning').textContent=monitor.running?'运行中':'已停止';
     document.getElementById('compressionLastScan').textContent=formatCompressionTime(monitor.last_scan_at);
     document.getElementById('compressionNextScan').textContent=formatCompressionTime(monitor.next_scan_at);
-    document.getElementById('compressionCurrentScan').textContent=monitor.structure_scanning?'扫描中':'空闲';
+    document.getElementById('compressionCurrentScan').textContent=monitor.scan_overdue?'扫描超时':(monitor.structure_scanning?'扫描中':'空闲');
     document.getElementById('compressionDuration').textContent=(monitor.scan_duration_ms||0)+' ms';
     document.getElementById('compressionScanned').textContent=scan.scanned||0;
     document.getElementById('compressionEligible').textContent=scan.eligible||0;

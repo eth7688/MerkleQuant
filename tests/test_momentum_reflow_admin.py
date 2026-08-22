@@ -37,7 +37,11 @@ def run_admin_javascript(test_body):
           'reflowLastError', 'reflowSaveError',
           'reflowWechatEnabled', 'reflowWebhook', 'reflowWebhookMask',
           'reflowWechatState', 'reflowWechatTest', 'reflowWechatTestState',
-          'reflowWechatDeliveryState', 'reflowAlertSaveError'
+          'reflowWechatDeliveryState', 'reflowAlertSaveError',
+          'compressionAutoEnabled', 'compressionSaveError', 'compressionEnabledState',
+          'compressionRunning', 'compressionLastScan', 'compressionNextScan',
+          'compressionCurrentScan', 'compressionDuration', 'compressionScanned',
+          'compressionEligible', 'compressionErrors', 'compressionLastError'
         ];
         let elements = {};
         function newElement(id) {
@@ -601,6 +605,7 @@ class CompressionAdminTests(unittest.TestCase):
                 "structure_scanning": False,
                 "scan_started_at": 5,
                 "scan_duration_ms": 123,
+                "scan_overdue": True,
                 "last_error": "",
                 "secret": "must not leak",
             },
@@ -622,6 +627,7 @@ class CompressionAdminTests(unittest.TestCase):
                     "structure_scanning": False,
                     "scan_started_at": 5,
                     "scan_duration_ms": 123,
+                    "scan_overdue": True,
                     "last_error": "",
                 },
                 "scan": {"scanned": 9, "eligible": 2, "errors": 1},
@@ -658,6 +664,7 @@ class CompressionAdminTests(unittest.TestCase):
             "structure_scanning": False,
             "scan_started_at": 5,
             "scan_duration_ms": 123,
+            "scan_overdue": True,
             "last_error": "",
             "secret": "must not leak",
         }
@@ -676,6 +683,7 @@ class CompressionAdminTests(unittest.TestCase):
                     "structure_scanning": False,
                     "scan_started_at": 5,
                     "scan_duration_ms": 123,
+                    "scan_overdue": True,
                     "last_error": "",
                 }
             },
@@ -688,6 +696,42 @@ class CompressionAdminTests(unittest.TestCase):
         self.assertIn("renderCompression", html)
         self.assertIn("compressionAutoEnabled", html)
         self.assertIn("compressionSaveError", html)
+
+    def test_compression_panel_refreshes_and_labels_overdue_scans(self):
+        html = admin_server.ADMIN_HTML
+
+        self.assertIn("scan_overdue", html)
+        self.assertIn("扫描超时", html)
+        self.assertIn("p==='compression'", html)
+        self.assertIn("setInterval", html)
+        self.assertIn("_currentPage==='compression'", html)
+
+    def test_compression_panel_refreshes_then_clears_timer_on_navigation(self):
+        run_admin_javascript(
+            textwrap.dedent(
+                """
+                  let timer, timerId=0, cleared=[];
+                  global.setInterval=function(callback){timer=callback; return ++timerId;};
+                  global.clearInterval=function(id){cleared.push(id);};
+                  switchPage('compression');
+                  assert.strictEqual(requests.length, 1);
+                  requests[0].resolve(response(true, {
+                    monitor:{auto_enabled:true,running:true,last_scan_at:0,next_scan_at:null,
+                      structure_scanning:true,scan_started_at:1,scan_duration_ms:2,
+                      scan_overdue:true,last_error:''},
+                    scan:{scanned:3,eligible:2,errors:1}
+                  }));
+                  await flush();
+                  assert.strictEqual(elements.compressionCurrentScan.textContent, '扫描超时');
+                  timer();
+                  assert.strictEqual(requests.length, 2);
+                  switchPage('dashboard');
+                  assert.deepStrictEqual(cleared, [1]);
+                  timer();
+                  assert.strictEqual(requests.length, 3);
+                """
+            )
+        )
 
 
 class MomentumReflowAlertAdminTests(unittest.TestCase):
