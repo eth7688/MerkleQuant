@@ -40,15 +40,25 @@ def add_compression_indicators(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _pivots(frame: pd.DataFrame, span: int) -> tuple[list[int], list[int]]:
-    highs, lows = [], []
-    for index in range(span, len(frame) - span):
-        high_window = frame["h"].iloc[index - span:index + span + 1]
-        low_window = frame["l"].iloc[index - span:index + span + 1]
-        if frame["h"].iloc[index] == high_window.max() and (high_window == frame["h"].iloc[index]).sum() == 1:
-            highs.append(index)
-        if frame["l"].iloc[index] == low_window.min() and (low_window == frame["l"].iloc[index]).sum() == 1:
-            lows.append(index)
-    return highs, lows
+    width = 2 * span + 1
+    if span < 0 or len(frame) < width:
+        return [], []
+    highs = frame["h"].to_numpy(dtype=float, copy=False)
+    lows = frame["l"].to_numpy(dtype=float, copy=False)
+    high_windows = np.lib.stride_tricks.sliding_window_view(highs, width)
+    low_windows = np.lib.stride_tricks.sliding_window_view(lows, width)
+    high_centers = highs[span:span + len(high_windows)]
+    low_centers = lows[span:span + len(low_windows)]
+    high_mask = (high_centers == high_windows.max(axis=1)) & (
+        (high_windows == high_centers[:, None]).sum(axis=1) == 1
+    )
+    low_mask = (low_centers == low_windows.min(axis=1)) & (
+        (low_windows == low_centers[:, None]).sum(axis=1) == 1
+    )
+    return (
+        (np.flatnonzero(high_mask) + span).tolist(),
+        (np.flatnonzero(low_mask) + span).tolist(),
+    )
 
 
 def _fit_shifted_envelope(frame: pd.DataFrame, pivot_highs: list[int], pivot_lows: list[int]) -> dict:
@@ -66,6 +76,28 @@ def _fit_shifted_envelope(frame: pd.DataFrame, pivot_highs: list[int], pivot_low
         "lower": lower,
         "upper_slope": float(upper_slope),
         "lower_slope": float(lower_slope),
+    }
+
+
+def _common_structure(frame: pd.DataFrame, params: CompressionParams) -> dict:
+    pivot_highs, pivot_lows = _pivots(frame, params.pivot_span)
+    envelope = _fit_shifted_envelope(frame, pivot_highs, pivot_lows)
+    if not envelope:
+        return {
+            "pivot_highs": pivot_highs,
+            "pivot_lows": pivot_lows,
+            "envelope": {},
+        }
+    widths = envelope["upper"] - envelope["lower"]
+    contraction_ratio = (
+        float(widths.iloc[-1] / widths.iloc[0])
+        if widths.iloc[0] else float("inf")
+    )
+    return {
+        "pivot_highs": pivot_highs,
+        "pivot_lows": pivot_lows,
+        "envelope": envelope,
+        "contraction_ratio": contraction_ratio,
     }
 
 
@@ -98,32 +130,49 @@ def _swing_structure(frame: pd.DataFrame, pivot_highs: list[int], pivot_lows: li
     return result
 
 
-def _non_length_rules(frame: pd.DataFrame, side: str, params: CompressionParams) -> dict:
-    pivot_highs, pivot_lows = _pivots(frame, params.pivot_span)
-    envelope = _fit_shifted_envelope(frame, pivot_highs, pivot_lows)
+def _non_length_rules(frame, side, params, *, common=None):
+    common = common if common is not None else _common_structure(frame, params)
+    pivot_highs = common["pivot_highs"]
+    pivot_lows = common["pivot_lows"]
+    envelope = common["envelope"]
     reasons = []
     if not envelope:
         reasons.append("INSUFFICIENT_PIVOTS")
-        return {"rejection_reasons": reasons, "pivot_highs": pivot_highs,
-                "pivot_lows": pivot_lows, "envelope": envelope}
+        return {
+            "rejection_reasons": reasons,
+            "pivot_highs": pivot_highs,
+            "pivot_lows": pivot_lows,
+            "envelope": envelope,
+        }
     upper, lower = envelope["upper"], envelope["lower"]
     atr = frame["atr14"].replace(0, np.nan)
     ema8, ema21 = frame["ema8"], frame["ema21"]
     if side == "LONG":
-        if not bool((ema8 > ema21).all()): reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] > pd.concat((ema8, ema21), axis=1).max(axis=1)).all()): reasons.append("CLOSE_IN_EMA_BAND")
-        directional_events = _touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
+        if not bool((ema8 > ema21).all()):
+            reasons.append("EMA_DIRECTION")
+        if not bool((frame["c"] > pd.concat((ema8, ema21), axis=1).max(axis=1)).all()):
+            reasons.append("CLOSE_IN_EMA_BAND")
+        directional_events = _touch_events(
+            frame["l"], lower, atr, params.touch_tolerance_atr
+        )
     else:
-        if not bool((ema8 < ema21).all()): reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()): reasons.append("CLOSE_IN_EMA_BAND")
-        directional_events = _touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
-    if not math.isfinite(float(atr.iloc[-1])) or abs(float(ema8.iloc[-1] - ema21.iloc[-1])) > float(atr.iloc[-1]) * params.max_ema_distance_atr:
+        if not bool((ema8 < ema21).all()):
+            reasons.append("EMA_DIRECTION")
+        if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()):
+            reasons.append("CLOSE_IN_EMA_BAND")
+        directional_events = _touch_events(
+            frame["h"], upper, atr, params.touch_tolerance_atr
+        )
+    if (
+        not math.isfinite(float(atr.iloc[-1]))
+        or abs(float(ema8.iloc[-1] - ema21.iloc[-1]))
+        > float(atr.iloc[-1]) * params.max_ema_distance_atr
+    ):
         reasons.append("EMA_DISTANCE_TOO_WIDE")
     swing = _swing_structure(frame, pivot_highs, pivot_lows, side)
     if not swing["valid"]:
         reasons.append("INVALID_SWING_STRUCTURE")
-    widths = upper - lower
-    contraction_ratio = float(widths.iloc[-1] / widths.iloc[0]) if widths.iloc[0] else float("inf")
+    contraction_ratio = common["contraction_ratio"]
     if contraction_ratio > params.contraction_ratio_max:
         reasons.append("INSUFFICIENT_CONTRACTION")
     if len(directional_events) < params.min_directional_boundary_touches:
@@ -147,13 +196,25 @@ def _ema_candidate_start(indicators: pd.DataFrame, side: str) -> int:
     return int(invalid[-1] + 1) if invalid.size else 0
 
 
-def _maximal_structural_suffix(indicators, side, params, *, common_cache=None):
+def _maximal_structural_suffix(
+    indicators, side, params, *, common_cache=None,
+):
     if indicators.empty:
         return indicators, {"rejection_reasons": ["EMPTY_DATA"]}
     minimum = 2 * params.pivot_span + 1
     if len(indicators) < minimum:
         return indicators, {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
-    selected_rules = _non_length_rules(indicators, side, params)
+    cache = common_cache if common_cache is not None else {}
+
+    def rules_for(candidate):
+        candidate_length = len(candidate)
+        common = cache.get(candidate_length)
+        if common is None:
+            common = _common_structure(candidate, params)
+            cache[candidate_length] = common
+        return _non_length_rules(candidate, side, params, common=common)
+
+    selected_rules = rules_for(indicators)
     if not selected_rules["rejection_reasons"]:
         return indicators, selected_rules
     if "EMA_DISTANCE_TOO_WIDE" in selected_rules["rejection_reasons"]:
@@ -161,7 +222,7 @@ def _maximal_structural_suffix(indicators, side, params, *, common_cache=None):
     first_start = max(1, _ema_candidate_start(indicators, side))
     for start in range(first_start, len(indicators) - minimum + 1):
         candidate = indicators.iloc[start:]
-        rules = _non_length_rules(candidate, side, params)
+        rules = rules_for(candidate)
         if not rules["rejection_reasons"]:
             return candidate, rules
     return indicators, selected_rules

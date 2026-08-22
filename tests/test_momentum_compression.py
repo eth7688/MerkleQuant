@@ -12,6 +12,7 @@ from momentum_compression import (
     _quality_score,
     _non_length_rules,
     _maximal_structural_suffix,
+    _pivots,
     _touch_events,
     add_compression_indicators,
     evaluate_both_sides,
@@ -89,6 +90,18 @@ def legacy_maximal_structural_suffix(indicators, side, params):
     return selected, selected_rules
 
 
+def legacy_pivots(frame, span):
+    highs, lows = [], []
+    for index in range(span, len(frame) - span):
+        high_window = frame["h"].iloc[index - span:index + span + 1]
+        low_window = frame["l"].iloc[index - span:index + span + 1]
+        if frame["h"].iloc[index] == high_window.max() and (high_window == frame["h"].iloc[index]).sum() == 1:
+            highs.append(index)
+        if frame["l"].iloc[index] == low_window.min() and (low_window == frame["l"].iloc[index]).sum() == 1:
+            lows.append(index)
+    return highs, lows
+
+
 class CompressionIndicatorTests(unittest.TestCase):
     def test_default_parameters_match_approved_spec(self):
         params = CompressionParams()
@@ -141,6 +154,32 @@ class CompressionIndicatorTests(unittest.TestCase):
 
 
 class CompressionRuleTests(unittest.TestCase):
+    def test_vectorized_pivots_match_legacy_for_unique_and_tied_extrema(self):
+        rng = np.random.default_rng(20260822)
+        for bars in (5, 15, 40, 220):
+            frame = valid_compression_frame(bars)
+            frame["h"] += rng.normal(0.0, 0.1, bars)
+            frame["l"] += rng.normal(0.0, 0.1, bars)
+            if bars >= 15:
+                frame.loc[7, "h"] = frame.loc[8, "h"] = max(frame.loc[7, "h"], frame.loc[8, "h"])
+                frame.loc[10, "l"] = frame.loc[11, "l"] = min(frame.loc[10, "l"], frame.loc[11, "l"])
+            self.assertEqual(_pivots(frame, 2), legacy_pivots(frame, 2))
+
+    def test_both_sides_share_direction_independent_candidate_geometry(self):
+        frame = valid_compression_frame(40)
+        evaluated_at = int(frame["ot"].iloc[-1] + 900_000)
+        with patch(
+            "momentum_compression._common_structure",
+            wraps=compression_module._common_structure,
+        ) as common:
+            evaluate_both_sides(
+                "TESTUSDT", frame, 115.0,
+                evaluated_at_ms=evaluated_at,
+                htf_alignment_by_side={},
+            )
+        starts = [int(call.args[0]["ot"].iloc[0]) for call in common.call_args_list]
+        self.assertEqual(len(starts), len(set(starts)))
+
     def test_ema_pruning_skips_only_suffixes_that_are_provably_invalid(self):
         indicators = add_compression_indicators(valid_compression_frame(220))
         indicators.loc[200, "ema8"] = indicators.loc[200, "ema21"]
