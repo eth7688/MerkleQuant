@@ -202,7 +202,7 @@ def _closed_kline_frame(df, interval, limit=None):
 
 def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True,
                  market_type=None, testnet=None, price_type=None,
-                 bitget_granularity=None):
+                 bitget_granularity=None, raise_errors=False):
     ex = exchange if exchange is not None else _exchange
     if ex == "bitget":
         return _fetch_klines_bitget(
@@ -233,7 +233,10 @@ def fetch_klines(symbol, interval, limit=200, exchange=None, closed_only=True,
         df = pd.DataFrame(data, columns=["ot","o","h","l","c","v","ct","qv","n","tbv","tbqv","ig"])
         for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
         return _closed_kline_frame(df, interval, limit) if closed_only else df
-    except: return None
+    except Exception:
+        if raise_errors:
+            raise
+        return None
 
 
 def fetch_klines_range(symbol, interval, start_ms, end_ms=None, exchange=None,

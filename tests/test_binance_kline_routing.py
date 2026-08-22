@@ -25,6 +25,15 @@ class FakeResponse:
 
 
 class BinanceKlineRoutingTest(unittest.TestCase):
+    def test_fetch_klines_keeps_legacy_none_on_request_failure(self):
+        with patch("screener.requests.get", side_effect=TimeoutError("slow")):
+            self.assertIsNone(fetch_klines("DOTUSDT", "15m", 2))
+
+    def test_fetch_klines_can_propagate_request_failure(self):
+        with patch("screener.requests.get", side_effect=TimeoutError("slow")):
+            with self.assertRaisesRegex(TimeoutError, "slow"):
+                fetch_klines("DOTUSDT", "15m", 2, raise_errors=True)
+
     def _requested_url(self, **kwargs):
         with patch("screener.requests.get", return_value=FakeResponse()) as get:
             frame = fetch_klines("DOTUSDT", "30m", 1, closed_only=False, **kwargs)
