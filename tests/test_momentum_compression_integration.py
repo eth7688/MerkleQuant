@@ -262,6 +262,7 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("function setCompressionAutoEnabled", source)
         self.assertIn("function pollCompressionAlerts", source)
         self.assertIn("axiom_compression_alert_cursor_v1", source)
+        self.assertIn("数据源：Binance Futures", source)
 
     def test_renderer_escapes_payload_and_formats_nonfinite_values(self):
         result = render_compression_payload({
@@ -283,6 +284,7 @@ class CompressionDashboardUiTests(unittest.TestCase):
             }],
         })
         rendered = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
+        self.assertIn("数据源：Binance Futures", rendered)
         self.assertIn("LONG 观察池", rendered)
         self.assertIn("SHORT 观察池", rendered)
         self.assertIn("当前突破", rendered)
