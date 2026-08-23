@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 
 
-GRANULARITY = {"1m": "1m", "30m": "30m", "1h": "1H", "4h": "4H"}
+GRANULARITY = {"1m": "1m", "30m": "30m", "1h": "1H", "4h": "4H", "1d": "1Dutc"}
 
 
 class BitgetHistorySource:

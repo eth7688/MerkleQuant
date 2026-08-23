@@ -16,6 +16,13 @@ trades*.jsonl
 signal_events*.jsonl
 rj_*_events*.jsonl
 watchlist*.json
+momentum_reflow_state.json
+/momentum_reflow_alert_settings.json
+/momentum_reflow_alerts.json
+/.momentum_reflow_alert_settings.json.*.tmp
+/.momentum_reflow_alerts.json.*.tmp
+/.momentum_reflow_alerts.lock
+/.momentum_reflow_alert_delivery.lock
 
 # Credentials and private keys
 *ed25519
@@ -36,6 +43,7 @@ video_frames/
 # Local agent state and private project memory
 .agents/
 .codex/
+.superpowers/
 memory/
 tmp_skill_review_tech_analysis/
 

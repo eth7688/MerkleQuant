@@ -2,10 +2,20 @@
 AXIOM QUANT — 独立管理后台
 端口 5001 | 开发者专用 | 不依赖交易引擎
 """
-import account_manager as accounts, json, os
+import account_manager as accounts, json, math, os, time
+from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, session
 from functools import wraps
 import secrets, os, sys
+from momentum_reflow_dashboard import load_reflow_settings, save_reflow_settings
+from momentum_reflow_alerts import (
+    enable_wechat_alerts,
+    load_alert_settings,
+    public_alert_settings,
+    read_delivery_status,
+    save_alert_settings,
+    test_wechat_webhook,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -133,6 +143,187 @@ def api_reset_password(uid):
 # Proxy to web_ui demo engine APIs
 import requests as _requests
 _WEB_UI = "http://127.0.0.1:5000"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REFLOW_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_settings.json"
+_REFLOW_ALERT_SETTINGS_PATH = Path(_BASE_DIR) / "momentum_reflow_alert_settings.json"
+_REFLOW_ALERT_LEDGER_PATH = Path(_BASE_DIR) / "momentum_reflow_alerts.json"
+
+def _normalize_reflow_scheduler_status(scheduler):
+    if not isinstance(scheduler, dict):
+        raise ValueError("scheduler status must be an object")
+    status = {}
+    for field in ("last_auto_scan_at", "next_scan_at"):
+        value = scheduler.get(field, 0)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{field} must be a finite nonnegative number")
+        status[field] = value
+    last_error = scheduler.get("last_auto_error", "")
+    if type(last_error) is not str:
+        raise ValueError("last_auto_error must be a string")
+    scheduler_status = scheduler.get("scheduler_status", "available")
+    if type(scheduler_status) is not str:
+        raise ValueError("scheduler_status must be a string")
+    running = scheduler.get("running", False)
+    if type(running) is not bool:
+        raise ValueError("running must be a boolean")
+    return {
+        **status,
+        "last_auto_error": last_error,
+        "scheduler_status": scheduler_status,
+        "running": running,
+    }
+
+
+def _compression_monitor_facts(monitor):
+    if not isinstance(monitor, dict):
+        raise ValueError("compression monitor status must be an object")
+    monitor_fields = (
+        "running", "auto_enabled", "last_scan_at", "next_scan_at",
+        "structure_scanning", "scan_started_at", "scan_duration_ms", "scan_overdue", "last_error",
+    )
+    return {field: monitor.get(field) for field in monitor_fields}
+
+
+def _compression_status_facts(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("compression status must be an object")
+    monitor = payload.get("monitor")
+    scan = payload.get("scan")
+    if not isinstance(scan, dict):
+        raise ValueError("compression status is incomplete")
+    scan_fields = ("scanned", "eligible", "errors")
+    return {
+        "monitor": _compression_monitor_facts(monitor),
+        "scan": {field: scan.get(field) for field in scan_fields},
+    }
+
+
+@app.route("/api/compression/settings", methods=["GET", "POST"])
+@admin_required
+def api_compression_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True)
+            enabled = data.get("enabled") if isinstance(data, dict) else None
+            if type(enabled) is not bool:
+                return jsonify({"error": "enabled must be a boolean"}), 400
+            response = _requests.post(
+                f"{_WEB_UI}/internal/compression/automation",
+                json={"enabled": enabled}, timeout=3,
+            )
+            response.raise_for_status()
+            return jsonify({"monitor": _compression_monitor_facts(response.json())})
+        response = _requests.get(
+            f"{_WEB_UI}/internal/compression/status", timeout=3
+        )
+        response.raise_for_status()
+        return jsonify(_compression_status_facts(response.json()))
+    except Exception:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+
+@app.route("/api/reflow/settings", methods=["GET", "POST"])
+@admin_required
+def api_reflow_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        enabled = data.get("auto_scan_enabled") if isinstance(data, dict) else None
+        if type(enabled) is not bool:
+            return jsonify({"error": "auto_scan_enabled must be boolean"}), 400
+        saved = save_reflow_settings(
+            _REFLOW_SETTINGS_PATH,
+            enabled,
+            str(session.get("admin_id", "")),
+            int(time.time() * 1000),
+        )
+        return jsonify({"ok": True, **saved})
+
+    settings = load_reflow_settings(_REFLOW_SETTINGS_PATH)
+    try:
+        response = _requests.get(
+            f"{_WEB_UI}/api/reflow/automation/status", timeout=3
+        )
+        response.raise_for_status()
+        scheduler = response.json()
+        status = _normalize_reflow_scheduler_status(scheduler)
+    except Exception:
+        status = {"scheduler_status": "unavailable"}
+    return jsonify({**settings, **status})
+
+
+@app.route("/api/reflow/alert-settings", methods=["GET", "POST"])
+@admin_required
+def api_reflow_alert_settings():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    if request.method == "GET":
+        try:
+            public = public_alert_settings(
+                load_alert_settings(_REFLOW_ALERT_SETTINGS_PATH)
+            )
+        except (TypeError, ValueError):
+            return jsonify({"error": "警报设置不可读"}), 500
+        try:
+            public.update(read_delivery_status(_REFLOW_ALERT_LEDGER_PATH))
+        except ValueError:
+            public.update(
+                last_delivery_at=0,
+                last_delivery_status="unavailable",
+                last_delivery_alert_id=0,
+                last_delivery_error="警报账本不可读，已停止发送",
+            )
+        return jsonify(public)
+
+    data = request.get_json(silent=True)
+    enabled = data.get("wechat_enabled") if isinstance(data, dict) else None
+    webhook = data.get("wechat_webhook") if isinstance(data, dict) else None
+    if type(enabled) is not bool or (
+        webhook is not None and not isinstance(webhook, str)
+    ):
+        return jsonify({"error": "invalid alert settings"}), 400
+    try:
+        if enabled:
+            saved = enable_wechat_alerts(
+                _REFLOW_ALERT_SETTINGS_PATH,
+                _REFLOW_ALERT_LEDGER_PATH,
+                wechat_webhook=webhook,
+                updated_by=str(session["admin_id"]),
+                now_ms=int(time.time() * 1000),
+            )
+        else:
+            saved = save_alert_settings(
+                _REFLOW_ALERT_SETTINGS_PATH,
+                wechat_enabled=False,
+                wechat_webhook=webhook,
+                updated_by=str(session["admin_id"]),
+                now_ms=int(time.time() * 1000),
+            )
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid alert settings"}), 400
+    return jsonify({"ok": True, **public_alert_settings(saved)})
+
+
+@app.route("/api/reflow/alert-settings/test", methods=["POST"])
+@admin_required
+def api_reflow_alert_test():
+    if not session.get("admin_id"):
+        return jsonify({"error": "无权限"}), 403
+    try:
+        result = test_wechat_webhook(
+            _REFLOW_ALERT_SETTINGS_PATH, int(time.time() * 1000)
+        )
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "last_test_ok": False,
+                        "last_test_error": "警报设置不可读"}), 400
+    status = 200 if result["last_test_ok"] else 502
+    return jsonify({"ok": bool(result["last_test_ok"]), **result}), status
 
 @app.route("/api/admin/demo/status")
 @admin_required
@@ -273,6 +464,8 @@ input:focus,select:focus{outline:none;border-color:var(--brand)}
   <div class="nav-item" data-page="license" onclick="switchPage('license')">🔑 许可管理</div>
   <div class="nav-item" data-page="fuel" onclick="switchPage('fuel')">⛽ 燃料管理</div>
   <div class="nav-item" data-page="demo" onclick="switchPage('demo')">📡 回测参数</div>
+  <div class="nav-item" data-page="reflow" onclick="switchPage('reflow')">↺ 动能回流</div>
+  <div class="nav-item" data-page="compression" onclick="switchPage('compression')">◈ 压缩扫描</div>
   <div class="nav-item" data-page="engine" onclick="switchPage('engine')">⚙ 演示引擎</div>
   <div style="margin-top:auto;padding:20px;border-top:1px solid var(--border)"><span style="font-size:11px;color:var(--muted)" id="loginInfo">未登录</span><br><a href="#" onclick="doLogout()" style="font-size:10px;color:var(--s-red)">退出</a></div>
 </div>
@@ -313,6 +506,8 @@ function switchPage(p){
   else if(p==='license') renderLicense(c);
   else if(p==='fuel') renderFuel(c);
   else if(p==='demo') renderDemoCfg(c);
+  else if(p==='reflow') renderReflow(c);
+  else if(p==='compression'){renderCompression(c);_refreshTimer=setInterval(function(){if(_currentPage==='compression') renderCompression(document.getElementById('content'));},2000);}
   else if(p==='engine'){renderEngine(c);_refreshTimer=setInterval(renderDemoPositions,2000);}
 }
 function renderDashboard(el){
@@ -344,6 +539,269 @@ function renderFuel(el){
       h+='<td style="display:flex;gap:4px"><button class="btn" onclick="openFuelTopup('+u.id+',\''+u.username+'\')">充值</button><button class="btn" onclick="openFuelDeduct('+u.id+',\''+u.username+'\')" style="color:var(--s-red)">扣费</button><button class="btn" onclick="viewFuelHistory('+u.id+',\''+u.username+'\')">流水</button></td></tr>';
     });
     h+='</tbody></table></div>';el.innerHTML=h;
+  });
+}
+function formatCompressionTime(value){
+  if(!value) return '--';
+  if(typeof value==='string') return value.replace('T',' ').replace('+00:00',' UTC');
+  return formatReflowTime(value);
+}
+function renderCompression(el){
+  el.innerHTML='<div class="card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">压缩扫描自动监控</h3><p style="color:var(--muted);font-size:12px;line-height:1.7">仅控制监控引擎，不修改告警或交易配置。</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer"><input type="checkbox" id="compressionAutoEnabled" style="width:auto">自动扫描</label>'+
+    '</div><div id="compressionSaveError" role="alert" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">'+
+      '<div class="stat-box"><div class="label">自动状态</div><div class="value" id="compressionEnabledState" style="font-size:18px">--</div></div>'+
+      '<div class="stat-box"><div class="label">引擎状态</div><div id="compressionRunning" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">上次扫描</div><div id="compressionLastScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">下次扫描</div><div id="compressionNextScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">当前扫描</div><div id="compressionCurrentScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">扫描耗时</div><div id="compressionDuration" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">已扫描</div><div id="compressionScanned" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">合格候选</div><div id="compressionEligible" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">错误数</div><div id="compressionErrors" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近错误</div><div id="compressionLastError" style="font-size:12px;color:var(--s-red)">--</div></div>'+
+    '</div></div>';
+  var box=document.getElementById('compressionAutoEnabled');
+  var error=document.getElementById('compressionSaveError');
+  box.disabled=true;
+  fetch('/api/compression/settings').then(function(response){return response.json().then(function(data){if(!response.ok) throw new Error(data.error||'读取设置失败');return data;});}).then(function(data){
+    if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;
+    var monitor=data.monitor||{}, scan=data.scan||{};
+    box.checked=Boolean(monitor.auto_enabled); box.dataset.savedChecked=String(box.checked); box.disabled=false;
+    document.getElementById('compressionEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('compressionRunning').textContent=monitor.running?'运行中':'已停止';
+    document.getElementById('compressionLastScan').textContent=formatCompressionTime(monitor.last_scan_at);
+    document.getElementById('compressionNextScan').textContent=formatCompressionTime(monitor.next_scan_at);
+    document.getElementById('compressionCurrentScan').textContent=monitor.scan_overdue?'扫描超时':(monitor.structure_scanning?'扫描中':'空闲');
+    document.getElementById('compressionDuration').textContent=(monitor.scan_duration_ms||0)+' ms';
+    document.getElementById('compressionScanned').textContent=scan.scanned||0;
+    document.getElementById('compressionEligible').textContent=scan.eligible||0;
+    document.getElementById('compressionErrors').textContent=scan.errors||0;
+    document.getElementById('compressionLastError').textContent=monitor.last_error||'无';
+    box.onchange=saveCompressionSetting;
+  }).catch(function(reason){if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;error.style.display='block';error.textContent=reason.message||'读取设置失败';});
+}
+function saveCompressionSetting(){
+  var box=document.getElementById('compressionAutoEnabled');
+  var error=document.getElementById('compressionSaveError');
+  var previous=box.dataset.savedChecked==='true';
+  error.style.display='none'; error.textContent=''; box.disabled=true;
+  fetch('/api/compression/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:Boolean(box.checked)})}).then(function(response){return response.json().then(function(data){if(!response.ok) throw new Error(data.error||'保存失败');return data;});}).then(function(){
+    if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;
+    box.dataset.savedChecked=String(box.checked); document.getElementById('compressionEnabledState').textContent=box.checked?'已启用':'已关闭';
+  }).catch(function(reason){if(_currentPage!=='compression'||document.getElementById('compressionAutoEnabled')!==box) return;box.checked=previous;error.style.display='block';error.textContent=reason.message||'保存失败';}).finally(function(){if(_currentPage==='compression'&&document.getElementById('compressionAutoEnabled')===box) box.disabled=false;});
+}
+var _reflowRenderGeneration=0;
+function isCurrentReflowRender(generation, box){
+  return _currentPage==='reflow' &&
+    generation===_reflowRenderGeneration &&
+    document.getElementById('reflowAutoEnabled')===box;
+}
+function refreshCurrentReflowPanel(){
+  if(_currentPage!=='reflow') return;
+  var box=document.getElementById('reflowAutoEnabled');
+  var content=document.getElementById('content');
+  if(box&&content) renderReflow(content);
+}
+function formatReflowTime(value){
+  var timestamp=Number(value);
+  if(!Number.isFinite(timestamp)||timestamp<=0) return '--';
+  return new Intl.DateTimeFormat('zh-CN',{
+    timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false
+  }).format(new Date(timestamp));
+}
+function renderReflow(el){
+  var generation=++_reflowRenderGeneration;
+  el.innerHTML='<div class="card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">动能回流自动扫描</h3>'+
+      '<p style="color:var(--muted);font-size:12px;line-height:1.7">全局扫描开关 · 固定流动性门槛 50万 USDT</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer">'+
+        '<input type="checkbox" id="reflowAutoEnabled" style="width:auto">自动扫描</label>'+
+    '</div>'+
+    '<div id="reflowSaveError" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">'+
+      '<div class="stat-box"><div class="label">当前状态</div><div class="value" id="reflowEnabledState" style="font-size:18px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最后修改时间</div><div id="reflowUpdatedAt" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最后修改人</div><div id="reflowUpdatedBy" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">上次自动扫描</div><div id="reflowLastScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">下次扫描</div><div id="reflowNextScan" style="font:12px var(--font-mono)">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近错误</div><div id="reflowLastError" style="font-size:12px;color:var(--s-red)">--</div></div>'+
+    '</div>'+
+    '<p style="color:var(--muted);font-size:12px;line-height:1.7;margin-top:18px">关闭自动扫描不会删除历史记录，手动扫描仍可使用。</p>'+
+  '</div>'+
+  '<div class="card reflow-alert-card" style="max-width:760px">'+
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px">'+
+      '<div><h3 style="font-size:15px;color:var(--brand);margin-bottom:6px">企业微信警报</h3>'+
+      '<p style="color:var(--muted);font-size:12px;line-height:1.7">仅发送新出现或升级的高质量信号</p></div>'+
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer">'+
+        '<input id="reflowWechatEnabled" type="checkbox" style="width:auto">企业微信高质量警报</label>'+
+    '</div>'+
+    '<div id="reflowAlertSaveError" role="alert" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(248,113,113,0.1);color:var(--s-red);font-size:12px;margin-bottom:14px"></div>'+
+    '<div class="field"><label>Webhook</label><input id="reflowWebhook" type="password" autocomplete="off" placeholder="粘贴企业微信群机器人 Webhook"></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:14px 0">'+
+      '<div class="stat-box"><div class="label">已保存凭证</div><div id="reflowWebhookMask" style="font:12px var(--font-mono)">未配置</div></div>'+
+      '<div class="stat-box"><div class="label">警报状态</div><div id="reflowWechatState" style="font-size:12px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近测试</div><div id="reflowWechatTestState" style="font-size:12px">--</div></div>'+
+      '<div class="stat-box"><div class="label">最近正式发送</div><div id="reflowWechatDeliveryState" style="font-size:12px">--</div></div>'+
+    '</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+      '<button type="button" class="btn btn-primary" onclick="saveReflowAlertSetting()">保存警报设置</button>'+
+      '<button id="reflowWechatTest" type="button" class="btn" onclick="testReflowWechat()">发送测试消息</button>'+
+    '</div>'+
+    '<small style="display:block;color:var(--muted);font-size:11px;line-height:1.6;margin-top:14px">网络超时可能造成企业微信已收到、服务器未收到回执，有限重试时存在极低概率重复。</small>'+
+  '</div>';
+  var box=document.getElementById('reflowAutoEnabled');
+  box.dataset.renderGeneration=String(generation);
+  box.disabled=true;
+  fetch('/api/reflow/settings').then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok) throw new Error(data.error||'读取设置失败');
+      return data;
+    });
+  }).then(function(data){
+    if(!isCurrentReflowRender(generation,box)) return;
+    box.checked=Boolean(data.auto_scan_enabled);
+    box.dataset.savedChecked=String(box.checked);
+    box.disabled=false;
+    document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('reflowUpdatedAt').textContent=formatReflowTime(data.updated_at);
+    document.getElementById('reflowUpdatedBy').textContent=data.updated_by||'--';
+    document.getElementById('reflowLastScan').textContent=formatReflowTime(data.last_auto_scan_at);
+    document.getElementById('reflowNextScan').textContent=formatReflowTime(data.next_scan_at);
+    document.getElementById('reflowLastError').textContent=data.last_auto_error||
+      (data.scheduler_status==='unavailable'?'调度状态不可用':'无');
+    box.onchange=saveReflowSetting;
+  }).catch(function(reason){
+    if(!isCurrentReflowRender(generation,box)) return;
+    var error=document.getElementById('reflowSaveError');
+    error.style.display='block';
+    error.textContent=reason.message||'读取设置失败';
+  });
+  var wechatBox=document.getElementById('reflowWechatEnabled');
+  var testButton=document.getElementById('reflowWechatTest');
+  wechatBox.disabled=true;
+  testButton.disabled=true;
+  fetch('/api/reflow/alert-settings').then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok) throw new Error(data.error||'读取警报设置失败');
+      return data;
+    });
+  }).then(function(data){
+    if(_currentPage!=='reflow'||generation!==_reflowRenderGeneration||
+       document.getElementById('reflowWechatEnabled')!==wechatBox) return;
+    wechatBox.checked=Boolean(data.wechat_enabled);
+    wechatBox.disabled=false;
+    testButton.disabled=false;
+    document.getElementById('reflowWechatState').textContent=
+      wechatBox.checked?'已启用':'已关闭';
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+    document.getElementById('reflowWechatTestState').textContent=
+      data.last_test_at?
+        ((data.last_test_ok?'成功 · ':'失败 · ')+formatReflowTime(data.last_test_at)+
+         (data.last_test_error?' · '+data.last_test_error:'')):'尚未测试';
+    var deliveryLabels={none:'尚无发送记录',pending:'等待发送',
+      delivered:'发送成功',failed:'发送失败',unavailable:'状态不可用'};
+    var delivery=deliveryLabels[data.last_delivery_status]||'状态不可用';
+    if(data.last_delivery_at) delivery+=' · '+formatReflowTime(data.last_delivery_at);
+    if(data.last_delivery_error) delivery+=' · '+data.last_delivery_error;
+    document.getElementById('reflowWechatDeliveryState').textContent=delivery;
+  }).catch(function(reason){
+    if(_currentPage!=='reflow'||generation!==_reflowRenderGeneration||
+       document.getElementById('reflowWechatEnabled')!==wechatBox) return;
+    var error=document.getElementById('reflowAlertSaveError');
+    error.style.display='block';
+    error.textContent=reason.message||'读取警报设置失败';
+  });
+}
+function saveReflowSetting(){
+  var box=document.getElementById('reflowAutoEnabled');
+  var error=document.getElementById('reflowSaveError');
+  var generation=Number(box.dataset.renderGeneration);
+  var previous=box.dataset.savedChecked==='true';
+  error.style.display='none';
+  error.textContent='';
+  box.disabled=true;
+  fetch('/api/reflow/settings',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({auto_scan_enabled:Boolean(box.checked)})
+  }).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.ok) throw new Error(data.error||'保存失败');
+      return data;
+    });
+  }).then(function(data){
+    if(!isCurrentReflowRender(generation,box)){
+      refreshCurrentReflowPanel();
+      return;
+    }
+    box.checked=Boolean(data.auto_scan_enabled);
+    box.dataset.savedChecked=String(box.checked);
+    document.getElementById('reflowEnabledState').textContent=box.checked?'已启用':'已关闭';
+    document.getElementById('reflowUpdatedAt').textContent=formatReflowTime(data.updated_at);
+    document.getElementById('reflowUpdatedBy').textContent=data.updated_by||'--';
+  }).catch(function(reason){
+    if(!isCurrentReflowRender(generation,box)) return;
+    box.checked=previous;
+    error.style.display='block';
+    error.textContent=reason.message||'保存失败';
+  }).finally(function(){
+    if(!isCurrentReflowRender(generation,box)) return;
+    box.disabled=false;
+  });
+}
+function saveReflowAlertSetting(){
+  var enabled=document.getElementById('reflowWechatEnabled');
+  var webhook=document.getElementById('reflowWebhook');
+  var error=document.getElementById('reflowAlertSaveError');
+  error.style.display='none';
+  error.textContent='';
+  fetch('/api/reflow/alert-settings',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({wechat_enabled:Boolean(enabled.checked),wechat_webhook:webhook.value})
+  }).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.ok) throw new Error(data.error||'保存失败');
+      return data;
+    });
+  }).then(function(data){
+    webhook.value='';
+    enabled.checked=Boolean(data.wechat_enabled);
+    document.getElementById('reflowWechatState').textContent=
+      enabled.checked?'已启用':'已关闭';
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+  }).catch(function(reason){
+    error.style.display='block';
+    error.textContent=reason.message||'保存失败';
+  });
+}
+function testReflowWechat(){
+  var button=document.getElementById('reflowWechatTest');
+  var state=document.getElementById('reflowWechatTestState');
+  button.disabled=true;
+  state.textContent='正在发送测试消息...';
+  fetch('/api/reflow/alert-settings/test',{method:'POST'}).then(function(response){
+    return response.json().then(function(data){
+      if(!response.ok||!data.last_test_ok){
+        throw new Error(data.last_test_error||data.error||'测试失败');
+      }
+      return data;
+    });
+  }).then(function(data){
+    document.getElementById('reflowWebhookMask').textContent=
+      data.webhook_mask||'未配置';
+    state.textContent='测试消息已发送';
+  }).catch(function(reason){
+    state.textContent=reason.message||'测试失败';
+  }).finally(function(){
+    button.disabled=false;
   });
 }
 function openFuelTopup(uid,uname){
@@ -389,6 +847,7 @@ function saveDemoFullCfg(){
     testnet_api_key: document.getElementById('deTestKey').value,
     testnet_api_secret: document.getElementById('deTestSec').value,
     entry_signal_source: document.getElementById('deSignalSource').value,
+    predicta_choppy_filter_mode: document.getElementById('dePredictaChoppy').value==='1'?'hard':'off',
     scan_interval: document.getElementById('deInt').value,
     min_score: parseInt(document.getElementById('deScore').value)||70,
     max_positions: parseInt(document.getElementById('deMaxpos').value)||3,
@@ -446,6 +905,7 @@ function saveDemoFullCfg(){
     max_daily_loss: parseFloat(document.getElementById('deMaxDL').value)||0,
     max_consecutive_loss: parseInt(document.getElementById('deMaxCL').value)||5,
     cooldown_minutes: parseInt(document.getElementById('deCooldown').value)||60,
+    half_risk_trigger_r: parseFloat(document.getElementById('deHalfRiskR').value)||0,
     enable_early_protect: document.getElementById('deEarlyProtect').value==='1',
     early_protect_r: parseFloat(document.getElementById('deEarlyR').value)||0.8,
     early_protect_lock_r: parseFloat(document.getElementById('deEarlyLock').value)||0,
@@ -462,7 +922,7 @@ function saveDemoFullCfg(){
   fetch('/api/admin/demo/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(r=>r.json()).then(d=>{
     var m=document.getElementById('deMsg');
     m.style.display='block'; m.style.background='rgba(45,212,191,0.1)'; m.style.color='var(--brand)';
-    m.textContent='已保存，需重启引擎生效';
+    m.textContent='已保存并生效';
   }).catch(function(e){
     var m=document.getElementById('deMsg');
     m.style.display='block'; m.style.background='rgba(248,113,113,0.1)'; m.style.color='var(--s-red)';
@@ -500,7 +960,8 @@ function renderEngine(el){
     h+='<div class="t-section">';
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-blue);box-shadow:0 0 5px rgba(96,165,250,0.3)"></span><span>策略参数</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
-    h+='<div class="field"><label>信号源</label><select id="deSignalSource"><option value="rj_only"'+(sigSrc==='rj_only'?' selected':'')+'>RJ独立模拟</option><option value="structure"'+(sigSrc==='structure'?' selected':'')+'>结构突破</option></select></div>';
+    h+='<div class="field"><label>信号源</label><select id="deSignalSource"><option value="predicta_ewo"'+(sigSrc==='predicta_ewo'?' selected':'')+'>Predicta + EWO</option><option value="rj_only"'+(sigSrc==='rj_only'?' selected':'')+'>RJ独立模拟</option><option value="structure"'+(sigSrc==='structure'?' selected':'')+'>结构突破</option></select></div>';
+    h+='<div class="field"><label>震荡过滤拦截</label><select id="dePredictaChoppy"><option value="1"'+((cfg.predicta_choppy_filter_mode||'off')==='hard'?' selected':'')+'>开启｜震荡信号不进入开仓链路</option><option value="0"'+((cfg.predicta_choppy_filter_mode||'off')!=='hard'?' selected':'')+'>关闭｜不使用震荡过滤拦截</option></select></div>';
     h+='<div class="field"><label>扫描周期</label><input type="text" id="deInt" value="'+deIntVal+'" placeholder="30m" style="font-size:11px"></div>';
     h+='<div class="field"><label>最低评分</label><input type="number" id="deScore" value="'+(cfg.min_score||70)+'"></div>';
     h+='<div class="field"><label>最大持仓</label><input type="number" id="deMaxpos" value="'+(cfg.max_positions||3)+'"></div>';
@@ -568,6 +1029,7 @@ function renderEngine(el){
     h+='<div class="t-section">';
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-purple);box-shadow:0 0 5px rgba(168,85,247,0.3)"></span><span>三阶止盈</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
+    h+='<div class="field"><label>0.5R半损保护 (0=关闭)</label><input type="number" id="deHalfRiskR" value="'+(cfg.half_risk_trigger_r??0)+'" min="0" max="0.79" step="0.1"></div>';
     h+='<div class="field"><label>提前保护</label><select id="deEarlyProtect"><option value="1"'+(cfg.enable_early_protect!==false?' selected':'')+'>启用</option><option value="0"'+(cfg.enable_early_protect===false?' selected':'')+'>关闭</option></select></div>';
     h+='<div class="field"><label>提前保护R</label><input type="number" id="deEarlyR" value="'+(cfg.early_protect_r||0.8)+'" min="0.3" max="1.2" step="0.1"></div>';
     h+='<div class="field"><label>提前锁定R</label><input type="number" id="deEarlyLock" value="'+(cfg.early_protect_lock_r||0)+'" min="0" max="0.5" step="0.05"></div>';

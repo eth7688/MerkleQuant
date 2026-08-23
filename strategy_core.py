@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from btc_stage import evaluate_btc_gate
+from strategy_filters import evaluate_daily_pattern_state
 
 
 RULE_VERSION = "rj_strategy_core_v1"
@@ -30,6 +31,7 @@ class StrategySnapshot:
     decision_time: int
     candles_30m: pd.DataFrame
     btc_stage: dict[str, Any]
+    candles_1d: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,8 @@ class ExitDecision:
 
 @dataclass(frozen=True)
 class ExitRules:
+    half_risk_trigger_r: float = 0.0
+    enable_early_protect: bool = True
     early_protect_r: float = 0.8
     early_lock_r: float = 0.0
     tier1_r: float = 1.2
@@ -77,6 +81,7 @@ class PositionState:
     remaining_qty: float | None = None
     mfe_r: float = 0.0
     mae_r: float = 0.0
+    half_risk_protected: bool = False
     early_protected: bool = False
     tier1_done: bool = False
     tier2_done: bool = False
@@ -138,6 +143,17 @@ def evaluate_rj_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
     evidence = dict(signal)
     evidence["btc_coin_reversal_pass"] = reversal
     evidence["btc_gate_reason"] = reason
+    daily_mode = str(getattr(cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+    if daily_mode in ("log_only", "soft"):
+        daily_pattern = evaluate_daily_pattern_state(
+            snapshot.candles_1d,
+            direction,
+            decision_time=snapshot.decision_time,
+        )
+        daily_pattern["mode"] = daily_mode
+        evidence["daily_pattern"] = daily_pattern
+        if allowed and daily_mode == "soft" and daily_pattern.get("would_block"):
+            allowed, reason = False, "daily_pattern_opposed"
     return EntryDecision(
         allowed=bool(allowed),
         reason="pass" if allowed else reason,
@@ -150,6 +166,47 @@ def evaluate_rj_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
         trigger_source=str(signal.get("rj_trigger_source", "") or ""),
         evidence=evidence,
     )
+
+
+def evaluate_predicta_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
+    frame = snapshot.candles_30m
+    if frame is None or frame.empty:
+        return EntryDecision(False, "no_candles")
+    last_open = int(float(frame["ot"].iloc[-1]))
+    if last_open + _interval_ms(snapshot.interval) > int(snapshot.decision_time):
+        raise ValueError("strategy_snapshot_lookahead")
+    decision_frame = frame.tail(160).copy().reset_index(drop=True)
+    signal = bot._predicta_signal_from_df(snapshot.symbol, snapshot.interval, decision_frame)
+    if not signal:
+        return EntryDecision(False, "no_predicta_signal")
+    direction = str(signal.get("direction", "")).upper()
+    allowed, reason = evaluate_btc_gate(direction, snapshot.btc_stage or {}, False)
+    evidence = dict(signal)
+    evidence["btc_gate_reason"] = reason
+    return EntryDecision(
+        allowed=bool(allowed),
+        reason="pass" if allowed else reason,
+        direction=direction,
+        reference_entry=float(signal.get("price", 0.0) or 0.0),
+        stop=float(signal.get("predicta_stop_price", 0.0) or 0.0),
+        signal_key=str(signal.get("signal_key", "") or ""),
+        key_time=signal.get("predicta_key_time"),
+        confirm_time=signal.get("predicta_confirm_time") or signal.get("predicta_key_time"),
+        trigger_source=str(signal.get("predicta_entry_path", "") or ""),
+        evidence=evidence,
+        rule_version="predicta_ewo_v1",
+    )
+
+
+def evaluate_entry(bot: Any, snapshot: StrategySnapshot) -> EntryDecision:
+    source = (
+        bot._entry_signal_source()
+        if callable(getattr(bot, "_entry_signal_source", None))
+        else str(getattr(getattr(bot, "cfg", None), "entry_signal_source", "rj_only"))
+    )
+    if source == "predicta_ewo":
+        return evaluate_predicta_entry(bot, snapshot)
+    return evaluate_rj_entry(bot, snapshot)
 
 
 def advance_position(
@@ -188,9 +245,32 @@ def advance_position(
     sign = 1.0 if position.direction == "LONG" else -1.0
     events: list[ExitDecision] = []
 
-    if not position.early_protected and position.mfe_r >= rules.early_protect_r:
+    half_risk_enabled = rules.half_risk_trigger_r > 0
+    early_stage_reached = (
+        rules.enable_early_protect
+        and position.mfe_r >= rules.early_protect_r
+    )
+    if (
+        half_risk_enabled
+        and not position.half_risk_protected
+        and position.mfe_r >= rules.half_risk_trigger_r
+        and not early_stage_reached
+    ):
+        candidate = position.entry - sign * 0.5 * risk
+        position.current_stop = (
+            max(position.current_stop, candidate)
+            if sign > 0
+            else min(position.current_stop, candidate)
+        )
+        position.half_risk_protected = True
+        events.append(
+            ExitDecision("move_stop", position.current_stop, 0.0, "half_risk_protect", timestamp)
+        )
+
+    if not position.early_protected and early_stage_reached:
         candidate = position.entry + sign * rules.early_lock_r * risk
         position.current_stop = max(position.current_stop, candidate) if sign > 0 else min(position.current_stop, candidate)
+        position.half_risk_protected = True
         position.early_protected = True
         events.append(ExitDecision("move_stop", position.current_stop, 0.0, "early_protect", timestamp))
 

@@ -4,6 +4,7 @@ Version: 1.0.0 (Titanium Build)
 启动: python web_ui.py  -> 浏览器 http://127.0.0.1:5000
 """
 from flask import Flask, render_template_string, jsonify, request, session, send_from_directory
+import re
 import threading, time, requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -14,9 +15,45 @@ from rj_indicator import compute_rj_bbkd, RJParams
 import numpy as np
 from trader import TradeConfig, SqueezeBreakoutBot
 import os as _os
+from pathlib import Path
+from momentum_reflow import scan_momentum_reflow
+from momentum_reflow_dashboard import (
+    load_reflow_dashboard,
+    load_reflow_settings,
+    merge_reflow_signals,
+    next_reflow_scan_at,
+)
+from momentum_reflow_alerts import (
+    WEBHOOK_PREFIX,
+    deliver_due_wechat,
+    observe_reflow_alerts,
+    read_public_alerts,
+)
+from momentum_compression_alerts import (
+    compression_delivery_statuses,
+    compression_sound_available_ids,
+    deliver_due_compression_wechat,
+    drain_compression_outbox,
+    read_public_compression_alerts,
+)
+from momentum_compression_monitor import CompressionMonitor
+from momentum_compression_service import scan_compression_market
+from momentum_compression_store import load_compression_state
 
 # 交易引擎实例 (全局单例)
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+MOMENTUM_REFLOW_LEDGER = Path(__file__).with_name("momentum_reflow_state.json")
+MOMENTUM_REFLOW_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_settings.json"
+MOMENTUM_REFLOW_HISTORY = Path(_BASE_DIR) / "momentum_reflow_daily_signals.json"
+MOMENTUM_REFLOW_ALERT_SETTINGS = Path(_BASE_DIR) / "momentum_reflow_alert_settings.json"
+MOMENTUM_REFLOW_ALERT_LEDGER = Path(_BASE_DIR) / "momentum_reflow_alerts.json"
+MOMENTUM_COMPRESSION_STATE = Path(_BASE_DIR) / "momentum_compression_state.json"
+MOMENTUM_COMPRESSION_EVENTS = Path(_BASE_DIR) / "momentum_compression_events.jsonl"
+MOMENTUM_COMPRESSION_SNAPSHOTS = Path(_BASE_DIR) / "momentum_compression_snapshots"
+MOMENTUM_COMPRESSION_ALERT_STATE = Path(_BASE_DIR) / "momentum_compression_alert_state.json"
+# Compression reuses the single protected WeCom configuration; no second
+# settings file is created or exposed by this feature.
+MOMENTUM_COMPRESSION_ALERT_SETTINGS = MOMENTUM_REFLOW_ALERT_SETTINGS
 
 # 数据回测展示配置 (管理员后台设置, 用户只读)
 _demo_cfg_path = _os.path.join(_BASE_DIR, 'demo_config.json')
@@ -41,6 +78,7 @@ class UserBotManager:
         cfg.testnet = True
         cfg.fuel_enabled = False
         cfg.mode = "live"
+        cfg.rj_daily_pattern_filter_mode = "log_only"
         return cfg
 
     def _user_path(self, uid, filename):
@@ -193,6 +231,8 @@ class UserBotManager:
         if bot:
             bot.cfg = cfg
             bot._init_client()
+            if bot.client is not None:
+                bot._restore_stop_ids()
             if uid == 0 and bot.client is not None:
                 try:
                     bot._sync_positions()
@@ -417,8 +457,65 @@ cache = {"squeeze_4h":[],"squeeze_1h":[],"squeeze_15m":[],"squeeze_1d":[],"squee
          "diverge_4h":[],"diverge_1h":[],"diverge_15m":[],"diverge_1d":[],"diverge_1w":[],
          "breakout_4h":[],"breakout_1h":[],"breakout_15m":[],"breakout_1d":[],
          "short_4h":[],"short_1h":[],"volume_4h":[],"volume_1h":[],"trader":[],
-         "funding":{"negative":[],"positive":[],"nextTime":0}}
+         "funding":{"negative":[],"positive":[],"nextTime":0},
+         "reflow_1h":None}
 state = {"time":"--","text":"就绪","scanning":False,"progress":""}
+_scan_lock = threading.Lock()
+_scan_worker = None
+_scan_generation = 0
+_scan_worker_token = None
+_reflow_automation_lock = threading.Lock()
+_reflow_automation = {
+    "running": False,
+    "last_auto_scan_at": 0,
+    "last_auto_error": "",
+    "last_skip_at": 0,
+    "next_scan_at": 0,
+}
+_reflow_scheduler_lock = threading.Lock()
+_reflow_scheduler_thread = None
+_reflow_scheduler_stop = threading.Event()
+_reflow_alert_lock = threading.Lock()
+_reflow_alert_thread = None
+_reflow_alert_stop = threading.Event()
+_reflow_alert_wakeup = threading.Event()
+_reflow_alert_status = {
+    "running": False,
+    "last_error": "",
+    "last_delivery_at": 0,
+}
+_compression_monitor_lock = threading.Lock()
+_compression_monitor_started = False
+_compression_manual_scan_lock = threading.Lock()
+_compression_alert_lock = threading.Lock()
+_compression_alert_thread = None
+_compression_alert_stop = threading.Event()
+_compression_alert_wakeup = threading.Event()
+_compression_alert_status = {"running": False, "last_error": "", "last_delivery_at": 0}
+_compression_rejection_counts = {}
+_compression_scan_summary = {"scanned": 0, "eligible": 0, "errors": 0}
+
+def _run_compression_scan(state_path, snapshot_dir):
+    report = scan_compression_market(state_path, snapshot_dir)
+    global _compression_rejection_counts, _compression_scan_summary
+    with _compression_monitor_lock:
+        _compression_rejection_counts = dict(report.get("rejection_counts", {}))
+        _compression_scan_summary = {key: int(report.get(key, 0) or 0) for key in ("scanned", "eligible", "errors")}
+    return report
+
+_compression_monitor = CompressionMonitor(
+    MOMENTUM_COMPRESSION_STATE,
+    MOMENTUM_COMPRESSION_SNAPSHOTS,
+    lambda events: _process_compression_events(events, int(time.time() * 1000)),
+    scan=_run_compression_scan,
+)
+
+def _sanitize_reflow_alert_error(error):
+    return re.sub(
+        rf"({re.escape(WEBHOOK_PREFIX)})\S*",
+        r"\1****",
+        str(error or ""),
+    )[:80]
 
 TABS = [
     ("squeeze_4h","收敛 4H","1"), ("squeeze_1h","收敛 1H","2"), ("squeeze_1d","收敛 日线","3"), ("squeeze_1w","收敛 周线","4"),
@@ -630,6 +727,28 @@ tr:last-child td{border-bottom:none}
 .empty-state{text-align:center;padding:var(--u12) var(--u3);color:var(--muted)}
 .empty-state h3{color:var(--text2);font-size:15px;font-weight:550;margin-bottom:var(--u1)}
 .empty-state p{font-size:13px;opacity:0.45;line-height:1.6}
+
+/* ===== MOMENTUM REFLOW PERSISTENT DASHBOARD ===== */
+.reflow-status-grid{display:grid;grid-template-columns:repeat(8,minmax(92px,1fr));gap:var(--u1);margin-bottom:var(--u3)}
+.reflow-status-card{min-width:0;padding:9px 10px;background:var(--card);border:1px solid var(--border);border-radius:7px;box-shadow:var(--shadow-sm)}
+.reflow-status-card span{display:block;color:var(--muted);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:3px}
+.reflow-status-card b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-family:var(--font-mono);font-size:12px;font-weight:620;font-variant-numeric:tabular-nums}
+.reflow-status-card .g{color:var(--s-green)}.reflow-status-card .r{color:var(--s-red)}.reflow-status-card .c{color:var(--s-blue)}
+.reflow-filter-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:var(--u3)}
+.reflow-filter-group{display:flex;align-items:center;gap:3px;padding:3px;background:rgba(255,255,255,.018);border:1px solid var(--border);border-radius:6px}
+.reflow-filter-label{padding:0 4px;color:var(--muted);font-size:9.5px;letter-spacing:.04em}
+.reflow-filter-btn{border:0;border-radius:4px;padding:4px 6px;background:transparent;color:var(--text2);cursor:pointer;font:520 10px var(--font)}
+.reflow-filter-btn:hover,.reflow-filter-btn.active{color:var(--text);background:rgba(255,255,255,.07)}
+.reflow-sound-controls{display:flex;align-items:center;gap:5px;margin-left:auto;color:var(--muted);font-size:10px}
+.reflow-sound-controls button{border:1px solid var(--border);border-radius:4px;padding:4px 6px;background:rgba(255,255,255,.018);color:var(--text2);cursor:pointer;font:520 10px var(--font)}
+.reflow-sound-controls button:hover{color:var(--text);background:rgba(255,255,255,.07)}
+.reflow-quality,.reflow-status{display:inline-block;padding:2px 6px;border:1px solid transparent;border-radius:4px;font-size:10px;font-family:var(--font);font-weight:600;white-space:nowrap}
+.reflow-quality-high{color:var(--s-green);background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.15)}
+.reflow-quality-standard{color:var(--s-blue);background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.15)}
+.reflow-quality-watch{color:var(--s-yellow);background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.15)}
+.reflow-status-active{color:var(--s-green);background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.15)}
+.reflow-status-window-complete,.reflow-status-invalid{color:var(--muted);background:rgba(148,163,184,.07);border-color:rgba(148,163,184,.12)}
+.reflow-mobile-details{display:none}
 
 /* ═══ FOOTER ═══ */
 .footer{text-align:center;padding:var(--u3);color:var(--muted);font-size:11px;border-top:1px solid var(--border);background:var(--bg2);letter-spacing:0.02em;max-width:1440px;margin:0 auto}
@@ -844,6 +963,7 @@ a:hover{color:var(--brand2)}
   .stat-bar-item{padding:0 var(--u2)}
   .stat-bar-item b{font-size:14px}
   table{font-size:11px;display:block;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+  .reflow-status-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.reflow-status-card{padding:8px}.reflow-status-card b{font-size:10.5px}.reflow-filter-bar{gap:5px}.reflow-filter-group{width:100%;justify-content:flex-start}.reflow-filter-btn{padding:4px 5px}.reflow-dashboard table th:nth-child(n+8),.reflow-dashboard table td:nth-child(n+8){display:none}.reflow-mobile-freshness{display:block;margin-top:3px;color:var(--text2);font:10px var(--font-mono)}.reflow-mobile-details{display:block;white-space:normal;margin-top:5px;color:var(--text2);font:10px/1.6 var(--font)}.reflow-mobile-details summary{cursor:pointer;color:var(--muted);font-size:10px}.reflow-mobile-details div{padding-top:4px}
   th,td{padding:6px 8px}
   tr.row-blast td:first-child::before,tr.row-strong td:first-child::before{display:none}
   tr.row-blast{background:rgba(251,191,36,0.1)!important}
@@ -1128,6 +1248,23 @@ tr.row-strong{background:linear-gradient(90deg,rgba(52,211,153,0.05) 0%,transpar
 .eq-dot.base{background:rgba(148,163,184,0.65);border-top:1px dashed rgba(148,163,184,0.9)}
 @media(max-width:768px){.eq-head{align-items:flex-start;flex-direction:column}.eq-metrics{grid-template-columns:repeat(2,1fr)}.eq-chart-wrap{height:210px}.eq-range button{padding:4px 7px}}
 @media(max-width:480px){.eq-metrics{grid-template-columns:1fr}.eq-value{font-size:15px}.eq-chart-wrap{height:190px}}
+.r-panel{background:linear-gradient(180deg,rgba(18,22,27,.97),rgba(11,14,18,.99));border:1px solid rgba(52,211,153,.18);border-radius:10px;padding:14px 16px;margin:-8px 0 18px;box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 8px 24px rgba(0,0,0,.28)}
+.r-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.r-title{font-size:12px;font-weight:800;letter-spacing:.08em;color:var(--s-green)}
+.r-meta{font-size:9px;color:var(--muted);font-family:var(--font-mono)}
+.r-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
+.r-card{min-width:0;padding:9px;background:rgba(4,7,10,.72);border:1px solid rgba(255,255,255,.045);border-radius:8px}
+.r-label{font-size:8px;color:var(--text2);font-weight:700;white-space:nowrap;margin-bottom:4px}
+.r-value{font:800 15px var(--font-mono);font-variant-numeric:tabular-nums}
+.r-value.g{color:var(--s-green)}.r-value.r{color:var(--s-red)}.r-value.neu{color:#fff}.r-value.p{color:var(--s-purple)}
+.r-chart-wrap{height:150px;margin-top:10px;border-top:1px solid rgba(255,255,255,.04)}
+.r-chart{width:100%;height:100%;display:block}
+.r-details{margin-top:8px;border-top:1px solid rgba(255,255,255,.04);padding-top:7px}
+.r-details summary{cursor:pointer;color:var(--text2);font-size:10px}
+.r-detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.r-detail-box{font-size:9px;color:var(--muted);background:rgba(4,7,10,.55);padding:8px;border-radius:7px}
+@media(max-width:900px){.r-metrics{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.r-metrics{grid-template-columns:repeat(2,1fr)}.r-detail-grid{grid-template-columns:1fr}.r-head{align-items:flex-start;flex-direction:column}}
 @keyframes breathG{0%{text-shadow:0 0 10px rgba(52,211,153,0.2)}100%{text-shadow:0 0 24px rgba(52,211,153,0.6)}}
 @keyframes breathR{0%{text-shadow:0 0 10px rgba(248,113,113,0.2)}100%{text-shadow:0 0 24px rgba(248,113,113,0.6)}}
 
@@ -1311,6 +1448,8 @@ let D={{ data|tojson }};
 let DEMO_CFG={{ demo_cfg_json|safe }};
 let cur='squeeze_4h';
 let pollTimer=null;
+var _reflowPolling=false, _pollingScan=false;
+var _compressionStatusTimer=null;
 
 // ===== SIDEBAR =====
 let groups=[
@@ -1319,6 +1458,8 @@ let groups=[
   ['glow','RJ指标策略',[['rj_indicator','RJ/BBKD','J']]],
   ['glow','演示引擎',[['demo','净值看板','D']]],
   ['breakout','动量突破',[['breakout_4h','4H','6'],['breakout_1h','1H','7'],['breakout_15m','15m','8'],['breakout_1d','日线','9']]],
+  ['reflow','动能回流',[['reflow_1h','1H首次回流','M']]],
+  ['compression','动能压缩破位',[['compression_15m','15M 压缩池','P']]],
   ['trader','自动交易',[['trader','交易面板','T']]],
   ['squeeze','收敛扫选',[['squeeze_4h','4H','1'],['squeeze_1h','1H','2'],['squeeze_15m','15m','3'],['squeeze_1d','日线','4'],['squeeze_1w','周线','5']]],
   ['short','做空扫选',[['short_4h','4H','9'],['short_1h','1H','0']]],
@@ -1342,6 +1483,8 @@ var _desc={
   breakout_1h:'方向性信号扫描（1H周期），灵敏度较高，适合捕捉短线机会。',
   breakout_15m:'方向性信号扫描（15m周期），灵敏度最高。建议结合大周期结构辅助判断。',
   breakout_1d:'方向性信号扫描（日线周期），结构稳定性最高，适合中长线参考。',
+  reflow_1h:'1H 首次回流看板：持续保留当日信号，展示自动扫描状态、最新回流窗口与质量分层，辅助复核而不执行交易。',
+  compression_15m:'15M 已收盘结构压缩池：数据源为 Binance Futures，池内实时突破监控、状态复核与拒绝统计。只监控不交易。',
   trader:'自动交易引擎。配置API后自动执行：信号扫描→结构止损→动态追踪。内置多级风控与入场验证。',
   squeeze_4h:'波动压缩扫描（4H周期）。监测价格波动收敛状态，压缩越紧=蓄力越充分。',
   squeeze_1h:'波动压缩扫描（1H周期），全市场波动收敛程度排序。',
@@ -1436,17 +1579,31 @@ function show(tab, btn){
   if(tab!=='trader' && traderPoll){clearInterval(traderPoll); traderPoll=null; _traderInitDone=false; stopEngineHeartbeat();}
   if(tab!=='btc_monitor' && btcPoll){clearInterval(btcPoll); btcPoll=null;}
   if(tab!=='demo' && demoPoll){clearInterval(demoPoll); demoPoll=null;}
+  if(prev==='reflow_1h' && tab!=='reflow_1h'){
+    _reflowPolling=false;
+    if(pollTimer && !_pollingScan){clearInterval(pollTimer); pollTimer=null;}
+  }
+  if(prev==='compression_15m' && tab!=='compression_15m' && _compressionStatusTimer){clearInterval(_compressionStatusTimer);_compressionStatusTimer=null;}
   var all=document.querySelectorAll('.nav-item');
   for(var i=0; i<all.length; i++){all[i].classList.remove('active');}
   if(btn) btn.classList.add('active');
   var rows=D[tab]||[];
+  var resultCount=tab==='compression_15m'&&rows&&Array.isArray(rows.pool_rows)?rows.pool_rows.length:tab==='reflow_1h'&&rows&&Array.isArray(rows.rows)?rows.rows.length:(Array.isArray(rows)?rows.length:0);
   setDesc(tab);
-  document.getElementById('statusCount').textContent=rows.length+' 结果';
+  document.getElementById('statusCount').textContent=resultCount+' 结果';
   if(btn){
     var label=btn.textContent.replace(/\d/g,'').trim();
     document.getElementById('scanLabel').textContent='当前: '+label;
   }
   render(tab, rows);
+  if(tab==='reflow_1h'){
+    _reflowPolling=true;
+    if(!pollTimer){pollTimer=setInterval(pollResults,1500); pollResults();}
+  }
+  if(tab==='compression_15m'){
+    refreshCompressionStatus();
+    if(!_compressionStatusTimer) _compressionStatusTimer=setInterval(refreshCompressionStatus,2000);
+  }
 }
 
 function render(tab, rows){
@@ -1462,6 +1619,8 @@ function render(tab, rows){
   if(isRoller){renderRoller(); return;}
   if(isDemo){renderDemo(); return;}
   if(isCR){renderCryptorank(tab.replace('cryptorank_','')); return;}
+  if(tab==='reflow_1h'){renderMomentumReflow(rows); return;}
+  if(tab==='compression_15m'){renderMomentumCompression(rows); return;}
   if(isF){renderFunding(rows); return;}
   if(isB && rows && rows.length>0){renderBreakout(rows); return;}
 
@@ -1561,6 +1720,355 @@ function renderBreakout(rows){
   document.getElementById('main').innerHTML=h;
 }
 
+var _reflowFilters={quality:'ALL',direction:'ALL',type:'ALL',status:'ALL'};
+var _reflowPayload={rows:[]};
+
+var REFLOW_ALERT_SOUND_KEY='axiom_reflow_alert_sound_v1';
+var REFLOW_ALERT_CURSOR_KEY='axiom_reflow_alert_cursor_v1';
+var _reflowAlertTimer=null,_reflowAudioContext=null,_reflowSoundNeedsGesture=false;
+var _reflowAlertPollPromise=null,_reflowAlertBaselinePromise=null;
+var _reflowAlertBaselineGeneration=-1,_reflowAlertGeneration=0;
+
+function updateReflowSoundControls(){
+  var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
+  var state=document.getElementById('reflowSoundState');
+  var toggle=document.getElementById('reflowSoundToggle');
+  if(state) state.textContent=_reflowSoundNeedsGesture?'需要点击恢复声音':(enabled?'已开启':'已关闭');
+  if(toggle){
+    toggle.textContent=enabled?'关闭声音提醒':'开启声音提醒';
+    toggle.onclick=function(){return setReflowSoundEnabled(!enabled);};
+  }
+}
+function activateReflowAudio(){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _reflowAudioContext=_reflowAudioContext||new AudioCtor();
+  return Promise.resolve(_reflowAudioContext.resume()).then(function(){
+    _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
+  }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
+}
+function playReflowCoinSound(playGuard){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _reflowAudioContext=_reflowAudioContext||new AudioCtor();
+  return Promise.resolve(_reflowAudioContext.resume()).then(function(){
+    if(playGuard&&!playGuard()) return false;
+    var now=_reflowAudioContext.currentTime;
+    [880,1175,1568].forEach(function(frequency,index){
+      var start=now+index*0.18,osc=_reflowAudioContext.createOscillator(),gain=_reflowAudioContext.createGain();
+      osc.type='triangle';osc.frequency.setValueAtTime(frequency,start);
+      gain.gain.setValueAtTime(0.0001,start);gain.gain.exponentialRampToValueAtTime(0.22,start+0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001,start+0.32);
+      osc.connect(gain);gain.connect(_reflowAudioContext.destination);osc.start(start);osc.stop(start+0.34);
+    });
+    _reflowSoundNeedsGesture=false;updateReflowSoundControls();return true;
+  }).catch(function(){_reflowSoundNeedsGesture=true;updateReflowSoundControls();return false;});
+}
+function fetchReflowAlertBaseline(){
+  return fetch('/api/reflow/alerts?after=0').then(function(response){
+    if(!response.ok) throw new Error('alert baseline failed');
+    return response.json();
+  });
+}
+function storeReflowAlertCursor(latestAlertId){
+  var current=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY),10);
+  var latest=parseInt(latestAlertId||0,10);
+  if(!isFinite(latest)||latest<0) latest=0;
+  if(isFinite(current)) latest=Math.max(current,latest);
+  localStorage.setItem(REFLOW_ALERT_CURSOR_KEY,String(latest));
+}
+function ensureReflowAlertBaseline(generation){
+  if(generation===undefined) generation=_reflowAlertGeneration;
+  if(generation!==_reflowAlertGeneration) return Promise.resolve(false);
+  if(_reflowAlertBaselinePromise&&_reflowAlertBaselineGeneration===generation){
+    return _reflowAlertBaselinePromise;
+  }
+  var pending=fetchReflowAlertBaseline().then(function(data){
+    if(generation!==_reflowAlertGeneration) return false;
+    storeReflowAlertCursor(data.latest_alert_id);return true;
+  }).catch(function(){return false;});
+  var tracked=pending.then(function(ready){
+    if(!ready&&generation===_reflowAlertGeneration&&_reflowAlertBaselinePromise===tracked){
+      _reflowAlertBaselinePromise=null;_reflowAlertBaselineGeneration=-1;
+    }
+    return ready;
+  });
+  _reflowAlertBaselineGeneration=generation;
+  _reflowAlertBaselinePromise=tracked;
+  return tracked;
+}
+function setReflowSoundEnabled(enabled){
+  var generation=++_reflowAlertGeneration;
+  _reflowAlertBaselinePromise=null;_reflowAlertBaselineGeneration=-1;
+  _reflowAlertPollPromise=null;
+  localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'0');
+  if(!enabled){updateReflowSoundControls();return Promise.resolve();}
+  return activateReflowAudio().then(function(active){
+    if(!active||generation!==_reflowAlertGeneration) return false;
+    return ensureReflowAlertBaseline(generation);
+  }).then(function(ready){
+    if(!ready||generation!==_reflowAlertGeneration) return;
+    localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'1');
+    updateReflowSoundControls();
+  }).catch(function(){
+    if(generation===_reflowAlertGeneration){localStorage.setItem(REFLOW_ALERT_SOUND_KEY,'0');updateReflowSoundControls();}
+  });
+}
+function testReflowCoinSound(){return playReflowCoinSound();}
+function pollReflowAlerts(){
+  if(localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
+  if(_reflowAlertPollPromise) return _reflowAlertPollPromise;
+  var generation=_reflowAlertGeneration;
+  var work=ensureReflowAlertBaseline(generation).then(function(baselineReady){
+    if(!baselineReady||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return null;
+    var cursor=parseInt(localStorage.getItem(REFLOW_ALERT_CURSOR_KEY),10);
+    if(!isFinite(cursor)) return null;
+    return fetch('/api/reflow/alerts?after='+cursor).then(function(response){
+      if(!response.ok) throw new Error('alert poll failed');return response.json();
+    }).then(function(data){return {cursor:cursor,data:data};});
+  }).then(function(result){
+    if(!result||generation!==_reflowAlertGeneration||localStorage.getItem(REFLOW_ALERT_SOUND_KEY)!=='1') return;
+    var data=result.data;
+    if(!Array.isArray(data.events)||!data.events.length) return;
+    var canPlay=function(){return generation===_reflowAlertGeneration&&localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';};
+    return playReflowCoinSound(canPlay).then(function(played){
+      if(played&&generation===_reflowAlertGeneration&&localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1'){
+        storeReflowAlertCursor(data.latest_alert_id||result.cursor);
+      }
+    });
+  }).catch(function(){});
+  var tracked=work.then(function(value){
+    if(_reflowAlertPollPromise===tracked) _reflowAlertPollPromise=null;
+    return value;
+  });
+  _reflowAlertPollPromise=tracked;
+  return tracked;
+}
+function initReflowAlertSound(){
+  ensureReflowAlertBaseline(_reflowAlertGeneration);
+  if(!_reflowAlertTimer) _reflowAlertTimer=setInterval(pollReflowAlerts,5000);
+  updateReflowSoundControls();
+}
+function reflowSoundControls(){
+  var enabled=localStorage.getItem(REFLOW_ALERT_SOUND_KEY)==='1';
+  return '<div class="reflow-sound-controls">'
+    +'<button id="reflowSoundToggle" type="button">'
+    +(enabled?'关闭声音提醒':'开启声音提醒')+'</button>'
+    +'<button type="button" onclick="testReflowCoinSound()">测试声音</button>'
+    +'<span id="reflowSoundState"></span></div>';
+}
+
+function reflowFreshness(returnCloseTime){
+  var time=finiteRNumber(returnCloseTime);
+  if(time===null||time<=0) return '--';
+  var minutes=Math.max(0,Math.floor((Date.now()-time)/60000));
+  if(minutes<1) return '\u521a\u521a';
+  if(minutes<60) return minutes+'\u5206\u949f\u524d';
+  return Math.floor(minutes/60)+'\u5c0f\u65f6\u524d';
+}
+
+function setReflowFilter(name,value){
+  if(!Object.prototype.hasOwnProperty.call(_reflowFilters,name)) return;
+  _reflowFilters[name]=String(value||'ALL');
+  renderMomentumReflow(_reflowPayload);
+}
+
+function renderMomentumReflow(payload){
+  payload=payload&&typeof payload==='object'?payload:{};
+  _reflowPayload=payload;
+  var sourceRows=Array.isArray(payload.rows)?payload.rows:[];
+  var rows=sourceRows.slice();
+  var automation=payload.automation&&typeof payload.automation==='object'?payload.automation:{};
+  var dailyLabel={strong_momentum:'\u5f3a\u52a8\u80fd\u65e5K',bullish_engulfing:'\u770b\u6da8\u541e\u6ca1',bearish_engulfing:'\u770b\u8dcc\u541e\u6ca1',hammer:'\u9524\u5b50\u7ebf',shooting_star:'\u6d41\u661f\u7ebf',morning_star:'\u65e9\u6668\u4e4b\u661f',evening_star:'\u9ec4\u660f\u4e4b\u661f',bottom_fractal:'\u5e95\u5206\u578b',top_fractal:'\u9876\u5206\u578b'};
+  var qualityLabel={HIGH:'\u9ad8\u8d28\u91cf',STANDARD:'\u6807\u51c6',WATCH:'\u89c2\u5bdf'};
+  var typeLabel={CRYPTO:'\u52a0\u5bc6',COMMODITY:'\u5546\u54c1',FX:'\u5916\u6c47'};
+  var statusLabel={ACTIVE:'\u56de\u6d41\u6709\u6548',WINDOW_COMPLETE:'\u7a97\u53e3\u7ed3\u675f',INVALID:'\u4e8b\u4ef6\u5931\u6548'};
+  function count(value){var n=finiteRNumber(value);return n===null?'--':String(Math.max(0,Math.trunc(n)));}
+  function atr(value){var n=finiteRNumber(value);return n===null?'--':Math.abs(n).toFixed(2)+' ATR';}
+  function price(value){var n=finiteRNumber(value);return n===null?'--':n.toFixed(6).replace(/\.?(0+)$/,'');}
+  function volume(value){var n=finiteRNumber(value);return n===null?'--':n.toFixed(1)+'x';}
+  function bjTime(value){var n=finiteRNumber(value);if(n===null||n<=0) return '--';var date=new Date(n);return isNaN(date.getTime())?'--':date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});}
+  function qualityKey(row){var value=String(row.quality_label||row.quality||'WATCH');return qualityLabel[value]?value:'WATCH';}
+  function typeKey(row){var value=String(row.instrument_type||'CRYPTO');return typeLabel[value]?value:'CRYPTO';}
+  function statusKey(row){var value=String(row.status||'ACTIVE');return statusLabel[value]?value:'ACTIVE';}
+  function card(label,value,tone){return '<div class="reflow-status-card"><span>'+label+'</span><b'+(tone?' class="'+tone+'"':'')+'>'+escapeRHtml(value)+'</b></div>';}
+  function filters(){
+    var defs=[['quality','\u8d28\u91cf',[['ALL','\u5168\u90e8'],['HIGH','\u9ad8\u8d28\u91cf'],['STANDARD','\u6807\u51c6'],['WATCH','\u89c2\u5bdf']]],['direction','\u65b9\u5411',[['ALL','\u5168\u90e8'],['LONG','LONG'],['SHORT','SHORT']]],['type','\u7c7b\u578b',[['ALL','\u5168\u90e8'],['CRYPTO','\u52a0\u5bc6'],['COMMODITY','\u5546\u54c1'],['FX','\u5916\u6c47']]],['status','\u72b6\u6001',[['ALL','\u5168\u90e8'],['ACTIVE','\u56de\u6d41\u6709\u6548'],['WINDOW_COMPLETE','\u7a97\u53e3\u7ed3\u675f'],['INVALID','\u4e8b\u4ef6\u5931\u6548']]]],h='<div class="reflow-filter-bar">';
+    for(var i=0;i<defs.length;i++){var group=defs[i];h+='<div class="reflow-filter-group"><span class="reflow-filter-label">'+group[1]+'</span>';for(var j=0;j<group[2].length;j++){var item=group[2][j];h+='<button type="button" class="reflow-filter-btn '+(_reflowFilters[group[0]]===item[0]?'active':'')+'" onclick="setReflowFilter(\''+group[0]+'\',\''+item[0]+'\')">'+item[1]+'</button>';}h+='</div>';}
+    return h+reflowSoundControls()+'</div>';
+  }
+  rows.sort(function(a,b){a=a&&typeof a==='object'?a:{};b=b&&typeof b==='object'?b:{};return finiteRNumber(b.return_open_time)-finiteRNumber(a.return_open_time)||finiteRNumber(b.quality_score)-finiteRNumber(a.quality_score)||finiteRNumber(b.breakout_volume_ratio)-finiteRNumber(a.breakout_volume_ratio)||String(a.symbol).localeCompare(String(b.symbol));});
+  rows=rows.filter(function(row){row=row&&typeof row==='object'?row:{};return (_reflowFilters.quality==='ALL'||qualityKey(row)===_reflowFilters.quality)&&(_reflowFilters.direction==='ALL'||row.direction===_reflowFilters.direction)&&(_reflowFilters.type==='ALL'||typeKey(row)===_reflowFilters.type)&&(_reflowFilters.status==='ALL'||statusKey(row)===_reflowFilters.status);});
+  var hasProgress=automation.progress!==undefined&&automation.progress!==null&&automation.progress!=='';
+  var progress=automation.scanning?'\u626b\u63cf\u4e2d'+(hasProgress?' '+String(automation.progress):''):(hasProgress?String(automation.progress):'--');
+  document.getElementById('stats').innerHTML='<div class="reflow-status-grid">'+card('\u81ea\u52a8\u626b\u63cf',automation.auto_scan_enabled?'\u5df2\u5f00\u542f':'\u5df2\u5173\u95ed',automation.auto_scan_enabled?'g':'r')+card('\u4e0a\u6b21\u626b\u63cf',bjTime(automation.last_auto_scan_at))+card('\u4e0b\u6b21\u626b\u63cf',bjTime(automation.next_scan_at),'c')+card('\u5f53\u524d\u626b\u63cf',progress,automation.scanning?'c':'')+card('\u5df2\u626b\u63cf',count(payload.scanned))+card('\u9519\u8bef',count(payload.errors),'r')+card('\u4eca\u65e5\u603b\u6570',count(payload.today_total),'c')+card('\u9ad8\u8d28\u91cf',count(payload.high_quality_count),'g')+'</div>';
+  if(!rows.length){document.getElementById('main').innerHTML=filters()+'<div class="empty-state"><div class="ic-empty"></div><h3>\u6682\u65e0\u9996\u6b21\u56de\u6d41\u5019\u9009</h3><p>\u7b49\u5f85 EMA50 \u5f3a\u52bf\u7a81\u7834\u3001\u6269\u5f20\u4e0e\u65e5\u7ebf\u786e\u8ba4\u540e\u9996\u6b21\u56de\u8e29\u3002</p></div>';updateReflowSoundControls();return;}
+  var h=filters()+'<div class="reflow-dashboard"><table><thead><tr><th>#</th><th>\u4ea4\u6613\u5bf9</th><th>\u65b9\u5411</th><th>\u8d28\u91cf</th><th>\u72b6\u6001</th><th>\u7c7b\u578b</th><th>\u4ef7\u683c</th><th>EMA50</th><th>\u65b0\u9c9c\u5ea6</th><th>\u7a97\u53e3</th><th>\u7a81\u7834\u65f6\u95f4</th><th>\u65e5\u7ebf\u786e\u8ba4</th><th>\u91cf\u6bd4</th></tr></thead><tbody>';
+  for(var i=0;i<rows.length;i++){var row=rows[i]&&typeof rows[i]==='object'?rows[i]:{},symbol=String(row.symbol===null||row.symbol===undefined?'':row.symbol),direction=row.direction==='SHORT'?'SHORT':'LONG',tone=direction==='LONG'?'g':'r',q=qualityKey(row),type=typeKey(row),status=statusKey(row),windowIndex=finiteRNumber(row.window_index),window=windowIndex===null?'--/5':Math.max(0,Math.trunc(windowIndex))+'/5',daily=escapeRHtml(dailyLabel[row.daily_kind]||row.daily_kind||'--');h+='<tr><td>'+(i+1)+'</td><td><span class="copy-sym" data-symbol="'+escapeRHtml(symbol)+'" onclick="event.stopPropagation();copySymbol(this.getAttribute(\'data-symbol\'),this)" title="\u590d\u5236"></span> <b>'+(escapeRHtml(symbol.replace('USDT',''))||'--')+'</b></td><td class="'+tone+' reflow-'+direction.toLowerCase()+'">'+direction+'</td><td><span class="reflow-quality reflow-quality-'+q.toLowerCase()+'">'+qualityLabel[q]+'</span></td><td class="reflow-mobile-detail-cell"><span class="reflow-status reflow-status-'+status.toLowerCase().replace('_','-')+'">'+statusLabel[status]+'</span><span class="reflow-mobile-freshness">'+reflowFreshness(row.return_close_time)+'</span><details class="reflow-mobile-details"><summary>\u66f4\u591a\u8be6\u60c5</summary><div>\u7c7b\u578b '+typeLabel[type]+' \u00b7 \u4ef7\u683c '+price(row.price)+' \u00b7 EMA50 '+price(row.ema50)+' \u00b7 \u7a97\u53e3 '+window+' \u00b7 \u7a81\u7834 '+bjTime(row.breakout_time)+' \u00b7 \u65e5\u7ebf '+daily+' \u00b7 \u91cf\u6bd4 '+volume(row.breakout_volume_ratio)+' \u00b7 \u6536\u76d8\u8ddd\u79bb '+atr(row.close_distance_atr)+' \u00b7 \u6700\u5927\u6269\u5f20 '+atr(row.max_expansion_atr)+'</div></details></td><td>'+typeLabel[type]+'</td><td>'+price(row.price)+'</td><td>'+price(row.ema50)+'</td><td>'+reflowFreshness(row.return_close_time)+'</td><td>'+window+'</td><td>'+bjTime(row.breakout_time)+'</td><td>'+daily+'</td><td>'+volume(row.breakout_volume_ratio)+'</td></tr>';}
+  document.getElementById('main').innerHTML=h+'</tbody></table></div>';
+  updateReflowSoundControls();
+}
+
+// Compression dashboard remains separate from the reflow renderer and alert cursor.
+var COMPRESSION_ALERT_SOUND_KEY='axiom_compression_alert_sound_v1';
+var COMPRESSION_ALERT_CURSOR_KEY='axiom_compression_alert_cursor_v1';
+var _compressionAlertTimer=null,_compressionAudioContext=null,_compressionAlertPollPromise=null;
+var _compressionAlertBaselinePromise=null,_compressionAlertGeneration=0,_compressionAlertBaselinedGeneration=-1;
+var _compressionPayload={monitor:{},pool_rows:[],episode_rows:[],rejection_counts:{},can_manage:false};
+
+function compressionNumber(value, decimals){
+  var number=finiteRNumber(value);
+  return number===null?'--':number.toFixed(decimals);
+}
+function compressionTime(value){
+  if(typeof value==='string') return escapeRHtml(value||'--');
+  var number=finiteRNumber(value);
+  if(number===null||number<=0) return '--';
+  var date=new Date(number);
+  return isNaN(date.getTime())?'--':escapeRHtml(date.toLocaleString('sv-SE',{timeZone:'Asia/Shanghai',hour12:false}));
+}
+function compressionDirection(row){return row&&row.side==='SHORT'?'SHORT':'LONG';}
+function compressionDeliveryStatus(row, key){
+  var value=String((row&&row[key])||'unknown');
+  if(value==='available') return '可用';
+  if(value==='not_eligible') return '不符合投递条件';
+  if(value==='pending') return '待投递';
+  if(value==='delivered') return '已投递';
+  if(value==='failed') return '投递失败';
+  if(value==='indeterminate') return '投递结果待确认';
+  return '无投递记录';
+}
+function compressionRows(rows, side){
+  return (Array.isArray(rows)?rows:[]).filter(function(row){return compressionDirection(row)===side;});
+}
+function compressionRowHtml(row, index){
+  row=row&&typeof row==='object'?row:{};
+  var symbol=escapeRHtml(row.symbol||'--'),side=compressionDirection(row),tone=side==='LONG'?'g':'r';
+  var state=escapeRHtml(row.state||'--'),price=compressionNumber(row.live_price,6),atr=finiteRNumber(row.atr14);
+  var boundary=finiteRNumber(side==='LONG'?row.upper_boundary_price:row.lower_boundary_price),live=finiteRNumber(row.live_price);
+  var distance=boundary===null||live===null||atr===null||atr<=0?'--':(Math.abs(boundary-live)/atr).toFixed(2)+' ATR';
+  var bars=compressionNumber(row.compression_bars,0),touches=compressionNumber(row.directional_touch_count,0),contraction=compressionNumber(row.contraction_ratio,3);
+  var ema8=compressionNumber(row.ema8,6),ema21=compressionNumber(row.ema21,6),quality=compressionNumber(row.quality_score,2),verified=compressionTime(row.last_verified_at||row.evaluated_at),firstSeen=compressionTime(row.first_seen_at);
+  return '<tr><td>'+index+'</td><td><b>'+symbol+'</b></td><td class="'+tone+'">'+side+'</td><td>'+state+'</td><td>'+price+'</td><td>'+bars+'</td><td>'+escapeRHtml(row.htf_alignment||'UNKNOWN')+'</td><td>'+firstSeen+'</td><td>'+distance+'</td><td>'+touches+'</td><td>'+contraction+'</td><td>'+ema8+' / '+ema21+'</td><td>'+compressionNumber(row.atr14,6)+'</td><td>'+quality+'</td><td>'+verified+'</td></tr>';
+}
+function compressionTable(title, rows, side){
+  var selected=compressionRows(rows,side).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);}),tone=side==='LONG'?'g':'r';
+  var html='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text)"><span class="'+tone+'">'+title+'</span> <span style="color:var(--muted)">'+selected.length+'</span></div>';
+  html+='<table><thead><tr><th>#</th><th>交易对</th><th>方向</th><th>当前状态</th><th>实时价格</th><th>压缩K线</th><th>大周期</th><th>入池时间</th><th>边界距离</th><th>触碰</th><th>收敛</th><th>EMA8/21</th><th>ATR</th><th>质量</th><th>验证时间</th></tr></thead><tbody>';
+  if(!selected.length) html+='<tr><td colspan="15" style="text-align:center;color:var(--muted);padding:18px">暂无候选</td></tr>';
+  for(var i=0;i<selected.length;i++) html+=compressionRowHtml(selected[i],i+1);
+  return html+'</tbody></table></section>';
+}
+function compressionSoundControls(){
+  var enabled=localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';
+  return '<div class="reflow-sound-controls"><button id="compressionSoundToggle" type="button" onclick="setCompressionSoundEnabled('+(!enabled)+')">'+(enabled?'关闭声音提醒':'开启声音提醒')+'</button><button type="button" onclick="testCompressionCoinSound()">测试声音</button><span id="compressionSoundState">'+(enabled?'已开启':'已关闭')+'</span></div>';
+}
+function updateCompressionSoundControls(){
+  var enabled=localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';
+  var toggle=document.getElementById('compressionSoundToggle'),state=document.getElementById('compressionSoundState');
+  if(toggle){toggle.textContent=enabled?'关闭声音提醒':'开启声音提醒';toggle.onclick=function(){return setCompressionSoundEnabled(!enabled);};}
+  if(state) state.textContent=enabled?'已开启':'已关闭';
+}
+function renderMomentumCompression(payload){
+  payload=payload&&typeof payload==='object'?payload:{};
+  _compressionPayload=payload;
+  var monitor=payload.monitor&&typeof payload.monitor==='object'?payload.monitor:{};
+  var scan=payload.scan&&typeof payload.scan==='object'?payload.scan:{};
+  var alert=payload.alert&&typeof payload.alert==='object'?payload.alert:{};
+  var pool=Array.isArray(payload.pool_rows)?payload.pool_rows:[];
+  var episodes=Array.isArray(payload.episode_rows)?payload.episode_rows:[];
+  var failures=Array.isArray(payload.scan_failures)?payload.scan_failures:[];
+  var rejections=payload.rejection_counts&&typeof payload.rejection_counts==='object'?payload.rejection_counts:{};
+  var canManage=payload.can_manage===true, running=monitor.running===true, auto=monitor.auto_enabled===true;
+  var status=running?'运行中':(auto?'待启动':'已关闭');
+  var stats='<div class="reflow-status-grid"><div class="reflow-status-card"><span>自动监控</span><b class="'+(auto?'g':'r')+'">'+(auto?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>引擎状态</span><b class="'+(running?'g':'')+'">'+status+'</b></div><div class="reflow-status-card"><span>观察池</span><b class="c">'+compressionNumber(monitor.pool_size===undefined?pool.length:monitor.pool_size,0)+'</b></div><div class="reflow-status-card"><span>已扫描</span><b>'+compressionNumber(scan.scanned,0)+'</b></div><div class="reflow-status-card"><span>合格候选</span><b class="g">'+compressionNumber(scan.eligible,0)+'</b></div><div class="reflow-status-card"><span>错误数</span><b class="r">'+compressionNumber(scan.errors,0)+'</b></div><div class="reflow-status-card"><span>当前已触发结构数</span><b class="g">'+compressionNumber(monitor.today_fresh,0)+'</b></div><div class="reflow-status-card"><span>丢弃价格行</span><b class="r">'+compressionNumber(monitor.dropped_price_rows,0)+'</b></div><div class="reflow-status-card"><span>上次结构扫描</span><b>'+compressionTime(monitor.last_scan_at)+'</b></div><div class="reflow-status-card"><span>下次扫描</span><b>'+compressionTime(monitor.next_scan_at)+'</b></div><div class="reflow-status-card"><span>价格流</span><b>'+escapeRHtml(monitor.price_stream_status||'--')+'</b></div><div class="reflow-status-card"><span>监控错误</span><b class="r">'+escapeRHtml(monitor.last_error||'--')+'</b></div><div class="reflow-status-card"><span>声音提醒</span><b>'+((localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1')?'已开启':'已关闭')+'</b></div><div class="reflow-status-card"><span>微信投递</span><b>'+compressionTime(alert.last_delivery_at)+'</b></div><div class="reflow-status-card"><span>微信错误</span><b class="r">'+escapeRHtml(alert.last_error||'--')+'</b></div></div>';
+  document.getElementById('stats').innerHTML=stats;
+  var toggle='<button type="button" class="btn" '+(canManage?'':'disabled title="仅管理员可修改"')+' onclick="setCompressionAutoEnabled('+(!auto)+')">'+(auto?'关闭自动监控':'开启自动监控')+'</button>';
+  var controls='<div class="reflow-filter-bar"><span class="reflow-filter-label">15M 已收盘结构 · 数据源：Binance Futures · 池内实时突破 · 只监控不交易</span>'+toggle+(canManage?'':'<span style="color:var(--muted);font-size:11px">仅管理员可修改</span>')+compressionSoundControls()+'</div>';
+  var currentBreakoutStates={BREAKOUT_FRESH_LONG:true,BREAKOUT_FRESH_SHORT:true,BREAKOUT_ACTIVE_LONG:true,BREAKOUT_ACTIVE_SHORT:true,BREAKOUT_RETRACING_LONG:true,BREAKOUT_RETRACING_SHORT:true};
+  var breakouts=pool.filter(function(row){return currentBreakoutStates[String((row||{}).state||'')]===true;}).sort(function(a,b){return (finiteRNumber(b&&b.quality_score)||-1)-(finiteRNumber(a&&a.quality_score)||-1);});
+  var failureHtml=failures.length?'<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">扫描失败明细 <span class="r">'+failures.length+'</span></div><table><thead><tr><th>交易对</th><th>阶段</th><th>错误类型</th><th>原因</th><th>尝试次数</th></tr></thead><tbody>'+failures.map(function(item){item=item&&typeof item==='object'?item:{};return '<tr><td><b>'+escapeRHtml(item.symbol||'--')+'</b></td><td>'+escapeRHtml(item.stage||'--')+'</td><td>'+escapeRHtml(item.error_type||'--')+'</td><td>'+escapeRHtml(item.message||'--')+'</td><td>'+compressionNumber(item.attempts,0)+'</td></tr>';}).join('')+'</tbody></table></section>':'';
+  var freshHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">当前突破 <span class="g">'+breakouts.length+'</span></div>'+(breakouts.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>状态</th><th>突破时间</th><th>突破价格</th><th>最新价格</th><th>最新时间</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>声音</th><th>微信</th><th>质量</th></tr></thead><tbody>'+breakouts.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at)+'</td><td>'+compressionNumber(row.breakout_price,6)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionTime(row.last_price_at)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionDeliveryStatus(row,'sound_status')+'</td><td>'+compressionDeliveryStatus(row,'wechat_status')+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无当前突破</p></div>')+'</section>';
+  var terminalHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">终止结构 <span style="color:var(--muted)">'+episodes.length+'</span></div>'+(episodes.length?'<table><thead><tr><th>交易对</th><th>方向</th><th>终止状态</th><th>突破时间</th><th>突破价格</th><th>最新价格</th><th>最新时间</th><th>边界</th><th>缓冲</th><th>当前距离</th><th>声音</th><th>微信</th><th>质量</th></tr></thead><tbody>'+episodes.map(function(row){row=row&&typeof row==='object'?row:{};var side=compressionDirection(row),boundary=side==='LONG'?row.upper_boundary_price:row.lower_boundary_price,atr=finiteRNumber(row.atr14),live=finiteRNumber(row.live_price),edge=finiteRNumber(boundary),distance=atr===null||atr<=0||live===null||edge===null?'--':(Math.abs(live-edge)/atr).toFixed(2)+' ATR';return '<tr><td><b>'+escapeRHtml(row.symbol||'--')+'</b></td><td class="'+(side==='LONG'?'g':'r')+'">'+side+'</td><td>'+escapeRHtml(row.state||'--')+'</td><td>'+compressionTime(row.breakout_at)+'</td><td>'+compressionNumber(row.breakout_price,6)+'</td><td>'+compressionNumber(row.live_price,6)+'</td><td>'+compressionTime(row.last_price_at)+'</td><td>'+compressionNumber(boundary,6)+'</td><td>'+compressionNumber(row.breakout_buffer_price,6)+'</td><td>'+distance+'</td><td>'+compressionDeliveryStatus(row,'sound_status')+'</td><td>'+compressionDeliveryStatus(row,'wechat_status')+'</td><td>'+compressionNumber(row.quality_score,2)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty-state" style="padding:22px"><p>暂无终止结构</p></div>')+'</section>';
+  var rejectionKeys=Object.keys(rejections).sort();
+  var rejectionHtml='<section class="reflow-dashboard" style="margin-top:12px"><div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700">拒绝统计</div><div style="padding:12px 14px;color:var(--text2);font-size:12px">'+(rejectionKeys.length?rejectionKeys.map(function(key){return '<span style="display:inline-block;margin:0 12px 8px 0">'+escapeRHtml(key)+' <b>'+compressionNumber(rejections[key],0)+'</b></span>';}).join(''):'本轮无拒绝统计')+'</div></section>';
+  document.getElementById('main').innerHTML=controls+failureHtml+compressionTable('LONG 观察池',pool,'LONG')+compressionTable('SHORT 观察池',pool,'SHORT')+freshHtml+terminalHtml+rejectionHtml;
+  updateCompressionSoundControls();
+}
+function refreshCompressionStatus(){
+  return fetch('/api/compression/status').then(function(response){if(!response.ok) throw new Error('compression status failed');return response.json();}).then(function(payload){
+    D.compression_15m=payload;
+    if(cur==='compression_15m'){
+      var button=document.getElementById('scanBtn'),scanning=payload.monitor&&payload.monitor.structure_scanning===true;
+      if(button){button.disabled=scanning;button.textContent=scanning?'扫描中...':'▶ 开始扫描';}
+    }
+    if(cur==='compression_15m') renderMomentumCompression(payload);
+    return payload;
+  }).catch(function(){return null;});
+}
+function startCompressionManualScan(){
+  var button=document.getElementById('scanBtn');
+  if(button){button.disabled=true;button.textContent='扫描中...';}
+  return fetch('/scan/compression/15m').then(function(response){return response.json();}).then(function(){return refreshCompressionStatus();}).catch(function(){if(button){button.disabled=false;button.textContent='▶ 开始扫描';}return null;});
+}
+function setCompressionAutoEnabled(enabled){
+  if(!_compressionPayload.can_manage) return Promise.resolve(false);
+  return fetch('/api/compression/automation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!!enabled})}).then(function(response){if(!response.ok) throw new Error('compression automation failed');return response.json();}).then(function(){return refreshCompressionStatus();}).catch(function(){return false;});
+}
+function activateCompressionAudio(){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _compressionAudioContext=_compressionAudioContext||new AudioCtor();
+  return Promise.resolve(_compressionAudioContext.resume()).then(function(){return true;}).catch(function(){return false;});
+}
+function playCompressionCoinSound(playGuard){
+  var AudioCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtor) return Promise.resolve(false);
+  _compressionAudioContext=_compressionAudioContext||new AudioCtor();
+  return Promise.resolve(_compressionAudioContext.resume()).then(function(){
+    if(playGuard&&!playGuard()) return false;
+    var now=_compressionAudioContext.currentTime;
+    [880,1175,1568].forEach(function(frequency,index){var start=now+index*0.18,osc=_compressionAudioContext.createOscillator(),gain=_compressionAudioContext.createGain();osc.type='triangle';osc.frequency.setValueAtTime(frequency,start);gain.gain.setValueAtTime(0.0001,start);gain.gain.exponentialRampToValueAtTime(0.22,start+0.012);gain.gain.exponentialRampToValueAtTime(0.0001,start+0.32);osc.connect(gain);gain.connect(_compressionAudioContext.destination);osc.start(start);osc.stop(start+0.34);});
+    return true;
+  }).catch(function(){return false;});
+}
+function storeCompressionAlertCursor(latest){
+  var value=parseInt(latest,10),current=parseInt(localStorage.getItem(COMPRESSION_ALERT_CURSOR_KEY),10);
+  if(!isFinite(value)||value<0) value=0;
+  if(isFinite(current)) value=Math.max(value,current);
+  localStorage.setItem(COMPRESSION_ALERT_CURSOR_KEY,String(value));
+}
+function ensureCompressionAlertBaseline(generation){
+  if(generation!==_compressionAlertGeneration) return Promise.resolve(false);
+  if(_compressionAlertBaselinedGeneration===generation) return Promise.resolve(true);
+  if(_compressionAlertBaselinePromise) return _compressionAlertBaselinePromise;
+  var pending=fetch('/api/compression/alerts?after=0').then(function(response){if(!response.ok) throw new Error('compression baseline failed');return response.json();}).then(function(data){if(generation!==_compressionAlertGeneration) return false;storeCompressionAlertCursor(data.latest_alert_id);_compressionAlertBaselinedGeneration=generation;return true;}).catch(function(){return false;});
+  var tracked=pending.then(function(ready){if(_compressionAlertBaselinePromise===tracked) _compressionAlertBaselinePromise=null;return ready;});
+  _compressionAlertBaselinePromise=tracked;
+  return tracked;
+}
+function setCompressionSoundEnabled(enabled){
+  var generation=++_compressionAlertGeneration;
+  _compressionAlertBaselinePromise=null;_compressionAlertPollPromise=null;_compressionAlertBaselinedGeneration=-1;
+  localStorage.setItem(COMPRESSION_ALERT_SOUND_KEY,'0');
+  if(!enabled){updateCompressionSoundControls();return Promise.resolve();}
+  return activateCompressionAudio().then(function(active){return active&&ensureCompressionAlertBaseline(generation);}).then(function(ready){if(ready&&generation===_compressionAlertGeneration) localStorage.setItem(COMPRESSION_ALERT_SOUND_KEY,'1');updateCompressionSoundControls();});
+}
+function pollCompressionAlerts(){
+  if(localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)!=='1') return Promise.resolve();
+  if(_compressionAlertPollPromise) return _compressionAlertPollPromise;
+  var generation=_compressionAlertGeneration;
+  var work=ensureCompressionAlertBaseline(generation).then(function(ready){if(!ready||generation!==_compressionAlertGeneration||localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)!=='1') return null;var cursor=parseInt(localStorage.getItem(COMPRESSION_ALERT_CURSOR_KEY),10);if(!isFinite(cursor)) return null;return fetch('/api/compression/alerts?after='+cursor).then(function(response){if(!response.ok) throw new Error('compression alert poll failed');return response.json();}).then(function(data){return {cursor:cursor,data:data};});}).then(function(result){if(!result||!Array.isArray(result.data.events)||!result.data.events.length||generation!==_compressionAlertGeneration) return;return playCompressionCoinSound(function(){return generation===_compressionAlertGeneration&&localStorage.getItem(COMPRESSION_ALERT_SOUND_KEY)==='1';}).then(function(played){if(played&&generation===_compressionAlertGeneration) storeCompressionAlertCursor(result.data.latest_alert_id||result.cursor);});}).catch(function(){});
+  var tracked=work.then(function(value){if(_compressionAlertPollPromise===tracked) _compressionAlertPollPromise=null;return value;});
+  _compressionAlertPollPromise=tracked;
+  return tracked;
+}
+function testCompressionCoinSound(){return playCompressionCoinSound();}
+function initCompressionAlertSound(){
+  ensureCompressionAlertBaseline(_compressionAlertGeneration);
+  if(!_compressionAlertTimer) _compressionAlertTimer=setInterval(pollCompressionAlerts,2000);
+}
+
 // ===== SCANNING =====
 function setScanning(s){
   document.getElementById('scanBtn').disabled=s;
@@ -1571,39 +2079,49 @@ function setScanning(s){
 }
 function stopScan(){
   if(pollTimer){clearInterval(pollTimer); pollTimer=null;}
+  _pollingScan=false;
   setScanning(false);
   document.getElementById('progressBar').style.width='0';
   document.getElementById('statusText').textContent='已停止';
 }
 function doScan(){
   if(cur==='trader'){selectTab('breakout_1h'); return;}
+  if(cur==='compression_15m'){startCompressionManualScan();return;}
+  _pollingScan=true;
   setScanning(true);
   var url=cur==='funding'?'/scan/funding':'/scan/'+cur.split('_')[0]+'/'+cur.split('_')[1];
   document.getElementById('progressBar').style.width='10%';
   fetch(url).then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusText').textContent=d.status||'';
-    pollTimer=setInterval(pollResults, 1500);
+    if(!pollTimer) pollTimer=setInterval(pollResults, 1500);
   }).catch(function(e){setScanning(false);});
 }
 function pollResults(){
   fetch('/data').then(function(r){return r.json();}).then(function(d){
+    var wasScanning=_pollingScan;
+    _pollingScan=!!d.scanning;
     D=d.data;
     document.getElementById('statusTime').textContent=d.time;
     var txt=d.status; if(d.progress) txt+=' ['+d.progress+']';
     document.getElementById('statusText').textContent=txt;
-    if(d.progress){
-      var parts=d.progress.split('/');
+    if(d.progress!==undefined && d.progress!==null && d.progress!==''){
+      var parts=String(d.progress).split('/');
       if(parts.length===2) document.getElementById('progressBar').style.width=(parseInt(parts[0])/parseInt(parts[1])*90+10)+'%';
     }
+    if(cur==='reflow_1h') show(cur, null);
+    if(cur==='compression_15m') refreshCompressionStatus();
     if(!d.scanning){
-      clearInterval(pollTimer); pollTimer=null;
-      setScanning(false);
-      document.getElementById('progressBar').style.width='100%';
-      setTimeout(function(){document.getElementById('progressBar').style.width='0'},500);
-      if(cur!=='trader') show(cur, null);
+      if(wasScanning){
+        setScanning(false);
+        document.getElementById('progressBar').style.width='100%';
+        setTimeout(function(){document.getElementById('progressBar').style.width='0'},500);
+        if(cur!=='trader' && cur!=='reflow_1h') show(cur, null);
+      }
+      if(!_reflowPolling){clearInterval(pollTimer); pollTimer=null;}
     }
   }).catch(function(e){
     clearInterval(pollTimer); pollTimer=null;
+    _pollingScan=false;
     setScanning(false);
   });
 }
@@ -1688,6 +2206,29 @@ function renderTrader(){
   refreshTraderData();
 }
 
+var _rPerformanceDetailsOpen=false;
+function rememberRPerformanceDetailsState(details){
+  _rPerformanceDetailsOpen=!!(details&&details.open);
+}
+
+function rPerformancePanelHtml(){
+  return '<section class="r-panel" id="rPerformancePanel">'
+    +'<div class="r-head"><div class="r-title">R PERFORMANCE</div><div class="r-meta" id="rPerformanceMeta">--</div></div>'
+    +'<div class="r-metrics">'
+    +'<div class="r-card"><div class="r-label">累计净 R</div><div class="r-value" id="rNetValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">每笔期望</div><div class="r-value" id="rExpectancyValue">--</div></div>'
+    +'<div class="r-card" title="平均盈利R ÷ 平均亏损R绝对值"><div class="r-label">平均盈亏比</div><div class="r-value p" id="rPayoffValue">--</div></div>'
+    +'<div class="r-card" title="全部盈利R ÷ 全部亏损R绝对值"><div class="r-label">Profit Factor</div><div class="r-value p" id="rProfitFactorValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">平均盈利 / 亏损</div><div class="r-value" id="rAverageValue">--</div></div>'
+    +'<div class="r-card"><div class="r-label">最大回撤 R</div><div class="r-value r" id="rDrawdownValue">--</div></div>'
+    +'</div>'
+    +'<div class="r-chart-wrap" id="rPerformanceChart"><div class="eq-empty">等待有效 R 交易记录</div></div>'
+    +'<details class="r-details" id="rPerformanceDetails"'
+    +(_rPerformanceDetailsOpen?' open':'')
+    +' ontoggle="rememberRPerformanceDetailsState(this)"><summary>更多复盘</summary><div class="r-detail-grid" id="rPerformanceDetailGrid"></div></details>'
+    +'</section>';
+}
+
 function initTraderPanel(){
   document.getElementById('main').innerHTML='<div style="text-align:center;padding:60px;color:var(--muted)">加载配置中...</div>';
   document.getElementById('stats').innerHTML='';
@@ -1714,6 +2255,7 @@ function initTraderPanel(){
     h+='<div class="eq-chart-wrap" id="equityChart"><div class="eq-empty">等待交易记录生成净值曲线</div></div>';
     h+='<div class="eq-legend"><span><i class="eq-dot"></i>账户净值</span><span><i class="eq-dot base"></i>初始权益</span></div>';
     h+='</div>';
+    h+=rPerformancePanelHtml();
     // Heartbeat bar — 下排全宽底栏 (纯展示, 无按钮)
     h+='<div class="axiom-heartbeat axiom-hb-bar" id="axiomTimerBox" style="display:none;margin-bottom:18px;border-radius:0 0 10px 10px;width:100%">';
     h+='<div class="ah-status"><span class="ah-dot" id="acStatusDot"></span><span class="ah-label" id="acStatusLabel">距下轮扫描</span></div>';
@@ -1765,7 +2307,7 @@ function initTraderPanel(){
     h+='<div class="t-field"><label>多周期并发<span class="tip">!<span class="tip-text">逗号分隔多周期同步扫描<br>例: 30m 或 30m,1h</span></span></label><input type="text" id="cfg_interval" value="'+(cfg.scan_interval||'30m')+'" placeholder="30m" style="font-family:monospace;font-size:11px"></div>';
     h+='<div class="t-field"><label>最低评分</label><input type="number" id="cfg_score" value="'+(cfg.min_score||70)+'" min="30" max="90" step="5"></div>';
     h+='<div class="t-field"><label>最大持仓</label><input type="number" id="cfg_maxpos" value="'+(cfg.max_positions||3)+'" min="1" max="10"></div>';
-    h+='<div class="t-field" style="display:none"><label>信号源</label><select id="cfg_signal_source"><option value="rj_only"'+((cfg.entry_signal_source||'rj_only')==='rj_only'?' selected':'')+'>RJ独立策略</option><option value="structure"'+((cfg.entry_signal_source||'rj_only')==='structure'?' selected':'')+'>结构突破 + RJ过滤</option></select></div>';
+    h+='<div class="t-field" style="display:none"><label>信号源</label><select id="cfg_signal_source"><option value="predicta_ewo"'+((cfg.entry_signal_source||'rj_only')==='predicta_ewo'?' selected':'')+'>Predicta + EWO</option><option value="rj_only"'+((cfg.entry_signal_source||'rj_only')==='rj_only'?' selected':'')+'>RJ独立策略</option><option value="structure"'+((cfg.entry_signal_source||'rj_only')==='structure'?' selected':'')+'>结构突破 + RJ过滤</option></select></div>';
     h+='</div></div>';
 
     // -- RJ entry filter section --
@@ -1838,6 +2380,7 @@ function initTraderPanel(){
     h+='<div class="t-section-header" onclick="toggleSection(this)"><span class="t-section-indicator" style="background:var(--s-purple);box-shadow:0 0 6px rgba(168,85,247,0.15)"></span><span>三阶止盈</span><span class="t-arrow">▶</span></div>';
     h+='<div class="t-section-body">';
     h+='<p style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">1阶防守 → 2阶减仓 → 3阶追踪 (EMA棘轮 / ATR吊灯)</p>';
+    h+='<div class="t-field"><label>0.5R半损保护<span class="tip">!<span class="tip-text">达到设置的R后，把最大亏损从1R降到0.5R<br>0=关闭，不锁浮盈</span></span></label><input type="number" id="cfg_half_risk_r" value="'+(cfg.half_risk_trigger_r??0)+'" min="0" max="0.79" step="0.1"></div>';
     h+='<div class="t-field"><label>提前保护<span class="tip">!<span class="tip-text">未到1.2R前先保本<br>防止0.8R附近回落成亏损</span></span></label><select id="cfg_early_protect"><option value="1"'+(cfg.enable_early_protect!==false?' selected':'')+'>启用</option><option value="0"'+(cfg.enable_early_protect===false?' selected':'')+'>关闭</option></select></div>';
     h+='<div class="t-field"><label>提前保护R</label><input type="number" id="cfg_early_r" value="'+(cfg.early_protect_r||0.8)+'" min="0.3" max="1.2" step="0.1"></div>';
     h+='<div class="t-field"><label>提前锁定R<span class="tip">!<span class="tip-text">0=止损推到入场价<br>0.05=锁0.05R小利润</span></span></label><input type="number" id="cfg_early_lock" value="'+(cfg.early_protect_lock_r||0)+'" min="0" max="0.5" step="0.05"></div>';
@@ -1859,8 +2402,8 @@ function initTraderPanel(){
     h+='<div class="t-field"><label>Hermes AI确认</label><select id="cfg_hermes_on"><option value="0"'+(cfg.hermes_confirm_enabled?'':' selected')+'>关闭</option><option value="1"'+(cfg.hermes_confirm_enabled?' selected':'')+'>启用</option></select></div>';
     h+='<div class="t-field"><label>Hermes模式</label><select id="cfg_hermes_mode"><option value="log_only"'+((cfg.hermes_confirm_mode||'log_only')==='log_only'?' selected':'')+'>仅记录</option><option value="hard_filter"'+((cfg.hermes_confirm_mode||'log_only')==='hard_filter'?' selected':'')+'>拦截冲突</option></select></div>';
     h+='<div class="t-field"><label>Hermes最低置信度</label><input type="number" id="cfg_hermes_conf" value="'+(cfg.hermes_confirm_min_confidence||65)+'" min="0" max="100" step="1"></div>';
-    h+='<div class="t-field"><label>Hermes超时秒</label><input type="number" id="cfg_hermes_timeout" value="'+(cfg.hermes_confirm_timeout_sec||90)+'" min="3" max="120" step="1"></div>';
-    h+='<div class="t-field"><label>Hermes排队秒</label><input type="number" id="cfg_hermes_queue_wait" value="'+(cfg.hermes_confirm_queue_wait_sec||120)+'" min="0" max="300" step="5"></div>';
+        h+='<div class="t-field"><label>Hermes超时秒</label><input type="number" id="cfg_hermes_timeout" value="'+(cfg.hermes_confirm_timeout_sec||240)+'" min="3" max="300" step="1"></div>';
+        h+='<div class="t-field"><label>Hermes排队秒</label><input type="number" id="cfg_hermes_queue_wait" value="'+(cfg.hermes_confirm_queue_wait_sec||300)+'" min="0" max="300" step="5"></div>';
     h+='<div class="t-field"><label>Hermes异常放行</label><select id="cfg_hermes_fail_open"><option value="0"'+(cfg.hermes_confirm_fail_open?'':' selected')+'>否</option><option value="1"'+(cfg.hermes_confirm_fail_open?' selected':'')+'>是</option></select></div>';
     h+='</div></div>';
 
@@ -1898,6 +2441,67 @@ function setEquityRange(days, btn){
   if(btn) btn.classList.add('active');
   if(_lastTraderData) renderEquityReview(_lastTraderData);
 }
+function getRRangeSummary(d){
+  var ranges=((d||{}).r_performance||{}).ranges||{};
+  var key=Number(_equityRangeDays||0)>0?String(_equityRangeDays):'all';
+  return ranges[key]||null;
+}
+function getRRangeLabel(){
+  var labels={7:'1W',30:'1M',90:'3M',180:'6M',365:'1Y',0:'ALL'};
+  return labels[Number(_equityRangeDays||0)]||'ALL';
+}
+function escapeRHtml(value){
+  return String(value===null||value===undefined?'':value)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+function finiteRNumber(value){
+  if(value===null||value===undefined||value==='') return null;
+  var n=Number(value);
+  return isFinite(n)?n:null;
+}
+function fmtRValue(value,signed){
+  var n=finiteRNumber(value);
+  if(n===null) return '--';
+  var prefix=signed?(n>0?'+':n<0?'−':''):(n<0?'−':'');
+  return prefix+Math.abs(n).toFixed(2)+'R';
+}
+function fmtRatio(value){
+  var n=finiteRNumber(value);
+  return n===null?'--':n.toFixed(2);
+}
+function fmtRCount(value){
+  var n=finiteRNumber(value);
+  return n===null?'--':String(Math.trunc(n));
+}
+function fmtRPercent(value){
+  var n=finiteRNumber(value);
+  return n===null?'--':n.toFixed(1)+'%';
+}
+function setRValue(id,text,value,tone){
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.textContent=text;
+  var n=finiteRNumber(value);
+  el.className='r-value '+(tone||(n===null?'neu':n>0?'g':n<0?'r':'neu'));
+}
+function resetRPerformance(message){
+  var meta=document.getElementById('rPerformanceMeta');
+  if(meta) meta.textContent=getRRangeLabel()+' · '+(message||'无统计数据');
+  setRValue('rNetValue','--',null);
+  setRValue('rExpectancyValue','--',null);
+  setRValue('rPayoffValue','--',null,'p');
+  setRValue('rProfitFactorValue','--',null,'p');
+  setRValue('rAverageValue','--',null);
+  setRValue('rDrawdownValue','--',null,'r');
+  var chart=document.getElementById('rPerformanceChart');
+  if(chart) chart.innerHTML='<div class="eq-empty">等待有效 R 交易记录</div>';
+  var detail=document.getElementById('rPerformanceDetailGrid');
+  if(detail) detail.innerHTML='<div class="r-detail-box">暂无复盘数据</div>';
+}
 function fmtMoney(v, signed){
   var n=Number(v||0);
   var p=signed?(n>=0?'+':'-'):(n<0?'-':'');
@@ -1911,16 +2515,28 @@ function tradePnlValue(t){
 }
 function hermesText(h){
   if(!h || !h.active) return 'Hermes 未启用';
-  var dir=(h.direction||'NEUTRAL').toUpperCase();
-  var cn=dir==='LONG'?'看多':(dir==='SHORT'?'看空':'中性');
-  var conf=Number(h.confidence||0).toFixed(0);
+  if(!h.analysis_status) {
+    var legacyDir=(h.direction||'NEUTRAL').toUpperCase();
+    var legacyCn=legacyDir==='LONG'?'看多':(legacyDir==='SHORT'?'看空':'中性');
+    return 'Hermes '+legacyCn+' · 旧版记录';
+  }
+  var status=(h.analysis_status||'').toUpperCase();
+  if(status && status!=='OK') return 'Hermes 异常 · '+status;
+  var dir=(h.dominant_direction||h.direction||'').toUpperCase();
+  var cn=dir==='LONG'?'看多':(dir==='SHORT'?'看空':'无方向');
+  var quality=h.tradeable?'可交易':'回避';
   var mode=h.mode==='hard_filter'?'拦截':'记录';
-  return 'Hermes '+cn+' '+conf+'% · '+mode;
+  return 'Hermes '+cn+' · '+quality+' · '+mode;
 }
 function hermesClass(h, axiomDir){
   if(!h || !h.active) return 'neu';
-  var dir=(h.direction||'NEUTRAL').toUpperCase();
-  if(dir==='NEUTRAL') return 'neu';
+  if(!h.analysis_status) {
+    var legacyDir=(h.direction||'NEUTRAL').toUpperCase();
+    return legacyDir==='NEUTRAL'?'neu':(legacyDir===axiomDir?'g':'r');
+  }
+  if((h.analysis_status||'').toUpperCase()!=='OK' || !h.tradeable) return 'r';
+  var dir=(h.dominant_direction||h.direction||'').toUpperCase();
+  if(!dir) return 'neu';
   return dir===axiomDir?'g':'r';
 }
 function hermesLine(h, axiomDir){
@@ -1929,6 +2545,60 @@ function hermesLine(h, axiomDir){
   var reason=(h.reason||'').replace(/[<>]/g,'').slice(0,80);
   var title=reason?(' title="'+reason+'"'):'';
   return '<div class="pc-data"><span class="pc-label">Hermes</span><span class="pc-val '+cls+'"'+title+'>'+hermesText(h)+'</span></div>';
+}
+function choppyReasonText(a){
+  var labels={atr_contraction:'波动衰减',box_squeeze:'箱体收缩',middle_chop:'中轴泥潭',pass:'活跃通过',insufficient_data:'数据不足',not_recorded:'未记录'};
+  var reasons=(a&&Array.isArray(a.reasons)&&a.reasons.length?a.reasons:[a&&a.reason]).filter(Boolean);
+  return reasons.map(function(x){return labels[x]||'状态未知';}).join(' + ')||'状态未知';
+}
+function choppyAuditMeta(a){
+  if(!a||!a.recorded) return '';
+  var parts=[];
+  if(a.atr_ratio!==null&&a.atr_ratio!==undefined) parts.push('ATR比率 '+Number(a.atr_ratio).toFixed(2));
+  if(a.box_position!==null&&a.box_position!==undefined) parts.push('箱体位置 '+(Number(a.box_position)*100).toFixed(1)+'%');
+  if(a.box_amplitude!==null&&a.box_amplitude!==undefined) parts.push('箱体振幅 '+(Number(a.box_amplitude)*100).toFixed(2)+'%');
+  return parts.join(' · ');
+}
+function choppyAuditClass(a){
+  if(!a||!a.recorded||!a.available) return 'neu';
+  return a.is_choppy?'y':'g';
+}
+function choppyAuditText(a){
+  if(!a||!a.recorded) return '入场未记录';
+  if(!a.available) return '数据不足';
+  return (a.is_choppy?'震荡 · ':'活跃 · ')+choppyReasonText(a);
+}
+function choppyLine(a){
+  var meta=choppyAuditMeta(a);
+  var title=meta?' title="'+meta+'"':'';
+  return '<div class="pc-data"><span class="pc-label">震荡过滤</span><span class="pc-val '+choppyAuditClass(a)+'"'+title+'>'+choppyAuditText(a)+'</span></div>';
+}
+function choppyTradeTag(a){
+  var meta=choppyAuditMeta(a);
+  var title=meta?' title="'+meta+'"':'';
+  return '<span class="'+choppyAuditClass(a)+'"'+title+'>'+choppyAuditText(a)+'</span>';
+}
+function dailyPatternText(a){
+  if(!a||!a.recorded) return '未记录';
+  var labels={strong_momentum:'强动能',morning_star:'早晨之星',evening_star:'黄昏之星',bullish_engulfing:'看涨吞没',bearish_engulfing:'看跌吞没',hammer:'锤子线',shooting_star:'射击之星',bottom_fractal:'底分型',top_fractal:'顶分型',mixed:'混合形态',none:'无明确形态'};
+  var kind=String(a.kind||'none').replace(/[<>]/g,'').slice(0,40);
+  var align=a.alignment==='aligned'?'同向':(a.alignment==='opposed'?'反向':(a.alignment==='mixed'?'混合':'中性'));
+  var day='';
+  if(a.candle_open_time!==null&&a.candle_open_time!==undefined){
+    var dt=new Date(Number(a.candle_open_time));
+    if(!isNaN(dt.getTime())) day=dt.toISOString().slice(0,10)+' UTC收盘';
+  }
+  return (labels[kind]||kind)+' · '+align+(day?' · '+day:'');
+}
+function dailyPatternClass(a){
+  if(!a||!a.recorded||a.alignment==='none') return 'neu';
+  return a.alignment==='aligned'?'g':(a.alignment==='opposed'?'r':'y');
+}
+function dailyPatternLine(a){
+  return '<div class="pc-data"><span class="pc-label">昨日收盘</span><span class="pc-val '+dailyPatternClass(a)+'">'+dailyPatternText(a)+'</span></div>';
+}
+function dailyPatternTradeTag(a){
+  return '<span class="'+dailyPatternClass(a)+'">昨日日K '+dailyPatternText(a)+'</span>';
 }
 function setEqValue(id, value, signed){
   var el=document.getElementById(id);
@@ -2040,6 +2710,78 @@ function calcDrawdown(points){
   }
   return {abs:maxAbs,pct:maxPct};
 }
+function renderRPerformance(d){
+  var s=getRRangeSummary(d), meta=document.getElementById('rPerformanceMeta');
+  if(!s){
+    resetRPerformance('无统计数据');
+    return;
+  }
+  var chart=document.getElementById('rPerformanceChart');
+  if(!chart) return;
+  if(meta){
+    var excluded=finiteRNumber(s.excluded_records);
+    meta.textContent=getRRangeLabel()+' · 完整交易 '+fmtRCount(s.valid_trade_count)
+      +' · 胜率 '+fmtRPercent(s.win_rate)
+      +' · 连亏峰值 '+fmtRCount(s.max_consecutive_losses)
+      +' · 有效记录 '+fmtRCount(s.valid_exit_record_count)+' / '+fmtRCount(s.source_record_count)
+      +(excluded!==null&&excluded>0?' · 未计入 '+fmtRCount(excluded)+' 条':'');
+  }
+  setRValue('rNetValue',fmtRValue(s.net_r,true),s.net_r);
+  setRValue('rExpectancyValue',fmtRValue(s.expectancy_r,true),s.expectancy_r);
+  setRValue('rPayoffValue',fmtRatio(s.average_payoff_ratio),s.average_payoff_ratio,'p');
+  setRValue('rProfitFactorValue',fmtRatio(s.profit_factor),s.profit_factor,'p');
+  setRValue('rAverageValue',fmtRValue(s.average_win_r,true)+' / '+fmtRValue(s.average_loss_r,true),null);
+  var drawdown=finiteRNumber(s.max_drawdown_r);
+  var drawdownValue=drawdown===null?null:-Math.abs(drawdown);
+  setRValue('rDrawdownValue',fmtRValue(drawdownValue,true),drawdownValue,'r');
+
+  var rawPoints=s.cumulative_r_points;
+  var points=Array.isArray(rawPoints)?rawPoints.slice():[];
+  var pointValues=[], invalidPoints=rawPoints!==null&&rawPoints!==undefined&&!Array.isArray(rawPoints);
+  for(var pi=0;pi<points.length&&!invalidPoints;pi++){
+    var pointValue=finiteRNumber(points[pi]&&points[pi].r);
+    if(pointValue===null) invalidPoints=true;
+    else pointValues.push(pointValue);
+  }
+  if(invalidPoints){
+    chart.innerHTML='<div class="eq-empty">R 曲线数据无效</div>';
+  }else if(!points.length){
+    chart.innerHTML='<div class="eq-empty">等待有效 R 交易记录</div>';
+  }else{
+    var W=860,H=150,L=44,R=12,T=12,B=22, values=pointValues.slice();
+    values.push(0);
+    var min=Math.min.apply(null,values),max=Math.max.apply(null,values);
+    if(max-min<1){max+=.5;min-=.5}
+    var span=max-min,pad=span*.12;min-=pad;max+=pad;
+    var coords=points.map(function(p,i){
+      return [L+(points.length===1?0:i/(points.length-1))*(W-L-R),T+(max-pointValues[i])/(max-min)*(H-T-B)];
+    });
+    var zero=T+(max-0)/(max-min)*(H-T-B);
+    var poly=coords.map(function(c){return c[0].toFixed(1)+','+c[1].toFixed(1)}).join(' ');
+    var netR=finiteRNumber(s.net_r);
+    chart.innerHTML='<svg class="r-chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+      +'<line x1="'+L+'" y1="'+zero.toFixed(1)+'" x2="'+(W-R)+'" y2="'+zero.toFixed(1)+'" stroke="rgba(148,163,184,.45)" stroke-dasharray="4 5"/>'
+      +'<polyline points="'+poly+'" fill="none" stroke="'+(netR!==null&&netR<0?'#f87171':'#34d399')+'" stroke-width="2"/>'
+      +'</svg>';
+  }
+
+  var directions=s.direction_breakdown||{}, reasons=s.exit_reason_breakdown||{};
+  var directionText=Object.keys(directions).map(function(k){return escapeRHtml(k)+' '+fmtRValue((directions[k]||{}).net_r,true)}).join('<br>')||'--';
+  var reasonText=Object.keys(reasons).sort(function(a,b){
+    var av=finiteRNumber((reasons[a]||{}).net_r), bv=finiteRNumber((reasons[b]||{}).net_r);
+    return (bv===null?-1:Math.abs(bv))-(av===null?-1:Math.abs(av));
+  }).map(function(k){
+    var row=reasons[k]||{};
+    return escapeRHtml(k)+' '+fmtRCount(row.trades)+' 笔 · '+fmtRValue(row.net_r,true);
+  }).join('<br>')||'--';
+  var capture=finiteRNumber(s.mfe_capture_efficiency);
+  var detail=document.getElementById('rPerformanceDetailGrid');
+  if(detail) detail.innerHTML='<div class="r-detail-box"><b>方向贡献</b><br>'+directionText+'</div>'
+    +'<div class="r-detail-box"><b>平仓原因贡献</b><br>'+reasonText+'</div>'
+    +'<div class="r-detail-box"><b>MFE 与极值</b><br>平均 MFE '+fmtRValue(s.average_mfe_r,false)
+    +'<br>捕获效率 '+(capture===null?'--':(capture*100).toFixed(1)+'%')
+    +'<br>最佳 '+fmtRValue(s.largest_win_r,true)+' · 最差 '+fmtRValue(s.largest_loss_r,true)+'</div>';
+}
 function renderEquityReview(d){
   _lastTraderData=d;
   var a=acct(d);
@@ -2069,6 +2811,7 @@ function renderEquityReview(d){
     var src=a.dailyBasis==='equity'?'权益':'记录';
     sum.textContent='交易 '+(d.total_trades||0)+' | 胜率 '+(d.win_rate||0).toFixed(1)+'% | 今日'+src+' '+fmtMoney(a.dailyDisplay,true)+' | 已实现 '+fmtMoney(a.realized,true)+' | 持仓 '+fmtMoney(a.open,true)+' | 账差 '+fmtMoney(a.diff,true);
   }
+  renderRPerformance(d);
   var box=document.getElementById('equityChart');
   if(!box) return;
   if(!pts.length){box.innerHTML='<div class="eq-empty">等待交易记录生成净值曲线</div>'; return;}
@@ -2295,6 +3038,8 @@ function refreshTraderData(){
         if(pTargetR>0){
           posHTML+='<div class="pc-data"><span class="pc-label">目标区</span><span class="pc-val">'+fmtTargetType(p.target_zone_type)+' '+Number(p.target_zone_price||0).toFixed(6)+' / '+pTargetR.toFixed(2)+'R</span></div>';
         }
+        posHTML+=choppyLine(p.choppy_filter);
+        posHTML+=dailyPatternLine(p.daily_pattern);
         posHTML+=hermesLine(p.hermes_confirm,p.direction);
         posHTML+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+(p.value||0).toFixed(2)+'</span></div>';
         posHTML+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(isProfit?'+':'')+p.pnl.toFixed(2)+' USDT</div><button class="pc-btn" onclick="closeOne(\''+p.symbol+'\')">平仓</button></div>';
@@ -2346,7 +3091,7 @@ function refreshTraderData(){
         logHTML+='<div class=\"tl-item '+(isWin?'tl-win':'tl-loss')+'\" onclick=\"this.classList.toggle(\'expanded\')\">';
         logHTML+='<div class=\"tl-time\">'+dt+'</div>';
         logHTML+='<div class=\"tl-body\"><div class=\"tl-head\"><span class=\"tl-sym\">'+t.symbol.replace('USDT','')+'</span><span class=\"tl-dir '+(t.direction==='LONG'?'g':'r')+'\">'+(t.direction==='LONG'?'多':'空')+'</span><span class=\"tl-reason\">'+t.reason+'</span></div>';
-        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span><span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
+        logHTML+='<div class=\"tl-data\"><span>入场 '+(t.entry||0).toFixed(4)+'</span><span>出场 '+(t.exit||0).toFixed(4)+'</span><span>SL '+(t.sl||0).toFixed(4)+'</span><span>'+targetText+'</span><span class=\"'+psrcCls+'\">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+dailyPatternTradeTag(t.daily_pattern)+'<span class=\"'+hermesClass(t.hermes_confirm,t.direction)+'\">'+hermesText(t.hermes_confirm)+'</span></div></div>';
         logHTML+='<div class=\"tl-pnl\"><span class=\"tl-pnl-val '+(isWin?'g':'r')+'\">'+(isWin?'+':'')+pnlVal.toFixed(2)+'</span><span class=\"tl-pnl-pct '+(isWin?'g':'r')+'\">'+(t.pnl_pct>=0?'+':'')+(t.pnl_pct||0).toFixed(2)+'%</span></div>';
         logHTML+='</div>';
       }
@@ -2468,6 +3213,7 @@ function saveConfig(){
     max_consecutive_loss: parseInt(document.getElementById('cfg_maxcl').value),
     max_position_usdt: parseFloat(document.getElementById('cfg_maxval').value),
     cooldown_minutes: parseInt(document.getElementById('cfg_cooldown').value),
+    half_risk_trigger_r: parseFloat(document.getElementById('cfg_half_risk_r').value)||0,
     enable_early_protect: document.getElementById('cfg_early_protect').value==='1',
     early_protect_r: parseFloat(document.getElementById('cfg_early_r').value)||0.8,
     early_protect_lock_r: parseFloat(document.getElementById('cfg_early_lock').value)||0,
@@ -2483,8 +3229,8 @@ function saveConfig(){
     hermes_confirm_enabled: document.getElementById('cfg_hermes_on').value==='1',
     hermes_confirm_mode: document.getElementById('cfg_hermes_mode').value,
     hermes_confirm_min_confidence: parseFloat(document.getElementById('cfg_hermes_conf').value)||65,
-    hermes_confirm_timeout_sec: parseInt(document.getElementById('cfg_hermes_timeout').value)||90,
-    hermes_confirm_queue_wait_sec: parseInt(document.getElementById('cfg_hermes_queue_wait').value)||120,
+    hermes_confirm_timeout_sec: parseInt(document.getElementById('cfg_hermes_timeout').value)||240,
+    hermes_confirm_queue_wait_sec: parseInt(document.getElementById('cfg_hermes_queue_wait').value)||300,
     hermes_confirm_fail_open: document.getElementById('cfg_hermes_fail_open').value==='1',
   };
   // 始终带上所有API字段, 防止切换交易所时覆盖丢失
@@ -2991,6 +3737,7 @@ function fetchDemoData(){
         h+='<div class="pc-data"><span class="pc-label">入场价</span><span class="pc-val">'+p.entry+'</span></div>';
         h+='<div class="pc-data"><span class="pc-label">当前价</span><span class="pc-val">'+(p.current_price||p.entry).toFixed(6)+'</span></div>';
         h+='<div class="pc-data"><span class="pc-label">止损价</span><span class="pc-val">'+p.sl+'</span></div>';
+        h+=choppyLine(p.choppy_filter);
         h+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+(p.value||0).toFixed(2)+'</span></div>';
         h+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(ip?'+':'')+p.pnl.toFixed(2)+' USDT</div></div>';
         if(p.breakeven) h+='<div class="pc-trail-shimmer">✦ 追踪止盈已开启</div>';
@@ -3036,6 +3783,8 @@ function renderDemoPositionCards(d){
     h+='<div class="pc-data"><span class="pc-label">当前价</span><span class="pc-val">'+Number(p.current_price||p.entry||0).toFixed(6)+'</span></div>';
     h+='<div class="pc-data"><span class="pc-label">止损价</span><span class="pc-val">'+p.sl+'</span></div>';
     h+='<div class="pc-data"><span class="pc-label">MFE</span><span class="pc-val">'+Number(p.max_favorable_r||0).toFixed(2)+'R</span></div>';
+    h+=choppyLine(p.choppy_filter);
+    h+=dailyPatternLine(p.daily_pattern);
     h+='<div class="pc-data"><span class="pc-label">持仓价值</span><span class="pc-val">$'+Number(p.value||0).toFixed(2)+'</span></div>';
     h+='<div class="pc-pnl-box"><div class="pc-pnl-val">'+(ip?'+':'')+Number(p.pnl||0).toFixed(2)+' USDT</div></div>';
     if(p.breakeven) h+='<div class="pc-trail-shimmer">保护止损已启动</div>';
@@ -3072,7 +3821,7 @@ function renderDemoTradeList(d){
       var targetR=Number(t.target_r||0);
       var targetText=targetR>0?('目标 '+targetR.toFixed(2)+'R'):'目标 --';
       h+='<div class="tl-item '+(tw?'tl-win':'tl-loss')+'"><div class="tl-time">'+String(t.time||'').slice(5,16).replace('T',' ')+'</div><div class="tl-body"><div class="tl-head"><span class="tl-sym">'+String(t.symbol||'').replace('USDT','')+'</span><span class="tl-dir '+(t.direction==='LONG'?'g':'r')+'">'+(t.direction==='LONG'?'多':'空')+'</span><span class="tl-reason">'+(t.reason||'')+'</span></div>';
-      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span></div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
+      h+='<div class="tl-data"><span>入场 '+entry.toFixed(4)+'</span><span>出场 '+exit.toFixed(4)+'</span><span>SL '+sl.toFixed(4)+'</span><span>'+targetText+'</span><span class="'+psrcCls+'">'+psrcText+'</span>'+choppyTradeTag(t.choppy_filter)+dailyPatternTradeTag(t.daily_pattern)+'</div></div><div class="tl-pnl"><span class="tl-pnl-val '+(tw?'g':'r')+'">'+(tw?'+':'')+pnlVal.toFixed(2)+'</span><span class="tl-pnl-pct '+(tw?'g':'r')+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</span></div></div>';
     }
     h+='</div>';
   }
@@ -3131,6 +3880,7 @@ function fetchDemoData(){
     h+='<div class="eq-chart-wrap" id="equityChart"><div class="eq-empty">等待演示交易生成净值曲线</div></div>';
     h+='<div class="eq-legend"><span><i class="eq-dot"></i>账户净值</span><span><i class="eq-dot base"></i>初始权益</span></div>';
     h+='</div>';
+    h+=rPerformancePanelHtml();
     h+='<div class="hud-grid hud-demo"><div class="hud-box"><div class="hud-title">配置本金</div><div class="hud-val neu" style="font-size:16px">'+(uiBase>0?'$'+uiBase.toFixed(2):'--')+'</div></div><div class="hud-box"><div class="hud-title">已实现盈亏</div><div class="hud-val '+(a.realized>=0?'g':'r')+'">'+fmtMoney(a.realized,true)+'</div></div><div class="hud-box"><div class="hud-title">持仓浮动</div><div class="hud-val '+(a.open>=0?'g':'r')+'">'+fmtMoney(a.open,true)+'</div></div><div class="hud-box"><div class="hud-title">记录净盈</div><div class="hud-val '+(a.recordNet>=0?'g':'r')+'">'+fmtMoney(a.recordNet,true)+'</div></div><div class="hud-box"><div class="hud-title">'+dayLabel+'</div><div class="hud-val '+(dailyPnl>=0?'g':'r')+'">'+fmtMoney(dailyPnl,true)+'</div></div><div class="hud-box"><div class="hud-title">权益净盈</div><div class="hud-val '+(accountPnl>=0?'g':'r')+'">'+fmtMoney(accountPnl,true)+'</div></div><div class="hud-box"><div class="hud-title">账差</div><div class="hud-val '+(a.diff>=0?'g':'r')+'">'+fmtMoney(a.diff,true)+'</div></div><div class="hud-box"><div class="hud-title">持仓 / 胜率</div><div class="hud-val neu">'+posCount+' / '+Number(d.win_rate||0).toFixed(1)+'%</div></div></div>';
     h+=renderDemoPositionCards(d);
     h+=renderDemoTradeList(d);
@@ -3241,14 +3991,18 @@ function renderCryptorank(page){
 // ===== INIT =====
 var firstMenu=document.querySelector('.menu-items');
 if(firstMenu){firstMenu.classList.add('open'); firstMenu.previousElementSibling.classList.add('open');}
-if(Object.values(D).every(function(v){return v.length===0})){
+if(Object.values(D).every(function(v){return Array.isArray(v)?v.length===0:(!v||(Array.isArray(v.rows)?v.rows.length===0:(!Array.isArray(v.negative)||v.negative.length===0)&&(!Array.isArray(v.positive)||v.positive.length===0)))})){
   document.getElementById('scanLabel').textContent='首次使用，点击开始扫描';
 }
+initReflowAlertSound();
+initCompressionAlertSound();
 </script></body></html>"""
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, data=cache, demo_cfg_json=_json.dumps(demo_display_cfg))
+    data = dict(cache)
+    data["reflow_1h"] = _reflow_dashboard_payload(cache.get("reflow_1h"))
+    return render_template_string(HTML, data=data, demo_cfg_json=_json.dumps(demo_display_cfg))
 
 # ═══ CryptoRank 中文雷达 ═══
 _CR_DIST = _os.path.join(_BASE_DIR, 'crypot-rank-bot-main', 'dist')
@@ -3281,49 +4035,649 @@ def proxy_cryptorank_api():
 
 @app.route("/data")
 def get_data():
-    return jsonify({"data":cache,"time":state["time"],"status":state["text"],
+    data = dict(cache)
+    data["reflow_1h"] = _reflow_dashboard_payload(cache.get("reflow_1h"))
+    return jsonify({"data":data,"time":state["time"],"status":state["text"],
                     "scanning":state["scanning"],"progress":state["progress"]})
 
 @app.route("/scan/funding")
 def do_funding():
-    if state["scanning"]:
-        if time.time() - state.get("_scan_start", 0) > 120: state["scanning"] = False
-        else: return jsonify({"scanning":True})
-    state["_scan_start"] = time.time()
-    def run():
-        try:
-            state["scanning"]=True; state["text"]="扫描资金费率"
-            result=scan_funding(50)
-            cache["funding"]=result
-            total=len(result["negative"])+len(result["positive"])
-            state["time"]=bj_now().strftime("%H:%M:%S")
-            state["text"]=f"完成: {total}个"
-        except Exception as e: state["text"]=str(e)[:80]
-        finally: state["scanning"]=False
-    threading.Thread(target=run,daemon=True).start()
+    def apply_result(result):
+        cache["funding"] = result
+        return len(result["negative"]) + len(result["positive"])
+
+    if not _start_scan_worker("扫描资金费率", lambda progress: scan_funding(50), apply_result):
+        return jsonify({"scanning": True, "status": "扫描中..."})
     return jsonify({"scanning":True})
+
+def _start_scan_worker(label, work, apply_result, apply_error=None):
+    global _scan_worker, _scan_generation, _scan_worker_token
+    with _scan_lock:
+        if state["scanning"] or (_scan_worker is not None and _scan_worker.is_alive()):
+            return False
+        _scan_generation += 1
+        generation = _scan_generation
+        token = object()
+        state.update(scanning=True, text=label, progress="", _scan_start=time.time())
+
+        worker = None
+
+        def is_current():
+            return (
+                generation == _scan_generation
+                and token is _scan_worker_token
+                and _scan_worker is worker
+            )
+
+        def progress(completed, total):
+            with _scan_lock:
+                if is_current():
+                    state["progress"] = f"{completed}/{total}"
+
+        def run():
+            try:
+                result = work(progress)
+                with _scan_lock:
+                    if is_current():
+                        result_count = apply_result(result)
+                        state["time"] = bj_now().strftime("%H:%M:%S")
+                        state["text"] = f"完成: {result_count} 结果"
+            except Exception as e:
+                with _scan_lock:
+                    if is_current():
+                        if apply_error is not None:
+                            apply_error(e)
+                        state["text"] = str(e)[:80]
+            finally:
+                with _scan_lock:
+                    if is_current():
+                        state["scanning"] = False
+
+        worker = threading.Thread(target=run, daemon=True)
+        _scan_worker = worker
+        _scan_worker_token = token
+        try:
+            worker.start()
+        except Exception:
+            if is_current():
+                _scan_worker = None
+                state["scanning"] = False
+            raise
+    return True
+
+def _reflow_dashboard_payload(base=None, now_ms=None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    payload = (
+        load_reflow_dashboard(MOMENTUM_REFLOW_HISTORY, now_ms)
+        if base is None
+        else dict(base)
+    )
+    with _reflow_automation_lock:
+        automation = dict(_reflow_automation)
+    with _scan_lock:
+        automation.update(
+            scanning=bool(state["scanning"]),
+            progress=state["progress"],
+        )
+    try:
+        settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+    except (OSError, ValueError) as error:
+        automation["auto_scan_enabled"] = False
+        automation["last_auto_error"] = str(error)[:80]
+    else:
+        automation["auto_scan_enabled"] = settings["auto_scan_enabled"]
+    payload["automation"] = automation
+    return payload
+
+def _run_reflow_scan(progress):
+    result = scan_momentum_reflow(MOMENTUM_REFLOW_LEDGER, progress=progress)
+    now_ms = int(time.time() * 1000)
+    payload = merge_reflow_signals(
+        MOMENTUM_REFLOW_HISTORY,
+        MOMENTUM_REFLOW_LEDGER,
+        result,
+        now_ms,
+    )
+    _process_reflow_alerts(payload, now_ms)
+    return payload
+
+def _process_reflow_alerts(payload, now_ms):
+    try:
+        created = observe_reflow_alerts(
+            MOMENTUM_REFLOW_ALERT_LEDGER,
+            payload.get("rows", []),
+            now_ms,
+        )
+    except Exception as error:
+        with _reflow_alert_lock:
+            _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(error)
+        return []
+    if created:
+        _reflow_alert_wakeup.set()
+    return created
+
+def _update_reflow_automation_success(trigger, payload):
+    if trigger != "auto":
+        return
+    scanned = max(0, int(payload.get("scanned", 0) or 0))
+    errors = max(0, int(payload.get("errors", 0) or 0))
+    high_failure_rate = scanned > 0 and errors >= 3 and errors * 2 >= scanned
+    with _reflow_automation_lock:
+        _reflow_automation["last_auto_scan_at"] = int(time.time() * 1000)
+        _reflow_automation["last_auto_error"] = (
+            f"扫描任务失败 {errors}/{scanned}" if high_failure_rate else ""
+        )
+
+def _update_reflow_automation_error(trigger, error):
+    if trigger != "auto":
+        return
+    with _reflow_automation_lock:
+        _reflow_automation["last_auto_error"] = str(error)[:80]
+
+def _start_reflow_scan(trigger):
+    label = "动能回流自动扫描" if trigger == "auto" else "reflow 1h 扫描中"
+
+    def apply_result(payload):
+        cache["reflow_1h"] = payload
+        _update_reflow_automation_success(trigger, payload)
+        return len(payload["rows"])
+
+    return _start_scan_worker(
+        label,
+        _run_reflow_scan,
+        apply_result,
+        lambda error: _update_reflow_automation_error(trigger, error),
+    )
+
+def _new_reflow_scheduler_state(**overrides):
+    scheduler_state = {
+        "previous_enabled": None,
+        "last_attempt_slot": 0,
+        "last_skip_at": 0,
+        "next_scan_at": 0,
+    }
+    scheduler_state.update(overrides)
+    return scheduler_state
+
+def _reflow_scheduler_step(now, settings, scheduler_state, start_scan):
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    enabled = settings.get("auto_scan_enabled")
+    if type(enabled) is not bool:
+        raise ValueError("auto_scan_enabled must be a boolean")
+
+    updated = dict(scheduler_state)
+    if not enabled:
+        updated["previous_enabled"] = False
+        updated["next_scan_at"] = 0
+        return updated
+
+    now_ms = int(now.timestamp() * 1000)
+    previous_enabled = updated.get("previous_enabled")
+    next_scan_at = int(updated.get("next_scan_at") or 0)
+    immediate = previous_enabled is not True
+    due = next_scan_at > 0 and now_ms >= next_scan_at
+    updated["previous_enabled"] = True
+
+    if not immediate and not due:
+        if next_scan_at == 0:
+            updated["next_scan_at"] = int(
+                next_reflow_scan_at(now).timestamp() * 1000
+            )
+        return updated
+
+    attempt_slot = now_ms if immediate else next_scan_at
+    if updated.get("last_attempt_slot") == attempt_slot:
+        updated["next_scan_at"] = int(
+            next_reflow_scan_at(now).timestamp() * 1000
+        )
+        return updated
+    updated["last_attempt_slot"] = attempt_slot
+    started = start_scan()
+    if not started:
+        updated["last_skip_at"] = attempt_slot
+    updated["next_scan_at"] = int(
+        next_reflow_scan_at(now).timestamp() * 1000
+    )
+    return updated
+
+def _reflow_scheduler_loop():
+    scheduler_state = _new_reflow_scheduler_state()
+    settings_error = ""
+    try:
+        while not _reflow_scheduler_stop.is_set():
+            now = datetime.now(timezone.utc)
+            try:
+                settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+            except Exception as error:
+                settings_error = str(error)[:80]
+                scheduler_state = _reflow_scheduler_step(
+                    now,
+                    {"auto_scan_enabled": False},
+                    scheduler_state,
+                    lambda: False,
+                )
+                with _reflow_automation_lock:
+                    _reflow_automation["last_auto_error"] = settings_error
+                    _reflow_automation["last_skip_at"] = scheduler_state["last_skip_at"]
+                    _reflow_automation["next_scan_at"] = 0
+                    _reflow_automation["auto_scan_enabled"] = False
+            else:
+                with _reflow_automation_lock:
+                    if (
+                        settings_error
+                        and _reflow_automation["last_auto_error"] == settings_error
+                    ):
+                        _reflow_automation["last_auto_error"] = ""
+                settings_error = ""
+                scheduler_state = _reflow_scheduler_step(
+                    now,
+                    settings,
+                    scheduler_state,
+                    lambda: _start_reflow_scan("auto"),
+                )
+                with _reflow_automation_lock:
+                    _reflow_automation["last_skip_at"] = scheduler_state["last_skip_at"]
+                    _reflow_automation["next_scan_at"] = scheduler_state["next_scan_at"]
+                    _reflow_automation["auto_scan_enabled"] = settings[
+                        "auto_scan_enabled"
+                    ]
+            _reflow_scheduler_stop.wait(1)
+    finally:
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = False
+
+def _start_reflow_scheduler():
+    global _reflow_scheduler_thread
+    with _reflow_scheduler_lock:
+        if (
+            _reflow_scheduler_thread is not None
+            and _reflow_scheduler_thread.is_alive()
+        ):
+            return False
+        _reflow_scheduler_stop.clear()
+        worker = threading.Thread(target=_reflow_scheduler_loop, daemon=True)
+        _reflow_scheduler_thread = worker
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = True
+        try:
+            worker.start()
+        except Exception:
+            _reflow_scheduler_thread = None
+            with _reflow_automation_lock:
+                _reflow_automation["running"] = False
+            raise
+    return True
+
+def _stop_reflow_scheduler_for_tests():
+    global _reflow_scheduler_thread
+    _reflow_scheduler_stop.set()
+    with _reflow_scheduler_lock:
+        worker = _reflow_scheduler_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _reflow_scheduler_lock:
+        if _reflow_scheduler_thread is not worker:
+            return
+        still_running = worker is not None and worker.is_alive()
+        if not still_running:
+            _reflow_scheduler_thread = None
+        with _reflow_automation_lock:
+            _reflow_automation["running"] = still_running
+
+def _reflow_alert_worker_loop():
+    with _reflow_alert_lock:
+        _reflow_alert_status["running"] = True
+    try:
+        while not _reflow_alert_stop.is_set():
+            try:
+                result = deliver_due_wechat(
+                    MOMENTUM_REFLOW_ALERT_SETTINGS,
+                    MOMENTUM_REFLOW_ALERT_LEDGER,
+                    int(time.time() * 1000),
+                )
+                with _reflow_alert_lock:
+                    _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(
+                        result.get("error", "")
+                    )
+                    if result.get("status") == "delivered":
+                        _reflow_alert_status["last_delivery_at"] = int(
+                            time.time() * 1000
+                        )
+            except Exception as error:
+                with _reflow_alert_lock:
+                    _reflow_alert_status["last_error"] = _sanitize_reflow_alert_error(error)
+            _reflow_alert_wakeup.wait(30)
+            _reflow_alert_wakeup.clear()
+    finally:
+        with _reflow_alert_lock:
+            _reflow_alert_status["running"] = False
+
+def _start_reflow_alert_worker():
+    global _reflow_alert_thread
+    with _reflow_alert_lock:
+        if _reflow_alert_thread is not None and _reflow_alert_thread.is_alive():
+            return False
+        _reflow_alert_stop.clear()
+        worker = threading.Thread(target=_reflow_alert_worker_loop, daemon=True)
+        _reflow_alert_thread = worker
+        try:
+            worker.start()
+        except Exception:
+            _reflow_alert_thread = None
+            raise
+    return True
+
+def _stop_reflow_alert_worker_for_tests():
+    global _reflow_alert_thread
+    _reflow_alert_stop.set()
+    _reflow_alert_wakeup.set()
+    with _reflow_alert_lock:
+        worker = _reflow_alert_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _reflow_alert_lock:
+        if _reflow_alert_thread is worker and (
+            worker is None or not worker.is_alive()
+        ):
+            _reflow_alert_thread = None
+
+def _sanitize_compression_alert_error(error):
+    return _sanitize_reflow_alert_error(error)
+
+def _process_compression_events(events, now_ms):
+    try:
+        created = drain_compression_outbox(
+            MOMENTUM_COMPRESSION_STATE,
+            MOMENTUM_COMPRESSION_EVENTS,
+            MOMENTUM_COMPRESSION_ALERT_STATE,
+            now_ms,
+        )
+    except Exception as error:
+        with _compression_alert_lock:
+            _compression_alert_status["last_error"] = _sanitize_compression_alert_error(error)
+        return []
+    if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+        _compression_alert_wakeup.set()
+    return created
+
+def _start_compression_monitor():
+    global _compression_monitor_started
+    with _compression_monitor_lock:
+        if _compression_monitor_started:
+            return False
+        started = _compression_monitor.start()
+        if started:
+            _compression_monitor_started = True
+        return started
+
+def _stop_compression_monitor_for_tests():
+    global _compression_monitor_started
+    _compression_monitor.stop(timeout=2)
+    with _compression_monitor_lock:
+        _compression_monitor_started = False
+
+def _compression_alert_worker_loop():
+    with _compression_alert_lock:
+        _compression_alert_status["running"] = True
+    try:
+        while not _compression_alert_stop.is_set():
+            try:
+                created = drain_compression_outbox(
+                    MOMENTUM_COMPRESSION_STATE,
+                    MOMENTUM_COMPRESSION_EVENTS,
+                    MOMENTUM_COMPRESSION_ALERT_STATE,
+                    int(time.time() * 1000),
+                )
+                if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+                    _compression_alert_wakeup.set()
+                result = deliver_due_compression_wechat(
+                    MOMENTUM_COMPRESSION_ALERT_SETTINGS,
+                    MOMENTUM_COMPRESSION_ALERT_STATE,
+                    MOMENTUM_COMPRESSION_EVENTS,
+                    int(time.time() * 1000),
+                )
+                with _compression_alert_lock:
+                    _compression_alert_status["last_error"] = _sanitize_compression_alert_error(result.get("error", ""))
+                    if result.get("status") == "delivered":
+                        _compression_alert_status["last_delivery_at"] = int(time.time() * 1000)
+            except Exception as error:
+                with _compression_alert_lock:
+                    _compression_alert_status["last_error"] = _sanitize_compression_alert_error(error)
+            _compression_alert_wakeup.wait(30)
+            _compression_alert_wakeup.clear()
+    finally:
+        with _compression_alert_lock:
+            _compression_alert_status["running"] = False
+
+def _start_compression_alert_worker():
+    global _compression_alert_thread
+    with _compression_alert_lock:
+        if _compression_alert_thread is not None and _compression_alert_thread.is_alive():
+            return False
+        _compression_alert_stop.clear()
+        worker = threading.Thread(target=_compression_alert_worker_loop, daemon=True)
+        _compression_alert_thread = worker
+        try:
+            worker.start()
+        except Exception:
+            _compression_alert_thread = None
+            raise
+    return True
+
+def _stop_compression_alert_worker_for_tests():
+    global _compression_alert_thread
+    _compression_alert_stop.set()
+    _compression_alert_wakeup.set()
+    with _compression_alert_lock:
+        worker = _compression_alert_thread
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2)
+    with _compression_alert_lock:
+        if _compression_alert_thread is worker and (worker is None or not worker.is_alive()):
+            _compression_alert_thread = None
+
+@app.route("/api/compression/status")
+def compression_status():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    try:
+        compression_state = load_compression_state(MOMENTUM_COMPRESSION_STATE)
+        monitor = _compression_monitor.status()
+    except ValueError:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+    with _compression_monitor_lock:
+        rejection_counts = dict(_compression_rejection_counts)
+        scan_summary = dict(_compression_scan_summary)
+    scan_failures = list(compression_state.get("last_scan_failures", []))
+    scan_summary["errors"] = len(scan_failures)
+    with _compression_alert_lock:
+        alert_status = dict(_compression_alert_status)
+    try:
+        sound_available_ids = compression_sound_available_ids(MOMENTUM_COMPRESSION_EVENTS)
+    except ValueError:
+        sound_available_ids = set()
+    try:
+        wechat_statuses = compression_delivery_statuses(MOMENTUM_COMPRESSION_ALERT_STATE)
+    except ValueError:
+        wechat_statuses = {}
+
+    def alert_facts(rows):
+        mapped = []
+        for row in rows:
+            item = dict(row)
+            compression_id = item.get("compression_id")
+            item["sound_status"] = "available" if compression_id in sound_available_ids else "unknown"
+            item["wechat_status"] = (
+                wechat_statuses.get(compression_id, "unknown")
+                if item.get("htf_alignment") == "CONFIRMED" else "not_eligible"
+            )
+            mapped.append(item)
+        return mapped
+
+    return jsonify({
+        "monitor": monitor,
+        "pool_rows": alert_facts(compression_state["pool"].values()),
+        "episode_rows": alert_facts(compression_state["episodes"].values()),
+        "scan_failures": scan_failures,
+        "rejection_counts": rejection_counts,
+        "scan": scan_summary,
+        "alert": alert_status,
+        "can_manage": session.get("role") == "admin",
+    })
+
+@app.route("/api/compression/automation", methods=["POST"])
+def compression_automation():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    if session.get("role") != "admin":
+        return jsonify({"error": "无权限"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+        return jsonify({"error": "enabled must be a boolean"}), 400
+    try:
+        return jsonify(_compression_monitor.set_auto_enabled(payload["enabled"]))
+    except ValueError as error:
+        return jsonify({"error": str(error)[:80]}), 400
+
+
+def _compression_internal_request_allowed():
+    return request.remote_addr in {"127.0.0.1", "::1"}
+
+
+def _compression_internal_status():
+    monitor = _compression_monitor.status()
+    with _compression_monitor_lock:
+        scan = dict(_compression_scan_summary)
+    return {
+        "monitor": {
+            key: monitor.get(key)
+            for key in (
+                "running", "auto_enabled", "last_scan_at", "next_scan_at",
+                "structure_scanning", "scan_started_at", "scan_duration_ms", "scan_overdue",
+                "last_error",
+            )
+        },
+        "scan": {key: scan.get(key, 0) for key in ("scanned", "eligible", "errors")},
+    }
+
+
+@app.route("/internal/compression/status")
+def internal_compression_status():
+    if not _compression_internal_request_allowed():
+        return jsonify({"error": "loopback only"}), 403
+    try:
+        return jsonify(_compression_internal_status())
+    except ValueError:
+        return jsonify({"error": "压缩监控暂不可用"}), 503
+
+
+@app.route("/internal/compression/automation", methods=["POST"])
+def internal_compression_automation():
+    if not _compression_internal_request_allowed():
+        return jsonify({"error": "loopback only"}), 403
+    payload = request.get_json(silent=True)
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"enabled"}
+        or type(payload.get("enabled")) is not bool
+    ):
+        return jsonify({"error": "enabled must be a boolean"}), 400
+    try:
+        return jsonify(_compression_monitor.set_auto_enabled(payload["enabled"]))
+    except ValueError as error:
+        return jsonify({"error": str(error)[:80]}), 400
+
+@app.route("/api/compression/alerts")
+def compression_alert_events():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    raw = request.args.get("after", "0")
+    try:
+        after_id = int(raw)
+        if after_id < 0:
+            raise ValueError("negative cursor")
+    except (TypeError, ValueError):
+        return jsonify({"error": "after must be a nonnegative integer"}), 400
+    try:
+        return jsonify(read_public_compression_alerts(MOMENTUM_COMPRESSION_EVENTS, after_id))
+    except ValueError:
+        return jsonify({"error": "警报暂不可用"}), 503
+
+@app.route("/api/reflow/automation/status")
+def reflow_automation_status():
+    with _reflow_automation_lock:
+        automation = dict(_reflow_automation)
+    try:
+        settings = load_reflow_settings(MOMENTUM_REFLOW_SETTINGS)
+    except (OSError, ValueError) as error:
+        return jsonify({
+            **automation,
+            "auto_scan_enabled": False,
+            "error": str(error)[:80],
+        }), 503
+    return jsonify({
+        **automation,
+        "auto_scan_enabled": settings["auto_scan_enabled"],
+    })
+
+@app.route("/api/reflow/alerts")
+def reflow_alert_events():
+    if not session.get("user_id"):
+        return jsonify({"error": "未登录"}), 401
+    raw = request.args.get("after", "0")
+    try:
+        after_id = int(raw)
+        if after_id < 0:
+            raise ValueError("negative cursor")
+    except (TypeError, ValueError):
+        return jsonify({"error": "after must be a nonnegative integer"}), 400
+    try:
+        payload = read_public_alerts(MOMENTUM_REFLOW_ALERT_LEDGER, after_id)
+    except ValueError:
+        return jsonify({"error": "警报暂不可用"}), 503
+    return jsonify(payload)
 
 @app.route("/scan/<mode>/<interval>")
 def do_scan(mode, interval):
-    # 如果扫描超过120秒, 强制解锁
-    if state["scanning"]:
-        if time.time() - state.get("_scan_start", 0) > 120:
-            state["scanning"] = False
-        else:
+    if mode == "reflow" and interval != "1h":
+        return jsonify({"error":"reflow only supports 1h"}), 400
+    if mode == "compression" and interval != "15m":
+        return jsonify({"error":"compression only supports 15m"}), 400
+    if mode == "reflow":
+        if not _start_reflow_scan("manual"):
             return jsonify({"scanning":True,"status":"扫描中..."})
-    key = f"{mode}_{interval}"
-    state["_scan_start"] = time.time()
-    def run():
+        return jsonify({"scanning":True})
+    if mode == "compression":
+        if not session.get("user_id"):
+            return jsonify({"error": "未登录"}), 401
+        if not _compression_manual_scan_lock.acquire(blocking=False):
+            return jsonify({"scanning":True,"status":"扫描中..."})
+        def run_compression_manual_scan():
+            try:
+                _compression_monitor.scan_now("manual")
+            finally:
+                _compression_manual_scan_lock.release()
         try:
-            state["scanning"]=True; state["text"]=f"{mode} {interval} 扫描中"
-            if mode=="diverge": cache[key]=scan_divergence(interval)
-            elif mode=="breakout": cache[key]=scan_breakout(interval)
-            else: cache[key]=scan(interval, mode, 5)
-            state["time"]=bj_now().strftime("%H:%M:%S")
-            state["text"]=f"完成: {len(cache[key])} 结果"
-        except Exception as e: state["text"]=str(e)[:80]
-        finally: state["scanning"]=False
-    threading.Thread(target=run,daemon=True).start()
+            threading.Thread(target=run_compression_manual_scan, daemon=True).start()
+        except Exception:
+            _compression_manual_scan_lock.release()
+            raise
+        return jsonify({"scanning": True})
+
+    key = f"{mode}_{interval}"
+    def work(progress):
+        if mode == "diverge": return scan_divergence(interval)
+        if mode == "breakout": return scan_breakout(interval)
+        return scan(interval, mode, 5)
+
+    def apply_result(result):
+        cache[key] = result
+        return len(result)
+
+    if not _start_scan_worker(f"{mode} {interval} 扫描中", work, apply_result):
+        return jsonify({"scanning":True,"status":"扫描中..."})
     return jsonify({"scanning":True})
 
 @app.route("/rj_indicator")
@@ -3749,4 +5103,8 @@ def _deduct_fuel_commission(pnl: float):
 if __name__=="__main__":
     print("\n  >>> Axiom Quant v1.0 <<<")
     print("  http://127.0.0.1:5000\n")
+    _start_reflow_scheduler()
+    _start_reflow_alert_worker()
+    _start_compression_monitor()
+    _start_compression_alert_worker()
     app.run(host="0.0.0.0",port=5000,debug=False,threaded=True)

@@ -15,7 +15,7 @@
   python trader.py --backtest SYMBOL    # 单币回测(开发中)
 """
 
-import os, sys, time, json, hmac, hashlib, threading, logging, subprocess, shlex, re
+import os, sys, time, json, hmac, hashlib, threading, logging, subprocess, shlex, re, tempfile
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -28,10 +28,23 @@ import pandas as pd
 import numpy as np
 
 from btc_stage import classify_btc_stage, evaluate_btc_gate
+from strategy_filters import (
+    evaluate_choppy_market_adaptive,
+    evaluate_daily_pattern_state,
+    evaluate_predicta_choppy_market,
+)
+from predicta_indicator import (
+    PredictaParams,
+    compute_predicta,
+    evaluate_predicta_setup,
+    make_predicta_setup,
+)
+from performance_metrics import summarize_r_performance_ranges
 
 from screener import (
-    fetch_klines, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
-    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME,
+    fetch_klines, fetch_klines_range, ema, calc_ma_band, verify_pool_signal, verify_pool_signal_details,
+    scan_squeeze_breakout, fetch_pairs, EMA_LENS, MA_LENS, MIN_VOLUME, INTERVAL_MS,
+    INTERVAL_OPEN_PHASE_MS,
     _find_fractal_sl_in_window, _find_fractal_structure_sequence, is_tradfi_or_junk,
     get_entry_float_limit, get_breakout_confirm_window, get_squeeze_max
 )
@@ -62,6 +75,14 @@ def bj_now():
     # 北京时间显示 (UTC+8)
     return (datetime.now(timezone.utc) + timedelta(hours=8)).replace(microsecond=0)
 
+
+def _entry_ms_for_market_data(entry_time: datetime, latest_open_ms: int) -> int:
+    """Convert the project's Beijing display timestamp at the UTC market-data boundary."""
+    raw_ms = int(entry_time.timestamp() * 1000)
+    if raw_ms - int(latest_open_ms) >= 6 * 60 * 60 * 1000:
+        return raw_ms - 8 * 60 * 60 * 1000
+    return raw_ms
+
 POSITIONS_PATH = "positions.json"
 TRADE_LOG_PATH = "trades.jsonl"
 SIGNAL_LOG_PATH = "signal_events.jsonl"
@@ -91,7 +112,7 @@ class TradeConfig:
     scan_interval: str = "30m"          # 扫描周期: 30m / 1h / 4h / 1d
     min_score: float = 70.0             # 最低起爆点评分
     max_positions: int = 3              # 同时最大持仓数
-    entry_signal_source: str = "rj_only"  # structure / rj_only
+    entry_signal_source: str = "rj_only"  # structure / rj_only / predicta_ewo
     rj_entry_filter: str = "off"         # off / log_only / soft / hard
     rj_cross_lookback_bars: int = 8      # RJ金叉/死叉有效窗口
     rj_min_jr_spread: float = 0.0        # J/R最小同向差值, 0=不额外要求
@@ -158,6 +179,23 @@ class TradeConfig:
     rj_only_setup_check_interval_sec: int = 60  # 候选池检查间隔, 控制行情请求频率
     rj_only_setup_near_pct: float = 0.15        # 距离触发价多少%内写near日志
     rj_only_setup_max_pool: int = 40            # RJ候选池最大数量
+    rj_choppy_filter_mode: str = "off"          # off / log_only / hard
+    rj_daily_pattern_filter_mode: str = "off"  # off / log_only / soft
+
+    # Predicta V4 + EWO entry path (closed candles only)
+    predicta_confirm_bars: int = 6
+    predicta_choppy_filter_mode: str = "hard"
+    predicta_ewo_fast: int = 5
+    predicta_ewo_slow: int = 35
+    predicta_confirm_atr_buffer: float = 0.08
+    predicta_stop_atr_mult: float = 0.5
+    predicta_min_stop_pct: float = 0.003
+    predicta_max_stop_pct: float = 0.08
+    predicta_max_symbols: int = 500
+    predicta_min_volume_usdt: float = 3_000_000.0
+    predicta_scan_workers: int = 4
+    predicta_scan_interval_sec: int = 1800
+    predicta_setup_max_pool: int = 40
 
     # 风控 — 仓位
     risk_per_trade: Any = 10.0          # 每笔风险 (USDT) 支持 "15m:10,1h:20,4h:40,1d:80"
@@ -167,6 +205,7 @@ class TradeConfig:
     # 风控 — 止损/止盈
     atr_mult_sl: float = 0.5           # SL额外偏移(ATR倍数), 0=纯均线边缘
     # 三阶止盈参数
+    half_risk_trigger_r: float = 0.0   # >0启用: 达阈值后把初始1R风险收窄到0.5R
     enable_early_protect: bool = True  # 提前保护: 未到1.2R前先保本
     early_protect_r: float = 0.8       # 提前保护触发R
     early_protect_lock_r: float = 0.0  # 提前保护锁定R, 0=SL推到入场价
@@ -188,10 +227,10 @@ class TradeConfig:
     hermes_confirm_enabled: bool = False
     hermes_confirm_mode: str = "log_only"      # log_only / hard_filter
     hermes_confirm_min_confidence: float = 65.0
-    hermes_confirm_timeout_sec: int = 90
+    hermes_confirm_timeout_sec: int = 240
     hermes_confirm_fail_open: bool = False
     hermes_confirm_cache_ttl_sec: int = 1800
-    hermes_confirm_queue_wait_sec: int = 120
+    hermes_confirm_queue_wait_sec: int = 300
     hermes_confirm_cmd: str = "hermes"
     hermes_confirm_skills: str = "kline-indicator"
     btc_direction_filter_enabled: bool = True
@@ -459,12 +498,33 @@ class BinanceClient:
             "symbol": symbol, "leverage": leverage
         }, signed=True)
 
+    def set_compatible_leverage(self, symbol, leverage):
+        """设置请求杠杆；不支持时逐级降到更低的安全档位。"""
+        requested = max(1, int(float(leverage or 1)))
+        candidates = []
+        for candidate in (requested, 20, 10, 5, 3, 2, 1):
+            candidate = min(requested, candidate)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            result = self.set_leverage(symbol, candidate)
+            if result:
+                if candidate != requested:
+                    self._log.info(
+                        f"Binance杠杆按合约兼容降档: {symbol} {requested}x -> {candidate}x"
+                    )
+                return result
+        return None
+
     def cancel_all_orders(self, symbol):
         if self.market_type == "futures":
             r1 = self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
-            if not self.testnet:
-                self._req("DELETE", "/fapi/v1/algo/openOrders", {"symbol": symbol}, signed=True)
-            return r1
+            if self.testnet:
+                return r1
+            r2 = self._req("DELETE", "/fapi/v1/algo/openOrders", {"symbol": symbol}, signed=True)
+            if r1 is None or r2 is None:
+                return None
+            return {"regular": r1, "algo": r2}
         else:
             return self._req("DELETE", "/api/v3/openOrders", {"symbol": symbol}, signed=True)
 
@@ -723,11 +783,20 @@ class BitgetClient:
         if symbol:
             params["symbol"] = symbol
         data = self._req("GET", "/api/v2/mix/order/orders-plan-pending", params)
-        if isinstance(data, dict):
-            return data.get("entrustedList") or []
-        if isinstance(data, list):
-            return data
-        return []
+        if data is None:
+            return None
+        if not isinstance(data, dict) or "entrustedList" not in data:
+            return None
+        orders = data.get("entrustedList")
+        if not isinstance(orders, list):
+            return None
+        if any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
+            for order in orders
+        ):
+            return None
+        return orders
 
     def resolve_close_trade(self, symbol, order_response=None, direction="", quantity=0.0):
         """平仓后反查 Bitget 成交/历史仓位, 获取真实已实现PnL。"""
@@ -849,7 +918,7 @@ class BitgetClient:
                     "stopLossPrice": str(round(stop_price, 8)),
                 }
                 result = self._req("POST", path, params)
-                if result and isinstance(result, dict) and result.get("code") == "00000":
+                if result is not None:
                     self._log.info(f"[带单止损] {symbol} SL={stop_price:.4f} trackingNo={tracking_no}")
                 else:
                     err = result.get("msg","") if isinstance(result, dict) else str(result)[:100]
@@ -871,9 +940,15 @@ class BitgetClient:
                         "symbol": symbol, "productType": "USDT-FUTURES",
                         "marginCoin": "USDT", "orderId": old_oid
                     })
-                    if r is not None and isinstance(r, dict) and r.get("code") == "00000":
-                        self._active_stop_ids.pop(symbol, None)
-                except: pass
+                    if r is None:
+                        self._log.error(
+                            f"Bitget旧止损撤销未确认: {symbol} id={old_oid}"
+                        )
+                        return None
+                    self._active_stop_ids.pop(symbol, None)
+                except Exception as e:
+                    self._log.error(f"Bitget旧止损撤销异常: {symbol} id={old_oid}: {e}")
+                    return None
             path = "/api/v2/mix/order/place-plan-order"
             sym_info = self.get_symbol_info(symbol)
             if sym_info and "pricePlace" in sym_info:
@@ -921,10 +996,12 @@ class BitgetClient:
                     "symbol": symbol, "productType": "USDT-FUTURES",
                     "marginCoin": "USDT", "orderId": known_oid
                 })
-                if r is not None and isinstance(r, dict) and r.get("code") == "00000":
+                if r is not None:
                     self._active_stop_ids.pop(symbol, None)  # 取消成功才清除
-                # 如果返回非成功码, 保留ID供 stop_order 内部再试
-            except: pass  # 网络异常也保留ID
+                return r
+            except Exception:
+                return None  # 网络异常保留ID
+        return {}  # 没有已跟踪止损时，取消步骤是已确认的空操作
 
     def cleanup_all_stops(self, symbols: list):
         """批量清理止损单 — 逐个symbol尝试取消所有计划+普通挂单"""
@@ -1016,6 +1093,9 @@ class Position:
     signal_score: float     # 入场时评分
     initial_band_hi: float  # 入场时均线上轨
     initial_band_lo: float  # 入场时均线下轨
+    initial_entry_price: float = 0.0     # 原始成交价/R锚点, 交易所均价同步不得覆盖
+    initial_risk_per_unit: float = 0.0   # 原始每单位风险, 持仓生命周期内不可变
+    half_risk_protected: bool = False
     breakeven_triggered: bool = False
     breakeven_cooldown: int = 0  # 保本后冷却计数, 防秒碰止损
     partial_tp_triggered: bool = False  # 2.0R减仓50%已执行
@@ -1030,6 +1110,7 @@ class Position:
     source_strategy: str = ""  # structure / rj_only, 用于策略差异化出场
     max_favorable_r: float = 0.0  # 入场后最大顺势推进R倍数, 用于未起爆超时退出
     max_adverse_r: float = 0.0    # 入场后最大逆势推进R倍数(MAE), 用于参数复盘
+    last_mfe_check_ms: int = 0    # 最后完整合并的已收盘K线开盘时间
     time_stop_armed: bool = True  # 兼容旧持仓文件; 实际执行统一由 enable_time_stop 控制
     time_stop_armed_at: Optional[datetime] = None  # 兼容旧持仓文件; 超时计数统一使用 entry_time
     time_stop_watch: bool = False  # RJ-only基础超时后进入观察态
@@ -1047,6 +1128,17 @@ class Position:
     target_distance_pct: float = 0.0    # 入场到目标区距离百分比
     target_zone_bars_ago: int = 0       # 目标区距离当前多少根K线
     hermes_confirm: dict = field(default_factory=dict)
+    excursion_price_source: str = ""
+    choppy_filter: dict = field(default_factory=dict)  # 入场时震荡过滤快照, 禁止持仓后重算
+    stop_replace_state: str = ""  # durable protective-stop transaction state
+    daily_pattern: dict = field(default_factory=dict)  # entry-time closed 1Dutc snapshot
+
+    def __post_init__(self):
+        if float(self.initial_entry_price or 0.0) <= 0:
+            self.initial_entry_price = float(self.entry_price or 0.0)
+        if float(self.initial_risk_per_unit or 0.0) <= 0:
+            anchor_sl = float(self.initial_sl or self.sl_price or 0.0)
+            self.initial_risk_per_unit = abs(float(self.initial_entry_price) - anchor_sl)
 
 
 # ============================================================
@@ -1075,6 +1167,8 @@ class SqueezeBreakoutBot:
         self._pending_signals: dict = {}   # {symbol: {first_seen, direction}} 跨扫描追踪
         self._rj_setup_pool: dict = {}      # RJ-only候选池: 关键K候选 -> 实时突破触发
         self._rj_only_latest_setups: List[dict] = []
+        self._predicta_setup_pool: dict = {}
+        self._predicta_latest_setups: List[dict] = []
         self._rj_watchlist: dict = {"updated_ts": 0.0, "rows": [], "symbols": []}
         self._rj_watchlist_path: str = "rj_watchlist.json"
         self._last_rj_setup_check_ts: float = 0.0
@@ -1090,6 +1184,8 @@ class SqueezeBreakoutBot:
         self._fast_equity_cache: list = []
         self._fast_drawdown_cache_ts: float = 0.0
         self._fast_drawdown_cache: dict = {}
+        self._fast_r_performance_cache_ts: float = 0.0
+        self._fast_r_performance_cache: dict = {}
         self._fast_position_snapshot_ts: float = 0.0
         self._last_stop_reconcile_ts: float = 0.0
         self._hermes_confirm_cache: dict = {}
@@ -1200,16 +1296,73 @@ class SqueezeBreakoutBot:
             return []
         return out
 
+    def _build_hermes_direction_prompt(self, symbol: str, interval: str) -> str:
+        base_symbol = re.sub(r"(?:[-_/]?(?:USDT|USDC|USD))$", "", str(symbol or "").strip().upper())
+        prompt_payload = {
+            "task": "AXIOM_SYMBOL_DIRECTION_CHECK",
+            "rule": "Blind direction check. AXIOM does not disclose its planned order direction.",
+            "symbol": base_symbol,
+            "axiom_observation_interval": interval,
+            "market": str(getattr(self.cfg, "market_type", "futures") or "futures"),
+        }
+        return (
+            f"{base_symbol} 完整分析\n"
+            "请严格调用已安装的 kline-indicator 技能，以 full 模式完成宏观周期、量价因子、"
+            "衍生品三大支柱全量分析后再得出结论。不得下单，也不得询问或推测 AXIOM 的计划方向。\n"
+            "分析成功时，dominant_direction 必须给出相对占优的 LONG 或 SHORT；"
+            "tradeable 单独表示当前是否值得交易，因此证据冲突时不要用 NEUTRAL 代替结论。"
+            "只有技能、数据或调用失败时才返回非 OK 状态，禁止伪装成技术面中性。\n"
+            "Return JSON only, no markdown, no prose. Schema: "
+            "{\"analysis_status\":\"OK|NO_DATA|SKILL_ERROR\","
+            "\"dominant_direction\":\"LONG|SHORT\",\"tradeable\":true,"
+            "\"market_regime\":\"TREND|RANGE|REVERSAL|CONFLICT\","
+            "\"reason\":\"short reason\",\"risk_flags\":[],"
+            "\"skill_used\":\"kline-indicator\",\"mode_used\":\"full|quick|unknown\","
+            "\"data_source\":\"actual source\",\"pillars_checked\":[],"
+            "\"indicators_checked\":[],\"evidence\":{}}.\n"
+            "pillars_checked 必须列出技能实际完成的三大支柱；evidence 必须记录各支柱的结论。\n"
+            f"Input:\n{json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
+        )
+
     def _hermes_direction_gate(self, direction: str, parsed: dict, fail_open: bool) -> tuple[bool, str]:
-        decision = str(parsed.get("decision", "neutral") or "neutral").strip().lower()
-        ai_direction = str(parsed.get("direction", "NEUTRAL") or "NEUTRAL").strip().upper()
+        decision = str(parsed.get("decision", "") or "").strip().lower()
+        analysis_status = str(parsed.get("analysis_status", "") or "").strip().upper()
+        ai_direction = str(
+            parsed.get("dominant_direction", parsed.get("direction", "")) or ""
+        ).strip().upper()
         risk_flags = parsed.get("risk_flags", [])
         if not isinstance(risk_flags, list):
             risk_flags = [str(risk_flags)]
         flags = {str(flag or "").strip().lower() for flag in risk_flags}
+        pillars_checked = parsed.get("pillars_checked", [])
+        evidence = parsed.get("evidence", {})
+        pillar_keys = {
+            re.sub(r"[^a-z0-9]+", "_", str(x or "").strip().lower()).strip("_")
+            for x in pillars_checked
+        } if isinstance(pillars_checked, list) else set()
+        evidence_keys = {
+            re.sub(r"[^a-z0-9]+", "_", str(x or "").strip().lower()).strip("_")
+            for x in evidence
+        } if isinstance(evidence, dict) else set()
 
         failure_reason = ""
-        if decision in {"timeout", "queue_timeout", "error"}:
+        try:
+            process_returncode = int(parsed.get("_process_returncode", 0) or 0)
+        except (TypeError, ValueError):
+            process_returncode = -1
+        if process_returncode != 0:
+            failure_reason = "process_error"
+        elif not analysis_status:
+            failure_reason = "status_missing"
+        elif analysis_status in {"NO_DATA", "DATA_UNAVAILABLE"}:
+            failure_reason = "data_unavailable"
+        elif analysis_status in {"SKILL_ERROR", "SKILL_UNAVAILABLE"}:
+            failure_reason = "skill_unavailable"
+        elif analysis_status in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+            failure_reason = analysis_status.lower()
+        elif analysis_status and analysis_status != "OK":
+            failure_reason = "invalid_status"
+        elif decision in {"timeout", "queue_timeout", "error"}:
             failure_reason = decision
         elif "skill_unavailable" in flags:
             failure_reason = "skill_unavailable"
@@ -1223,14 +1376,24 @@ class SqueezeBreakoutBot:
             failure_reason = "data_unavailable"
         elif not parsed.get("indicators_checked"):
             failure_reason = "indicators_missing"
-        elif ai_direction not in {"LONG", "SHORT", "NEUTRAL"}:
+        elif not {
+            "macro_cycle", "price_volume_factors", "derivatives"
+        }.issubset(pillar_keys) or not (
+            "macro_cycle" in evidence_keys
+            and "derivatives" in evidence_keys
+            and any(key == "price_volume_factors" or key.startswith("price_volume_factors_") for key in evidence_keys)
+        ):
+            failure_reason = "pillars_incomplete"
+        elif ai_direction not in {"LONG", "SHORT"}:
             failure_reason = "invalid_direction"
+        elif "tradeable" not in parsed or not isinstance(parsed.get("tradeable"), bool):
+            failure_reason = "tradeable_missing"
 
         if failure_reason:
             suffix = ":fail_open" if fail_open else ""
             return bool(fail_open), f"operational_failure:{failure_reason}{suffix}"
-        if ai_direction == "NEUTRAL":
-            return True, "neutral_abstain"
+        if not parsed["tradeable"]:
+            return False, "market_not_tradeable"
         if ai_direction == str(direction or "").strip().upper():
             return True, "direction_match"
         return False, "direction_opposite"
@@ -1259,44 +1422,26 @@ class SqueezeBreakoutBot:
             data["cached"] = True
             return data
 
-        timeout_sec = max(3, min(120, int(getattr(self.cfg, "hermes_confirm_timeout_sec", 90) or 90)))
-        queue_wait_sec = max(0, min(300, int(getattr(self.cfg, "hermes_confirm_queue_wait_sec", 120) or 120)))
+        timeout_sec = max(3, min(300, int(getattr(self.cfg, "hermes_confirm_timeout_sec", 240) or 240)))
+        queue_wait_sec = max(0, min(300, int(getattr(self.cfg, "hermes_confirm_queue_wait_sec", 300) or 300)))
         fail_open = self._as_bool(getattr(self.cfg, "hermes_confirm_fail_open", False))
         cmd = str(getattr(self.cfg, "hermes_confirm_cmd", "hermes") or "hermes").strip()
         if cmd == "hermes" and os.path.exists("/root/.hermes/hermes-agent/venv/bin/hermes"):
             cmd = "/root/.hermes/hermes-agent/venv/bin/hermes"
         skills = str(getattr(self.cfg, "hermes_confirm_skills", "kline-indicator") or "").strip()
 
-        prompt_payload = {
-            "task": "AXIOM_SYMBOL_DIRECTION_CHECK",
-            "rule": "Blind direction check. AXIOM does not disclose its planned order direction.",
-            "symbol": symbol,
-            "interval": interval,
-            "market": str(getattr(self.cfg, "market_type", "futures") or "futures"),
-            "exchange_hint": "OKX data source is available in Hermes if configured.",
-        }
-        prompt = (
-            "You are Hermes independent technical-analysis direction checker for AXIOM Quant.\n"
-            "AXIOM intentionally does not reveal its planned order direction. Do not infer that any direction is expected.\n"
-            "You MUST use the installed kline-indicator skill in full mode and your configured OKX market-data/API tools. Do not place orders.\n"
-            "If kline-indicator or market data is unavailable, return direction NEUTRAL with risk_flags including skill_unavailable or data_unavailable.\n"
-            "Return JSON only, no markdown, no prose. Schema: "
-            "{\"decision\":\"allow|block|neutral\",\"direction\":\"LONG|SHORT|NEUTRAL\","
-            "\"confidence\":0,\"reason\":\"short reason\",\"risk_flags\":[],"
-            "\"skill_used\":\"kline-indicator\",\"mode_used\":\"full|quick|unknown\","
-            "\"data_source\":\"okx_cli|okx_mcp|unknown\",\"indicators_checked\":[]}.\n"
-            "Set direction to your independent technical-analysis direction for the symbol/timeframe. "
-            "Use NEUTRAL when evidence is mixed or insufficient. The decision field can mirror direction strength: "
-            "allow means directional evidence is clear, neutral means unclear, block means high-risk/no-trade environment.\n"
-            f"Input:\n{json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
-        )
+        prompt = self._build_hermes_direction_prompt(symbol, interval)
 
         result = {
             "active": True,
             "pass": fail_open if mode == "hard_filter" else True,
             "mode": mode,
+            "analysis_status": "ERROR",
             "decision": "error",
             "direction": "NEUTRAL",
+            "dominant_direction": "",
+            "tradeable": False,
+            "market_regime": "",
             "confidence": 0.0,
             "reason": "",
             "risk_flags": [],
@@ -1304,6 +1449,8 @@ class SqueezeBreakoutBot:
             "mode_used": "",
             "data_source": "",
             "indicators_checked": [],
+            "pillars_checked": [],
+            "evidence": {},
             "skills_requested": skills,
             "cached": False,
             "queued_sec": 0.0,
@@ -1340,27 +1487,44 @@ class SqueezeBreakoutBot:
             parsed = self._extract_json_object(raw)
             if not parsed:
                 raise RuntimeError(f"no json from hermes rc={completed.returncode}: {raw[-500:]}")
-            decision = str(parsed.get("decision", "neutral") or "neutral").lower()
-            ai_direction = str(parsed.get("direction", "NEUTRAL") or "NEUTRAL").upper()
+            parsed["_process_returncode"] = completed.returncode
+            analysis_status = str(parsed.get("analysis_status", "") or "").strip().upper()
+            ai_direction = str(
+                parsed.get("dominant_direction", parsed.get("direction", "")) or ""
+            ).strip().upper()
+            parsed["analysis_status"] = analysis_status
+            parsed["dominant_direction"] = ai_direction
+            tradeable = self._as_bool(parsed.get("tradeable", False))
+            decision = "allow" if analysis_status == "OK" and tradeable else "block"
             confidence = float(parsed.get("confidence", 0) or 0)
             reason = str(parsed.get("reason", "") or "")[:300]
             risk_flags = parsed.get("risk_flags", [])
             if not isinstance(risk_flags, list):
                 risk_flags = [str(risk_flags)]
-            skill_used = str(parsed.get("skill_used", "") or "")
-            mode_used = str(parsed.get("mode_used", "") or "")
-            data_source = str(parsed.get("data_source", "") or "")
+            skill_used = str(parsed.get("skill_used", "") or "").strip()
+            mode_used = str(parsed.get("mode_used", "") or "").strip()
+            data_source = str(parsed.get("data_source", "") or "").strip()
             indicators_checked = parsed.get("indicators_checked", [])
             if not isinstance(indicators_checked, list):
                 indicators_checked = [str(indicators_checked)]
+            pillars_checked = parsed.get("pillars_checked", [])
+            if not isinstance(pillars_checked, list):
+                pillars_checked = [str(pillars_checked)]
+            evidence = parsed.get("evidence", {})
+            if not isinstance(evidence, dict):
+                evidence = {}
             allowed, gate_reason = self._hermes_direction_gate(direction, parsed, fail_open)
             if mode == "log_only":
                 allowed = True
             result.update({
                 "pass": bool(allowed),
                 "gate_reason": gate_reason,
+                "analysis_status": analysis_status,
                 "decision": decision,
                 "direction": ai_direction,
+                "dominant_direction": ai_direction,
+                "tradeable": tradeable,
+                "market_regime": str(parsed.get("market_regime", "") or "").upper()[:20],
                 "confidence": confidence,
                 "reason": reason,
                 "risk_flags": risk_flags[:8],
@@ -1368,15 +1532,21 @@ class SqueezeBreakoutBot:
                 "mode_used": mode_used[:40],
                 "data_source": data_source[:60],
                 "indicators_checked": [str(x)[:80] for x in indicators_checked[:20]],
+                "pillars_checked": [str(x)[:80] for x in pillars_checked[:6]],
+                "evidence": {str(k)[:40]: str(v)[:160] for k, v in list(evidence.items())[:8]},
                 "skills_requested": skills,
                 "returncode": completed.returncode,
             })
         except subprocess.TimeoutExpired:
-            result.update({"decision": "timeout", "reason": f"hermes timeout {timeout_sec}s"})
+            result.update({
+                "analysis_status": "TIMEOUT",
+                "decision": "timeout",
+                "reason": f"hermes timeout {timeout_sec}s",
+            })
             if mode == "log_only" or fail_open:
                 result["pass"] = True
         except Exception as e:
-            result.update({"decision": "error", "reason": str(e)[:300]})
+            result.update({"analysis_status": "ERROR", "decision": "error", "reason": str(e)[:300]})
             if mode == "log_only" or fail_open:
                 result["pass"] = True
         finally:
@@ -1395,8 +1565,14 @@ class SqueezeBreakoutBot:
             "active": bool(state.get("active", False)),
             "pass": bool(state.get("pass", True)),
             "mode": str(state.get("mode", "disabled") or "disabled"),
+            "analysis_status": str(state.get("analysis_status", "") or "").strip().upper()[:24],
             "decision": str(state.get("decision", "") or ""),
-            "direction": str(state.get("direction", "NEUTRAL") or "NEUTRAL").upper(),
+            "direction": str(state.get("direction", "NEUTRAL") or "NEUTRAL").strip().upper(),
+            "dominant_direction": str(
+                state.get("dominant_direction", state.get("direction", "")) or ""
+            ).strip().upper()[:12],
+            "tradeable": self._as_bool(state.get("tradeable", False)),
+            "market_regime": str(state.get("market_regime", "") or "").upper()[:20],
             "confidence": round(float(state.get("confidence", 0.0) or 0.0), 1),
             "reason": str(state.get("reason", "") or "")[:160],
             "skill_used": str(state.get("skill_used", "") or "")[:80],
@@ -1407,6 +1583,15 @@ class SqueezeBreakoutBot:
             "queued_sec": round(float(state.get("queued_sec", 0.0) or 0.0), 3),
             "gate_reason": str(state.get("gate_reason", "") or "")[:80],
         }
+        pillars = state.get("pillars_checked", [])
+        out["pillars_checked"] = (
+            [str(x)[:80] for x in pillars[:6]] if isinstance(pillars, list) else []
+        )
+        evidence = state.get("evidence", {})
+        out["evidence"] = (
+            {str(k)[:40]: str(v)[:160] for k, v in list(evidence.items())[:8]}
+            if isinstance(evidence, dict) else {}
+        )
         flags = state.get("risk_flags", [])
         if isinstance(flags, list):
             out["risk_flags"] = [str(x)[:80] for x in flags[:5]]
@@ -1422,6 +1607,225 @@ class SqueezeBreakoutBot:
         else:
             out["indicators_checked"] = []
         return out
+
+    def _position_choppy_filter(self, state: Optional[dict]) -> dict:
+        """压缩入场时震荡判定，供持仓、交易记录和前端复盘共用。"""
+        state = state or {}
+        source_reason = str(state.get("reason", state.get("choppy_filter_reason", "")) or "")
+        if source_reason == "not_recorded":
+            recorded = False
+        elif "recorded" in state:
+            recorded = bool(state.get("recorded"))
+        else:
+            recorded = bool(
+                "choppy_filter_available" in state
+                or "choppy_filter_is_choppy" in state
+                or "choppy_filter_mode" in state
+                or "available" in state
+                or "is_choppy" in state
+            )
+        if not recorded:
+            return {
+                "recorded": False,
+                "mode": "",
+                "anchor": "",
+                "available": False,
+                "is_choppy": False,
+                "reason": "not_recorded",
+                "reasons": [],
+                "atr_ratio": None,
+                "box_position": None,
+                "box_amplitude": None,
+                "adx_period": None,
+                "adx": None,
+                "efficiency_period": None,
+                "efficiency_ratio": None,
+            }
+
+        reasons = state.get("reasons", state.get("choppy_filter_reasons", []))
+        if not isinstance(reasons, list):
+            reasons = [reasons] if reasons else []
+
+        def optional_float(name, source_name):
+            value = state.get(name, state.get(source_name))
+            try:
+                return round(float(value), 6) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def optional_int(name, source_name):
+            value = state.get(name, state.get(source_name))
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "recorded": True,
+            "mode": str(state.get("mode", state.get("choppy_filter_mode", "")) or "")[:16],
+            "anchor": str(state.get("anchor", state.get("choppy_filter_anchor", "")) or "")[:24],
+            "available": bool(state.get("available", state.get("choppy_filter_available", False))),
+            "is_choppy": bool(state.get("is_choppy", state.get("choppy_filter_is_choppy", False))),
+            "reason": str(state.get("reason", state.get("choppy_filter_reason", "")) or "")[:40],
+            "reasons": [str(reason)[:40] for reason in reasons[:3]],
+            "atr_ratio": optional_float("atr_ratio", "choppy_atr_ratio"),
+            "box_position": optional_float("box_position", "choppy_box_position"),
+            "box_amplitude": optional_float("box_amplitude", "choppy_box_amplitude"),
+            "adx_period": optional_int("adx_period", "choppy_adx_period"),
+            "adx": optional_float("adx", "choppy_adx"),
+            "efficiency_period": optional_int("efficiency_period", "choppy_efficiency_period"),
+            "efficiency_ratio": optional_float(
+                "efficiency_ratio", "choppy_efficiency_ratio"
+            ),
+        }
+
+    def _position_daily_pattern(self, state: Optional[dict]) -> dict:
+        state = state or {}
+        if not bool(state.get("recorded", False)):
+            return {
+                "recorded": False,
+                "kind": "none",
+                "pattern_direction": "NONE",
+                "alignment": "unavailable",
+                "rank": 0,
+                "would_block": False,
+                "candle_open_time": None,
+                "candle_close_time": None,
+                "reason": str(state.get("reason", "not_recorded") or "not_recorded")[:40],
+                "mode": str(state.get("mode", "") or "")[:16],
+            }
+
+        def optional_int(name):
+            value = state.get(name)
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            rank = int(state.get("rank", 0) or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        return {
+            "recorded": True,
+            "kind": str(state.get("kind", "none") or "none")[:40],
+            "pattern_direction": str(state.get("pattern_direction", "NONE") or "NONE")[:8],
+            "alignment": str(state.get("alignment", "none") or "none")[:16],
+            "rank": rank,
+            "would_block": bool(state.get("would_block", False)),
+            "candle_open_time": optional_int("candle_open_time"),
+            "candle_close_time": optional_int("candle_close_time"),
+            "reason": str(state.get("reason", "") or "")[:40],
+            "mode": str(state.get("mode", "") or "")[:16],
+        }
+
+    def _daily_pattern_state_for_entry(
+        self, symbol: str, direction: str, decision_time: Optional[int] = None,
+    ) -> dict:
+        mode = str(getattr(self.cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+        if mode not in ("off", "log_only", "soft"):
+            mode = "log_only"
+        if mode == "off":
+            return self._position_daily_pattern({"reason": "disabled", "mode": mode})
+        try:
+            daily = fetch_klines(
+                symbol, "1d", 50,
+                exchange="bitget",
+                closed_only=True,
+                bitget_granularity="1Dutc",
+            )
+        except Exception:
+            return self._position_daily_pattern({
+                "reason": "daily_fetch_failed",
+                "mode": mode,
+            })
+        state = evaluate_daily_pattern_state(
+            daily,
+            direction,
+            decision_time=(int(time.time() * 1000) if decision_time is None else decision_time),
+        )
+        state["mode"] = mode
+        return self._position_daily_pattern(state)
+
+    def _daily_pattern_entry_decision(
+        self, symbol: str, direction: str, source_strategy: str,
+        decision_time: Optional[int] = None,
+    ) -> tuple[Optional[dict], bool]:
+        mode = str(getattr(self.cfg, "rj_daily_pattern_filter_mode", "off") or "off").strip().lower()
+        if mode == "off":
+            return None, False
+        snapshot = self._daily_pattern_state_for_entry(
+            symbol, direction, decision_time=decision_time,
+        )
+        should_block = (
+            source_strategy == "rj_only"
+            and snapshot.get("mode") == "soft"
+            and snapshot.get("would_block")
+        )
+        return snapshot, bool(should_block)
+
+    def _attach_daily_pattern_for_entry(
+        self, signal: dict, source_strategy: str,
+        decision_time: Optional[int] = None,
+    ) -> bool:
+        symbol = str(signal.get("symbol", "") or "")
+        direction = str(signal.get("direction", "") or "")
+        snapshot, should_block = self._daily_pattern_entry_decision(
+            symbol,
+            direction,
+            source_strategy,
+            decision_time=decision_time,
+        )
+        if snapshot is None:
+            return False
+        signal["daily_pattern"] = snapshot
+        self._append_signal_event(
+            "rj_daily_pattern_shadow",
+            symbol,
+            self._signal_snapshot(signal, {"daily_pattern": snapshot}),
+        )
+        if should_block:
+            self._append_signal_event(
+                "entry_reject",
+                symbol,
+                self._signal_snapshot(signal, {
+                    "reason": "daily_pattern_opposed",
+                    "daily_pattern": snapshot,
+                }),
+            )
+        return should_block
+
+    def _entry_choppy_audit_map(self) -> dict:
+        """从成交事件恢复旧持仓缺失的入场快照，不用当前行情补算。"""
+        audits = {}
+        path = Path(getattr(self, "_signal_log_path", SIGNAL_LOG_PATH))
+        if not path.exists():
+            return audits
+        try:
+            lines = deque(maxlen=5000)
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    lines.append(line)
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("event") != "entry_filled":
+                    continue
+                audit = self._position_choppy_filter(event)
+                if not audit.get("recorded"):
+                    continue
+                symbol = str(event.get("symbol", "") or "")
+                signal_key = str(event.get("signal_key", "") or "")
+                if symbol:
+                    audits[(symbol, "")] = audit
+                    if signal_key:
+                        audits[(symbol, signal_key)] = audit
+        except Exception as exc:
+            if getattr(self, "_log_ready", False):
+                self._log.warning(f"恢复持仓震荡快照失败: {exc}")
+        return audits
 
     def _bar_marker(self, df, idx):
         try:
@@ -1949,6 +2353,23 @@ class SqueezeBreakoutBot:
                 pass
         return 0.0
 
+    def _r_performance_summary(self) -> dict:
+        now_ts = time.monotonic()
+        if (
+            self._fast_r_performance_cache
+            and now_ts - self._fast_r_performance_cache_ts < 2
+        ):
+            return self._fast_r_performance_cache
+        try:
+            payload = summarize_r_performance_ranges(self.trade_log, now=bj_now())
+        except Exception as exc:
+            if getattr(self, "_log_ready", False):
+                self._log.warning(f"R绩效统计失败: {exc}")
+            payload = {"status": "error", "ranges": {}}
+        self._fast_r_performance_cache = payload
+        self._fast_r_performance_cache_ts = now_ts
+        return payload
+
     @staticmethod
     def _extract_order_number(obj, keys, allow_negative: bool = False):
         if obj is None:
@@ -2377,8 +2798,9 @@ class SqueezeBreakoutBot:
             "structure_rj": "structure",
             "squeeze": "structure",
             "breakout": "structure",
+            "predicta": "predicta_ewo",
         }
-        return aliases.get(raw, raw if raw in ("structure", "rj_only") else "structure")
+        return aliases.get(raw, raw if raw in ("structure", "rj_only", "predicta_ewo") else "structure")
 
     def _compute_rj_lines(self, df) -> Optional[dict]:
         if df is None or len(df) < 30:
@@ -2697,6 +3119,254 @@ class SqueezeBreakoutBot:
             state.update({"rj_sr_filter_pass": False, "rj_sr_reason": f"sr_exception:{str(e)[:60]}"})
             return state
 
+    def _choppy_filter_state(
+        self,
+        df,
+        anchor_idx: int,
+        mode: str,
+        evaluator=evaluate_choppy_market_adaptive,
+    ) -> dict:
+        mode = str(mode or "off").strip().lower()
+        if mode not in ("off", "log_only", "hard"):
+            mode = "off"
+        if mode == "off":
+            return {
+                "choppy_filter_mode": mode,
+                "choppy_filter_anchor": "signal_key",
+                "choppy_filter_available": False,
+                "choppy_filter_is_choppy": False,
+                "choppy_filter_reason": "disabled",
+                "choppy_filter_reasons": [],
+            }
+        state = evaluator(df, anchor_idx=anchor_idx)
+        state["choppy_filter_mode"] = mode
+        state["choppy_filter_anchor"] = "signal_key"
+        return state
+
+    def _rj_choppy_filter_state(self, df, anchor_idx: int) -> dict:
+        return self._choppy_filter_state(
+            df, anchor_idx, getattr(self.cfg, "rj_choppy_filter_mode", "off")
+        )
+
+    def _predicta_choppy_filter_state(self, df, anchor_idx: int) -> dict:
+        return self._choppy_filter_state(
+            df,
+            anchor_idx,
+            getattr(self.cfg, "predicta_choppy_filter_mode", "hard"),
+            evaluator=evaluate_predicta_choppy_market,
+        )
+
+    def _predicta_params(self) -> PredictaParams:
+        return PredictaParams(
+            ewo_fast=max(1, int(getattr(self.cfg, "predicta_ewo_fast", 5) or 5)),
+            ewo_slow=max(1, int(getattr(self.cfg, "predicta_ewo_slow", 35) or 35)),
+            confirm_bars=max(1, int(getattr(self.cfg, "predicta_confirm_bars", 6) or 6)),
+            confirm_atr_buffer=max(0.0, float(getattr(self.cfg, "predicta_confirm_atr_buffer", 0.08) or 0.0)),
+            stop_atr_mult=max(0.0, float(getattr(self.cfg, "predicta_stop_atr_mult", 0.5) or 0.0)),
+        )
+
+    def _predicta_normalize_stop(self, direction: str, entry_price: float, raw_stop: float) -> Optional[float]:
+        entry_price = float(entry_price or 0.0)
+        raw_stop = float(raw_stop or 0.0)
+        if entry_price <= 0:
+            return None
+        min_pct = max(0.0, float(getattr(self.cfg, "predicta_min_stop_pct", 0.003) or 0.0))
+        max_pct = max(min_pct, float(getattr(self.cfg, "predicta_max_stop_pct", 0.08) or 0.08))
+        if direction == "LONG":
+            stop = min(raw_stop, entry_price * (1.0 - min_pct))
+            distance = entry_price - stop
+        else:
+            stop = max(raw_stop, entry_price * (1.0 + min_pct))
+            distance = stop - entry_price
+        stop_pct = distance / entry_price
+        if stop <= 0 or stop_pct <= 0 or stop_pct > max_pct:
+            return None
+        return float(stop)
+
+    def _predicta_candidates_from_df(
+        self, symbol: str, interval: str, df,
+        signal_idx: Optional[int] = None, lines=None,
+    ) -> tuple[list, list]:
+        """Build a fast signal or waiting setup from the latest closed candle."""
+        if df is None or len(df) < 40:
+            return [], []
+        frame = df.reset_index(drop=True)
+        params = self._predicta_params()
+        lines = compute_predicta(frame, params) if lines is None else lines
+        signal_idx = len(lines) - 1 if signal_idx is None else int(signal_idx)
+        direction = ""
+        if bool(lines["bull_signal"].iloc[signal_idx]):
+            direction = "LONG"
+        elif bool(lines["bear_signal"].iloc[signal_idx]):
+            direction = "SHORT"
+        if not direction:
+            return [], []
+        choppy = self._predicta_choppy_filter_state(frame, signal_idx)
+        if choppy.get("choppy_filter_mode") == "hard" and choppy.get("choppy_filter_is_choppy"):
+            return [], []
+        raw_ewo = lines["ewo"].iloc[signal_idx]
+        signal_ewo = float(raw_ewo) if pd.notna(raw_ewo) else 0.0
+        setup = make_predicta_setup(
+            symbol, direction, interval, frame, signal_idx, signal_ewo, choppy, params
+        )
+        setup["price"] = float(frame["c"].iloc[signal_idx])
+        setup["score"] = 100.0
+        setup["retest"] = (
+            "Predicta信号K EWO同向"
+            if setup["predicta_entry_path"] == "fast"
+            else "Predicta等待突破+EWO"
+        )
+        if setup["predicta_entry_path"] != "fast":
+            return [], [setup]
+        atr_value = float(self._calc_atr(frame.iloc[:signal_idx + 1], 14) or 0.0)
+        raw_stop = (
+            float(setup["predicta_key_low"]) - atr_value * params.stop_atr_mult
+            if direction == "LONG"
+            else float(setup["predicta_key_high"]) + atr_value * params.stop_atr_mult
+        )
+        stop = self._predicta_normalize_stop(direction, setup["price"], raw_stop)
+        if stop is None:
+            return [], []
+        setup.update({
+            "predicta_atr": atr_value,
+            "predicta_stop_price": round(stop, 8),
+            "predicta_stop_anchor": "signal_key",
+            "fractal_sl": float(
+                setup["predicta_key_low"] if direction == "LONG" else setup["predicta_key_high"]
+            ),
+            "band_sl": round(stop, 8),
+        })
+        return [setup], []
+
+    def _predicta_confirmed_signal(self, setup: dict, df) -> Optional[dict]:
+        """Evaluate one waiting setup against the latest closed candle."""
+        if df is None or len(df) < 40:
+            return None
+        frame = df.reset_index(drop=True)
+        params = self._predicta_params()
+        atr_value = float(self._calc_atr(frame, 14) or 0.0)
+        decision = evaluate_predicta_setup(setup, frame, params, atr_value)
+        if decision.status != "confirmed":
+            return None
+        stop = self._predicta_normalize_stop(
+            str(setup.get("direction", "")), decision.confirm_price, decision.stop_price
+        )
+        if stop is None:
+            return None
+        signal = dict(setup)
+        signal.update({
+            "price": float(decision.confirm_price),
+            "score": 100.0,
+            "source_strategy": "predicta_ewo",
+            "predicta_entry_path": "wait",
+            "predicta_confirm_time": int(decision.confirm_time or 0),
+            "predicta_confirm_ewo": float(decision.ewo),
+            "predicta_confirm_reason": decision.reason,
+            "predicta_confirm_age_bars": int(decision.age_bars),
+            "predicta_atr": atr_value,
+            "predicta_stop_price": round(stop, 8),
+            "predicta_stop_anchor": "signal_key",
+            "fractal_sl": float(
+                setup.get("predicta_key_low", 0.0)
+                if setup.get("direction") == "LONG"
+                else setup.get("predicta_key_high", 0.0)
+            ),
+            "band_sl": round(stop, 8),
+            "retest": "Predicta关键K突破 + EWO确认",
+        })
+        return signal
+
+    def _predicta_signal_from_df(self, symbol: str, interval: str, df) -> Optional[dict]:
+        """Stateless adapter used by replay and live restart recovery."""
+        if df is None or len(df) < 40:
+            return None
+        frame = df.reset_index(drop=True)
+        current_idx = len(frame) - 1
+        confirm_bars = max(1, int(getattr(self.cfg, "predicta_confirm_bars", 6) or 6))
+        lines = compute_predicta(frame, self._predicta_params())
+        for signal_idx in range(current_idx, max(-1, current_idx - confirm_bars - 1), -1):
+            fast, waiting = self._predicta_candidates_from_df(
+                symbol, interval, frame, signal_idx=signal_idx, lines=lines
+            )
+            if fast:
+                if signal_idx == current_idx:
+                    return fast[0]
+                continue
+            if waiting:
+                setup = waiting[0]
+                for decision_idx in range(signal_idx + 1, current_idx + 1):
+                    decision_frame = frame.iloc[:decision_idx + 1].copy()
+                    atr_value = float(self._calc_atr(decision_frame, 14) or 0.0)
+                    decision = evaluate_predicta_setup(
+                        setup, decision_frame, self._predicta_params(), atr_value
+                    )
+                    if decision.status == "confirmed":
+                        if decision_idx != current_idx:
+                            return None
+                        return self._predicta_confirmed_signal(setup, decision_frame)
+                    if decision.status in ("invalidated", "timeout"):
+                        return None
+        return None
+
+    def _sync_predicta_setup_pool(self, setups: list) -> None:
+        now_ts = time.time()
+        max_pool = max(1, int(getattr(self.cfg, "predicta_setup_max_pool", 40) or 40))
+        for raw in setups or []:
+            key = str(raw.get("signal_key", "") or "")
+            symbol = str(raw.get("symbol", "") or "")
+            if not key or not symbol or self._any_signal_key_used([key]):
+                continue
+            if any(position.symbol == symbol for position in self.positions):
+                continue
+            existing = self._predicta_setup_pool.get(key, {})
+            item = dict(existing)
+            item.update(raw)
+            item["predicta_setup_first_seen_ts"] = float(
+                existing.get("predicta_setup_first_seen_ts", now_ts) or now_ts
+            )
+            self._predicta_setup_pool[key] = item
+        while len(self._predicta_setup_pool) > max_pool:
+            oldest_key = min(
+                self._predicta_setup_pool,
+                key=lambda key: float(
+                    self._predicta_setup_pool[key].get("predicta_setup_first_seen_ts", now_ts) or now_ts
+                ),
+            )
+            self._predicta_setup_pool.pop(oldest_key, None)
+
+    def _check_predicta_setup_pool(self) -> list:
+        """Return newly confirmed signals and remove terminal waiting setups."""
+        if self._entry_signal_source() != "predicta_ewo" or not self._predicta_setup_pool:
+            return []
+        confirmed = []
+        params = self._predicta_params()
+        for key, setup in list(self._predicta_setup_pool.items()):
+            symbol = str(setup.get("symbol", "") or "")
+            interval = str(setup.get("source_interval", self.cfg.scan_interval) or self.cfg.scan_interval)
+            if not symbol or any(position.symbol == symbol for position in self.positions):
+                self._predicta_setup_pool.pop(key, None)
+                continue
+            try:
+                frame = fetch_klines(
+                    symbol, interval, 160,
+                    exchange=self.cfg.exchange,
+                    closed_only=True,
+                )
+                if frame is None or len(frame) < 40:
+                    continue
+                atr_value = float(self._calc_atr(frame, 14) or 0.0)
+                decision = evaluate_predicta_setup(setup, frame, params, atr_value)
+                if decision.status == "confirmed":
+                    signal = self._predicta_confirmed_signal(setup, frame)
+                    self._predicta_setup_pool.pop(key, None)
+                    if signal is not None:
+                        confirmed.append(signal)
+                elif decision.status in ("invalidated", "timeout"):
+                    self._predicta_setup_pool.pop(key, None)
+            except Exception as exc:
+                self._log.warning(f"Predicta候选池检查异常 {symbol} {interval}: {exc}")
+        return confirmed
+
     def _rj_only_signal_from_df(self, symbol: str, interval: str, df) -> Optional[dict]:
         """RJ-only demo entry: RJ cross -> key candle -> latest close confirms key break."""
         if df is None or len(df) < 60:
@@ -2803,6 +3473,12 @@ class SqueezeBreakoutBot:
                             stop_pct = (sl_price - entry_price) / entry_price
                         if stop_pct <= 0 or stop_pct > max_stop_pct:
                             continue
+                        choppy_state = self._rj_choppy_filter_state(df, cross_idx)
+                        if (
+                            choppy_state.get("choppy_filter_mode") == "hard"
+                            and choppy_state.get("choppy_filter_is_choppy", False)
+                        ):
+                            continue
                         volume_state = self._rj_only_volume_state(df, cross_idx, anchor="signal_key")
                         if not volume_state.get("rj_volume_filter_pass", True):
                             continue
@@ -2878,6 +3554,7 @@ class SqueezeBreakoutBot:
                             "rj_only_confirm_atr_buffer": confirm_atr_buffer,
                             "rj_only_invalidate_on_opposite_break": invalidate_on_opposite,
                             "rj_only_confirm_bars": confirm_bars,
+                            **choppy_state,
                             **line_params,
                             **volume_state,
                             **sr_state,
@@ -3021,6 +3698,12 @@ class SqueezeBreakoutBot:
                             stop_pct = (sl_price - confirm_level) / confirm_level if confirm_level > 0 else 0.0
                         if stop_pct <= 0 or stop_pct > max_stop_pct:
                             continue
+                        choppy_state = self._rj_choppy_filter_state(df, cross_idx)
+                        if (
+                            choppy_state.get("choppy_filter_mode") == "hard"
+                            and choppy_state.get("choppy_filter_is_choppy", False)
+                        ):
+                            continue
                         volume_state = self._rj_only_volume_state(df, cross_idx, anchor="signal_key")
                         if not volume_state.get("rj_volume_filter_pass", True):
                             continue
@@ -3091,6 +3774,7 @@ class SqueezeBreakoutBot:
                         "rj_setup_confirm_mode": str(getattr(self.cfg, "rj_only_setup_confirm_mode", "near_close") or "near_close"),
                         "rj_setup_close_confirm_sec": int(getattr(self.cfg, "rj_only_setup_close_confirm_sec", 45) or 45),
                         "rj_setup_trigger_hold_sec": int(getattr(self.cfg, "rj_only_setup_trigger_hold_sec", 10) or 0),
+                        **choppy_state,
                         **line_params,
                         **volume_state,
                         **sr_state,
@@ -3254,6 +3938,12 @@ class SqueezeBreakoutBot:
                     "pool_size": len(self._rj_setup_pool),
                     **btc_fields,
                 }))
+                if item.get("choppy_filter_mode") == "log_only" and item.get("choppy_filter_is_choppy"):
+                    self._append_signal_event(
+                        "rj_choppy_shadow",
+                        raw.get("symbol", ""),
+                        self._signal_snapshot(item, {"source_event": "rj_setup_add", **btc_fields}),
+                    )
         while len(self._rj_setup_pool) > max_pool:
             oldest_key, oldest = min(
                 self._rj_setup_pool.items(),
@@ -3864,6 +4554,73 @@ class SqueezeBreakoutBot:
             f"top={','.join(self._rj_watchlist.get('symbols', [])[:5]) or '-'}"
         )
 
+    def _scan_predicta_signals(self, intervals: list, btc_fields: dict) -> list:
+        """Scan the liquid universe for closed-candle Predicta labels."""
+        try:
+            symbols, vols = fetch_pairs(exchange=self.cfg.exchange)
+        except Exception as exc:
+            self._log.warning(f"Predicta扫描读取交易对失败: {exc}")
+            return []
+        min_volume = max(0.0, float(getattr(self.cfg, "predicta_min_volume_usdt", MIN_VOLUME) or 0.0))
+        max_symbols = max(5, int(getattr(self.cfg, "predicta_max_symbols", 500) or 500))
+        ranked = sorted(
+            [
+                symbol for symbol in symbols
+                if symbol and symbol.endswith("USDT") and symbol != "USDCUSDT"
+                and not is_tradfi_or_junk(symbol)
+                and float(vols.get(symbol, 0.0) or 0.0) >= min_volume
+            ],
+            key=lambda symbol: float(vols.get(symbol, 0.0) or 0.0),
+            reverse=True,
+        )
+        candidates = self._filter_live_trade_symbols(ranked)[:max_symbols]
+        fast_signals = []
+        waiting_setups = []
+        lookback = 160
+
+        def worker(symbol: str, interval: str):
+            frame = fetch_klines(
+                symbol, interval, lookback,
+                exchange=self.cfg.exchange,
+                closed_only=True,
+            )
+            if frame is None or len(frame) < 40:
+                return [], []
+            fast, waiting = self._predicta_candidates_from_df(symbol, interval, frame)
+            if not fast:
+                recovered = self._predicta_signal_from_df(symbol, interval, frame)
+                if recovered is not None:
+                    fast = [recovered]
+            return fast, waiting
+
+        worker_cap = max(1, int(getattr(self.cfg, "predicta_scan_workers", 4) or 4))
+        with ThreadPoolExecutor(max_workers=min(worker_cap, max(1, len(candidates)))) as pool:
+            futures = {
+                pool.submit(worker, symbol, interval): (symbol, interval)
+                for interval in intervals
+                for symbol in candidates
+                if not any(position.symbol == symbol for position in self.positions)
+            }
+            for future in as_completed(futures):
+                try:
+                    fast, waiting = future.result()
+                    volume = round(float(vols.get(futures[future][0], 0.0) or 0.0), 2)
+                    for item in fast + waiting:
+                        item["volume_usdt"] = volume
+                    fast_signals.extend(fast)
+                    waiting_setups.extend(waiting)
+                except Exception as exc:
+                    symbol, interval = futures[future]
+                    self._log.warning(f"Predicta扫描异常 {symbol} {interval}: {exc}")
+        fast_unique = {item["signal_key"]: item for item in fast_signals}
+        waiting_unique = {item["signal_key"]: item for item in waiting_setups}
+        self._predicta_latest_setups = sorted(
+            waiting_unique.values(), key=lambda item: item.get("volume_usdt", 0.0), reverse=True
+        )
+        return sorted(
+            fast_unique.values(), key=lambda item: item.get("volume_usdt", 0.0), reverse=True
+        )
+
     def _scan_rj_only_signals(self, intervals: list, btc_fields: dict) -> list:
         try:
             symbols, vols = fetch_pairs(exchange=self.cfg.exchange)
@@ -3993,6 +4750,49 @@ class SqueezeBreakoutBot:
         })
         return signals
 
+    def _run_predicta_cycle(self, now, btc_fields: dict, intervals: list):
+        confirmed = self._check_predicta_setup_pool()
+        fast_signals = self._scan_predicta_signals(intervals, btc_fields)
+        waiting_setups = list(self._predicta_latest_setups)
+        self._sync_predicta_setup_pool(waiting_setups)
+        signals_by_key = {
+            str(signal.get("signal_key", "")): signal
+            for signal in confirmed + fast_signals
+            if signal.get("signal_key")
+        }
+        signals = list(signals_by_key.values())
+        self.last_scan_time = now
+        self.last_signal_count = len(signals)
+        self._append_signal_event("predicta_scan_cycle", payload={
+            "intervals": ",".join(intervals),
+            "fast_signals": len(fast_signals),
+            "confirmed_signals": len(confirmed),
+            "waiting_setups": len(waiting_setups),
+            "setup_pool_size": len(self._predicta_setup_pool),
+            "positions": len(self.positions),
+            **btc_fields,
+        })
+        for signal in signals:
+            self._append_signal_event(
+                "predicta_candidate", signal.get("symbol", ""),
+                self._signal_snapshot(signal, btc_fields),
+            )
+        for setup in waiting_setups:
+            self._append_signal_event(
+                "predicta_setup_wait", setup.get("symbol", ""),
+                self._signal_snapshot(setup, btc_fields),
+            )
+        display = signals[:10]
+        if len(display) < 10:
+            display += waiting_setups[:10 - len(display)]
+        self.last_signals_data = [dict(item) for item in display]
+        for signal in signals:
+            if len(self.positions) >= self.cfg.max_positions:
+                break
+            if any(position.symbol == signal.get("symbol") for position in self.positions):
+                continue
+            self.enter_predicta_position(signal)
+
     def _run_rj_only_cycle(self, now, btc_fields: dict, intervals: list):
         signals = self._scan_rj_only_signals(intervals, btc_fields)
         setups = list(getattr(self, "_rj_only_latest_setups", []) or [])
@@ -4001,6 +4801,12 @@ class SqueezeBreakoutBot:
         self.last_signal_count = len(signals)
         for s in signals:
             self._append_signal_event("rj_only_candidate", s.get("symbol", ""), self._signal_snapshot(s, btc_fields))
+            if s.get("choppy_filter_mode") == "log_only" and s.get("choppy_filter_is_choppy"):
+                self._append_signal_event(
+                    "rj_choppy_shadow",
+                    s.get("symbol", ""),
+                    self._signal_snapshot(s, {"source_event": "rj_only_candidate", **btc_fields}),
+                )
         display_rows = signals[:10]
         if len(display_rows) < 10:
             display_rows = display_rows + setups[:max(0, 10 - len(display_rows))]
@@ -4015,7 +4821,9 @@ class SqueezeBreakoutBot:
                 "rj_sr_filter_pass", "rj_sr_reason", "rj_sr_support", "rj_sr_resistance",
                 "rj_sr_near_support", "rj_sr_near_resistance", "rj_sr_bull_div", "rj_sr_bear_div",
                 "rj_only_hist_samples", "rj_only_hist_win_rate", "rj_only_hist_avg_r",
-                "rj_only_hist_profit_factor", "rj_only_stats_pass"
+                "rj_only_hist_profit_factor", "rj_only_stats_pass",
+                "choppy_filter_mode", "choppy_filter_is_choppy", "choppy_filter_reason",
+                "choppy_atr_ratio", "choppy_box_amplitude", "choppy_box_position"
             )}
             for s in display_rows
         ]
@@ -4053,6 +4861,11 @@ class SqueezeBreakoutBot:
             "squeeze_start", "squeeze_end", "first_fractal_bar", "confirm_fractal_bar",
             "target_zone_type", "target_zone_price", "target_zone_low", "target_zone_high",
             "target_r", "target_distance_pct", "target_zone_bars_ago",
+            "daily_pattern",
+            "predicta_entry_path", "predicta_key_time", "predicta_key_high", "predicta_key_low",
+            "predicta_signal_ewo", "predicta_confirm_time", "predicta_confirm_ewo",
+            "predicta_confirm_reason", "predicta_confirm_age_bars", "predicta_confirm_bars",
+            "predicta_atr", "predicta_stop_price", "predicta_stop_anchor",
             "rj_filter_mode", "rj_filter_pass", "rj_rule_pass", "rj_filter_reason",
             "rj_available", "rj_reason", "rj_j", "rj_r", "rj_spread", "rj_bg",
             "rj_current_ok", "rj_recent_cross", "rj_cross_type", "rj_cross_bars_ago",
@@ -4084,6 +4897,14 @@ class SqueezeBreakoutBot:
             "rj_sr_early_bull_div", "rj_sr_early_bear_div",
             "rj_sr_last_bull_div_bar", "rj_sr_last_bear_div_bar",
             "rj_sr_pivot_left", "rj_sr_pivot_right",
+            "choppy_filter_mode", "choppy_filter_anchor", "choppy_filter_available",
+            "choppy_filter_is_choppy", "choppy_filter_reason", "choppy_filter_reasons",
+            "choppy_filter_anchor_idx", "choppy_filter_anchor_time",
+            "choppy_atr", "choppy_atr_baseline", "choppy_atr_ratio",
+            "choppy_box_high", "choppy_box_low", "choppy_box_amplitude",
+            "choppy_box_threshold", "choppy_box_position",
+            "choppy_adx_period", "choppy_adx",
+            "choppy_efficiency_period", "choppy_efficiency_ratio",
             "btc_coin_reversal_pass",
             "rj_only_stats_pass", "rj_only_stats_reason", "rj_only_hist_samples",
             "rj_only_hist_raw_triggers", "rj_only_hist_confirmed", "rj_only_hist_risk_ok",
@@ -4311,18 +5132,540 @@ class SqueezeBreakoutBot:
         except Exception as e:
             self._log.error(f"Telegram通知失败: {e}")
 
+    def _position_r_anchor(self, pos: Position) -> tuple:
+        """Return the immutable entry/risk pair, migrating legacy positions in memory."""
+        entry = float(getattr(pos, "initial_entry_price", 0.0) or 0.0)
+        if entry <= 0:
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            pos.initial_entry_price = entry
+        risk = float(getattr(pos, "initial_risk_per_unit", 0.0) or 0.0)
+        if risk <= 0:
+            initial_sl = float(
+                getattr(pos, "initial_sl", 0.0)
+                or getattr(pos, "sl_price", 0.0)
+                or 0.0
+            )
+            risk = abs(entry - initial_sl)
+            pos.initial_risk_per_unit = risk
+        return entry, risk
+
+    def _post_entry_history(self, pos: Position, df):
+        if df is None or len(df) == 0 or "ot" not in df:
+            return df.iloc[0:0] if df is not None else None
+        try:
+            open_times = pd.to_numeric(df["ot"], errors="coerce")
+            valid_open_times = open_times.dropna()
+            if len(valid_open_times) == 0:
+                return df.iloc[0:0]
+            entry_ms = _entry_ms_for_market_data(pos.entry_time, int(valid_open_times.max()))
+            return df[open_times >= entry_ms]
+        except Exception:
+            return df.iloc[0:0]
+
+    def _history_with_unobserved_excursion(
+        self,
+        pos: Position,
+        interval: str,
+        recent_df,
+        price_source: str = "",
+    ) -> tuple:
+        """Return recent data plus every closed candle not covered by the durable MFE cursor."""
+        recent_history = self._post_entry_history(pos, recent_df)
+        if recent_df is None or len(recent_df) == 0 or "ot" not in recent_df:
+            return recent_history, 0
+        try:
+            step_ms = INTERVAL_MS.get(
+                str(interval).strip(),
+                self._interval_seconds(interval) * 1000,
+            )
+            phase_ms = INTERVAL_OPEN_PHASE_MS.get(str(interval).strip(), 0)
+
+            def mergeable(history) -> bool:
+                if history is None or len(history) == 0:
+                    return True
+                if "ot" not in history or "h" not in history or "l" not in history:
+                    return False
+                open_values = pd.to_numeric(
+                    history["ot"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                high_values = pd.to_numeric(
+                    history["h"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                low_values = pd.to_numeric(
+                    history["l"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                if not (
+                    np.isfinite(open_values).all()
+                    and np.isfinite(high_values).all()
+                    and np.isfinite(low_values).all()
+                    and np.equal(open_values, np.floor(open_values)).all()
+                ):
+                    return False
+                ordered_times = sorted(int(value) for value in open_values)
+                return bool(
+                    len(set(ordered_times)) == len(ordered_times)
+                    and all(
+                        (open_time - phase_ms) % step_ms == 0
+                        for open_time in ordered_times
+                    )
+                    and all(
+                        right - left == step_ms
+                        for left, right in zip(
+                            ordered_times,
+                            ordered_times[1:],
+                        )
+                    )
+                )
+
+            raw_recent_open_times = pd.to_numeric(
+                recent_df["ot"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            if not (
+                np.isfinite(raw_recent_open_times).all()
+                and np.equal(
+                    raw_recent_open_times,
+                    np.floor(raw_recent_open_times),
+                ).all()
+            ):
+                return recent_history, 0
+            recent_open_times = (
+                pd.Series(raw_recent_open_times.astype("int64"))
+                .drop_duplicates()
+                .sort_values()
+            )
+            if len(recent_open_times) == 0:
+                return recent_history, 0
+            if any(
+                (int(open_time) - phase_ms) % step_ms != 0
+                for open_time in recent_open_times
+            ):
+                return recent_history, 0
+            end_ms = int(recent_open_times.iloc[-1])
+            entry_ms = _entry_ms_for_market_data(pos.entry_time, end_ms)
+            last_check_ms = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+            old_source = str(getattr(pos, "excursion_price_source", "") or "")
+            if price_source and old_source != price_source:
+                last_check_ms = 0
+            start_ms = (
+                max(entry_ms, last_check_ms + step_ms)
+                if last_check_ms > 0
+                else entry_ms
+            )
+            if start_ms > end_ms:
+                return recent_history, 0
+
+            relevant_times = recent_open_times[recent_open_times >= start_ms]
+            recent_covers_range = False
+            if len(relevant_times) > 0:
+                first_open = int(relevant_times.iloc[0])
+                last_open = int(relevant_times.iloc[-1])
+                expected_first = (
+                    (
+                        (start_ms - phase_ms + step_ms - 1)
+                        // step_ms
+                    )
+                    * step_ms
+                    + phase_ms
+                )
+                gaps = relevant_times.diff().dropna()
+                recent_covers_range = (
+                    first_open == expected_first
+                    and last_open == end_ms
+                    and (
+                        len(gaps) == 0
+                        or bool((gaps == step_ms).all())
+                    )
+                )
+            if recent_covers_range:
+                return (
+                    (recent_history, end_ms)
+                    if mergeable(recent_history)
+                    else (recent_history, 0)
+                )
+
+            missing_history = fetch_klines_range(
+                pos.symbol,
+                interval,
+                start_ms,
+                end_ms,
+                exchange=self.cfg.exchange,
+                market_type=self.cfg.market_type,
+                testnet=self.cfg.testnet,
+                price_type="mark",
+            )
+            if missing_history is None:
+                self._log.warning(
+                    f"{pos.symbol} MFE history pagination incomplete: "
+                    f"start={start_ms} end={end_ms}"
+                )
+                return recent_history, 0
+            missing_history = self._post_entry_history(pos, missing_history)
+            frames = [
+                frame
+                for frame in (missing_history, recent_history)
+                if frame is not None and len(frame) > 0
+            ]
+            if not frames:
+                return recent_history, end_ms
+            history = pd.concat(frames, ignore_index=True)
+            history["ot"] = pd.to_numeric(history["ot"], errors="coerce")
+            history = (
+                history.dropna(subset=["ot"])
+                .drop_duplicates(subset=["ot"], keep="last")
+                .sort_values("ot")
+                .reset_index(drop=True)
+            )
+            return (history, end_ms) if mergeable(history) else (history, 0)
+        except Exception as e:
+            self._log.warning(f"{pos.symbol} MFE history merge failed: {e}")
+            return recent_history, 0
+
+    def _merge_position_excursion(
+        self,
+        pos: Position,
+        history,
+        current_price: float = 0.0,
+        price_source: str = "",
+    ) -> bool:
+        """Merge all available post-entry extrema into durable MFE/MAE."""
+        entry, risk = self._position_r_anchor(pos)
+        if history is None or len(history) == 0 or risk <= 0:
+            return False
+        try:
+            high = float(pd.to_numeric(history["h"], errors="coerce").max())
+            low = float(pd.to_numeric(history["l"], errors="coerce").min())
+        except Exception:
+            return False
+        if not np.isfinite(high) or not np.isfinite(low):
+            return False
+        if pos.direction == "LONG":
+            historical_favorable = (high - entry) / risk
+            historical_adverse = (entry - low) / risk
+            current_r = (float(current_price) - entry) / risk if current_price else 0.0
+        else:
+            historical_favorable = (entry - low) / risk
+            historical_adverse = (high - entry) / risk
+            current_r = (entry - float(current_price)) / risk if current_price else 0.0
+
+        old_mfe = float(getattr(pos, "max_favorable_r", 0.0) or 0.0)
+        old_mae = float(getattr(pos, "max_adverse_r", 0.0) or 0.0)
+        source_changed = bool(
+            price_source
+            and str(getattr(pos, "excursion_price_source", "") or "") != price_source
+        )
+        if source_changed:
+            new_mfe = max(0.0, current_r, historical_favorable)
+            new_mae = max(0.0, historical_adverse)
+        else:
+            new_mfe = max(old_mfe, 0.0, current_r, historical_favorable)
+            new_mae = max(old_mae, 0.0, historical_adverse)
+        pos.max_favorable_r = new_mfe
+        pos.max_adverse_r = new_mae
+        if price_source:
+            pos.excursion_price_source = price_source
+        return (
+            source_changed
+            or abs(new_mfe - old_mfe) > 1e-12
+            or abs(new_mae - old_mae) > 1e-12
+        )
+
+    def _protection_recovery_target(self, pos: Position) -> tuple:
+        """Return the strongest tighten-only startup protection target and stage."""
+        entry, risk = self._position_r_anchor(pos)
+        current_sl = float(pos.current_sl)
+        if entry <= 0 or risk <= 0:
+            return current_sl, ""
+        protect_r = float(getattr(pos, "max_favorable_r", 0.0) or 0.0)
+        target = current_sl
+        stage = ""
+        half_trigger = max(
+            0.0,
+            float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+        )
+        if half_trigger > 0 and protect_r >= half_trigger:
+            half_target = entry - risk * 0.5 if pos.direction == "LONG" else entry + risk * 0.5
+            target = max(target, half_target) if pos.direction == "LONG" else min(target, half_target)
+            stage = "half"
+
+        early_enabled = bool(getattr(self.cfg, "enable_early_protect", True))
+        early_trigger = max(
+            0.1,
+            float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
+        )
+        if early_enabled and protect_r >= early_trigger:
+            lock_r = max(
+                0.0,
+                float(getattr(self.cfg, "early_protect_lock_r", 0.0) or 0.0),
+            )
+            early_target = entry + risk * lock_r if pos.direction == "LONG" else entry - risk * lock_r
+            target = max(target, early_target) if pos.direction == "LONG" else min(target, early_target)
+            stage = "early"
+        return target, stage
+
+    def _stop_result_confirmed(self, pos: Position, result) -> bool:
+        if bool(getattr(self.cfg, "testnet", False)) and str(
+            getattr(self.cfg, "exchange", "")
+        ).lower() == "binance":
+            return True
+        if str(getattr(self.cfg, "exchange", "")).lower() == "bitget":
+            if getattr(pos, "tracking_no", ""):
+                return result is not None
+            return isinstance(result, dict) and bool(result.get("orderId"))
+        return bool(result)
+
+    def _cancel_result_confirmed(self, result) -> bool:
+        if bool(getattr(self.cfg, "testnet", False)) and str(
+            getattr(self.cfg, "exchange", "")
+        ).lower() == "binance":
+            return True
+        return result is not None
+
+    def _remember_active_stop(self, symbol: str, result) -> None:
+        if not isinstance(result, dict) or not result.get("orderId"):
+            return
+        if not hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids = {}
+        self.client._active_stop_ids[symbol] = str(result["orderId"])
+
+    def _cancel_protective_stop(self, pos: Position):
+        try:
+            return self.client.cancel_all_orders(pos.symbol)
+        except Exception as e:
+            self._log.error(
+                f"保护止损撤单异常: {pos.symbol} action=cancel_exception error={e}"
+            )
+            return None
+
+    def _recover_uncertain_stop_tracking(self, pos: Position) -> bool:
+        """Resolve a crash-window Bitget stop before any replacement is attempted."""
+        state = str(getattr(pos, "stop_replace_state", "") or "")
+        uncertain_states = (
+            "canceling_old_stop",
+            "placing_new_stop",
+            "retry_pending_untracked_stop",
+            "retry_pending_unprotected",
+        )
+        if str(getattr(self.cfg, "exchange", "")).lower() != "bitget":
+            return True
+
+        if not hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids = {}
+        tracked_stop_id = self.client._active_stop_ids.get(pos.symbol)
+        needs_untracked_reconcile = (
+            not tracked_stop_id
+            and not str(getattr(pos, "tracking_no", "") or "")
+        )
+        if state not in uncertain_states and not needs_untracked_reconcile:
+            return True
+
+        getter = getattr(self.client, "get_pending_plan_orders", None)
+        if not callable(getter):
+            self._log.critical(
+                f"保护止损不确定状态无法核对: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+        try:
+            pending = getter(pos.symbol)
+        except Exception as e:
+            self._log.critical(
+                f"保护止损不确定状态核对异常: {pos.symbol} "
+                f"action=critical_retry_pending state={state} error={e}"
+            )
+            return False
+        if pending is None:
+            self._log.critical(
+                f"保护止损不确定状态核对未确认: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+
+        if not isinstance(pending, list) or any(
+            not isinstance(order, dict)
+            or not str(order.get("orderId", "") or "")
+            for order in pending
+        ):
+            self._log.critical(
+                f"保护止损不确定状态返回畸形计划单: {pos.symbol} "
+                f"action=critical_retry_pending state={state}"
+            )
+            return False
+        live_ids = sorted({
+            str(order["orderId"])
+            for order in pending
+        })
+        if len(live_ids) > 1:
+            self._log.critical(
+                f"保护止损发现多张未决计划单: {pos.symbol} "
+                f"action=critical_retry_pending ids={','.join(live_ids)}"
+            )
+            return False
+        if live_ids:
+            self.client._active_stop_ids[pos.symbol] = live_ids[0]
+            self._log.warning(
+                f"保护止损恢复崩溃窗口ID: {pos.symbol} "
+                f"state={state} active_stop_id={live_ids[0]}"
+            )
+        else:
+            self.client._active_stop_ids.pop(pos.symbol, None)
+            self._log.warning(
+                f"保护止损恢复确认无活动计划单: {pos.symbol} state={state}"
+            )
+        return True
+
+    def _submit_protective_stop(self, pos: Position, stop_price: float) -> tuple:
+        side = "SELL" if pos.direction == "LONG" else "BUY"
+        try:
+            result = self.client.stop_order(
+                pos.symbol,
+                side,
+                round(stop_price, 8),
+                round(pos.quantity, 8),
+                tracking_no=pos.tracking_no,
+            )
+        except Exception as e:
+            self._log.error(
+                f"保护止损挂单异常: {pos.symbol} action=place_exception "
+                f"stop={stop_price:.8f} error={e}"
+            )
+            result = None
+        confirmed = self._stop_result_confirmed(pos, result)
+        if confirmed:
+            self._remember_active_stop(pos.symbol, result)
+        return result, confirmed
+
+    def _rollback_protective_stop(
+        self,
+        pos: Position,
+        old_sl: float,
+        desired_sl: float,
+        stop_result,
+    ) -> bool:
+        rollback_result, restored = self._submit_protective_stop(pos, old_sl)
+        pos.current_sl = old_sl
+        if restored:
+            pos.stop_replace_state = "rollback_restored"
+            persisted = self._save_positions()
+            self._log.error(
+                f"保护止损换单待重试: {pos.symbol} action=retry_pending rollback=restored "
+                f"SL保持{old_sl:.4f}, 目标{desired_sl:.4f}, stop_result={stop_result}"
+            )
+            if not persisted:
+                self._log.critical(
+                    f"保护止损回滚ID持久化失败: {pos.symbol} action=critical_retry_pending "
+                    f"rollback_result={rollback_result}"
+                )
+            return False
+
+        pos.stop_replace_state = "retry_pending_unprotected"
+        self._save_positions()
+        self._log.critical(
+            f"保护止损换单严重失败: {pos.symbol} action=critical_retry_pending "
+            f"new_sl={desired_sl:.4f} rollback_sl={old_sl:.4f} "
+            f"stop_result={stop_result} rollback_result={rollback_result}"
+        )
+        return False
+
+    def _replace_protective_stop(
+        self,
+        pos: Position,
+        desired_sl: float,
+        rollback_sl: Optional[float] = None,
+    ) -> bool:
+        """Cancel, persist transition, place, and rollback as one stop transaction."""
+        old_sl = float(pos.current_sl if rollback_sl is None else rollback_sl)
+        desired_sl = float(desired_sl)
+        if self.client is None:
+            pos.current_sl = desired_sl
+            pos.stop_replace_state = ""
+            return True
+
+        if not self._recover_uncertain_stop_tracking(pos):
+            return False
+
+        # Persist both the latest MFE and the recoverable pre-cancel transaction state.
+        previous_state = str(getattr(pos, "stop_replace_state", "") or "")
+        pos.stop_replace_state = "canceling_old_stop"
+        if not self._save_positions():
+            pos.stop_replace_state = previous_state
+            self._log.error(
+                f"保护止损换单阻止: {pos.symbol} action=persist_failed_before_cancel"
+            )
+            return False
+
+        stop_ids = getattr(self.client, "_active_stop_ids", None)
+        old_stop_id = stop_ids.get(pos.symbol) if isinstance(stop_ids, dict) else None
+        cancel_result = self._cancel_protective_stop(pos)
+        if not self._cancel_result_confirmed(cancel_result):
+            if old_stop_id:
+                if not hasattr(self.client, "_active_stop_ids"):
+                    self.client._active_stop_ids = {}
+                self.client._active_stop_ids[pos.symbol] = old_stop_id
+            self._log.error(
+                f"保护止损换单阻止: {pos.symbol} action=cancel_unconfirmed "
+                f"tracked_stop_id={old_stop_id or ''}"
+            )
+            return False
+
+        if hasattr(self.client, "_active_stop_ids"):
+            self.client._active_stop_ids.pop(pos.symbol, None)
+        pos.stop_replace_state = "placing_new_stop"
+        if not self._save_positions():
+            self._log.critical(
+                f"保护止损过渡状态持久化失败: {pos.symbol} action=critical_retry_pending"
+            )
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, "transition_persist_failed"
+            )
+
+        stop_result, applied = self._submit_protective_stop(pos, desired_sl)
+        if not applied:
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, stop_result
+            )
+
+        pos.current_sl = desired_sl
+        pos.stop_replace_state = ""
+        if self._save_positions():
+            return True
+
+        # Do not leave a successfully placed but untracked orphan after a save failure.
+        cancel_new = self._cancel_protective_stop(pos)
+        if self._cancel_result_confirmed(cancel_new):
+            if hasattr(self.client, "_active_stop_ids"):
+                self.client._active_stop_ids.pop(pos.symbol, None)
+            return self._rollback_protective_stop(
+                pos, old_sl, desired_sl, "new_stop_persist_failed"
+            )
+        pos.stop_replace_state = "retry_pending_untracked_stop"
+        self._save_positions()
+        self._log.critical(
+            f"保护止损新单持久化且撤销均失败: {pos.symbol} "
+            f"action=critical_retry_pending stop_result={stop_result}"
+        )
+        return False
+
     def _save_positions(self):
-        """持久化当前持仓 + 活动止损单ID到文件"""
+        """Atomically persist positions and active stop IDs."""
+        tmp_path = None
         try:
             data = []
             stop_ids = getattr(self.client, '_active_stop_ids', {}) if self.client else {}
             for p in self.positions:
+                initial_entry_price, initial_risk_per_unit = self._position_r_anchor(p)
                 entry = {
                     "symbol": p.symbol, "direction": p.direction,
                     "entry_price": p.entry_price, "quantity": p.quantity,
                     "sl_price": p.sl_price, "current_sl": p.current_sl,
                     "risk_usdt": p.risk_usdt, "signal_score": p.signal_score,
                     "entry_time": p.entry_time.isoformat() if p.entry_time else "",
+                    "initial_entry_price": initial_entry_price,
+                    "initial_risk_per_unit": initial_risk_per_unit,
+                    "half_risk_protected": bool(getattr(p, "half_risk_protected", False)),
                     "breakeven_triggered": p.breakeven_triggered,
                     "breakeven_cooldown": p.breakeven_cooldown,
                     "partial_tp_triggered": p.partial_tp_triggered,
@@ -4334,6 +5677,8 @@ class SqueezeBreakoutBot:
                     "source_strategy": getattr(p, "source_strategy", ""),
                     "max_favorable_r": p.max_favorable_r,
                     "max_adverse_r": p.max_adverse_r,
+                    "last_mfe_check_ms": int(getattr(p, "last_mfe_check_ms", 0) or 0),
+                    "excursion_price_source": getattr(p, "excursion_price_source", ""),
                     "time_stop_armed": p.time_stop_armed,
                     "time_stop_armed_at": p.time_stop_armed_at.isoformat() if getattr(p, "time_stop_armed_at", None) else "",
                     "time_stop_watch": bool(getattr(p, "time_stop_watch", False)),
@@ -4351,13 +5696,36 @@ class SqueezeBreakoutBot:
                     "target_distance_pct": getattr(p, "target_distance_pct", 0.0),
                     "target_zone_bars_ago": getattr(p, "target_zone_bars_ago", 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                     "active_stop_id": stop_ids.get(p.symbol, ""),
+                    "stop_replace_state": str(getattr(p, "stop_replace_state", "") or ""),
                 }
                 data.append(entry)
-            with open(getattr(self, '_positions_path', 'positions.json'), "w") as f:
-                json.dump(data, f, indent=2)
+            path = Path(getattr(self, '_positions_path', 'positions.json'))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                json.dump(data, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            return True
         except Exception as e:
             self._log.error(f"保存持仓失败: {e}")
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return False
 
     def _restore_stop_ids(self):
         """从持仓文件恢复 active_stop_ids (跨重启去重)"""
@@ -4381,6 +5749,7 @@ class SqueezeBreakoutBot:
             with open(getattr(self, '_positions_path', 'positions.json')) as f:
                 data = json.load(f)
             loaded = []
+            entry_choppy_audits = self._entry_choppy_audit_map()
             for d in data:
                 pos = Position(
                     symbol=d["symbol"], direction=d["direction"],
@@ -4389,7 +5758,10 @@ class SqueezeBreakoutBot:
                     risk_usdt=d.get("risk_usdt", 0), signal_score=d.get("signal_score", 0),
                     initial_band_hi=d.get("initial_band_hi", d["entry_price"]*1.02),
                     initial_band_lo=d.get("initial_band_lo", d["entry_price"]*0.98),
+                    initial_entry_price=float(d.get("initial_entry_price", 0.0) or 0.0),
+                    initial_risk_per_unit=float(d.get("initial_risk_per_unit", 0.0) or 0.0),
                 )
+                pos.half_risk_protected = bool(d.get("half_risk_protected", False))
                 pos.breakeven_triggered = d.get("breakeven_triggered", False)
                 pos.breakeven_cooldown = d.get("breakeven_cooldown", 0)
                 pos.partial_tp_triggered = d.get("partial_tp_triggered", False)
@@ -4400,6 +5772,9 @@ class SqueezeBreakoutBot:
                 pos.source_interval = d.get('source_interval', '15m')
                 pos.max_favorable_r = float(d.get('max_favorable_r', 0.0) or 0.0)
                 pos.max_adverse_r = float(d.get('max_adverse_r', 0.0) or 0.0)
+                pos.last_mfe_check_ms = int(d.get('last_mfe_check_ms', 0) or 0)
+                pos.excursion_price_source = str(d.get('excursion_price_source', '') or '')
+                pos.stop_replace_state = str(d.get('stop_replace_state', '') or '')
                 pos.btc_regime_fields = d.get('btc_regime_fields', {}) or {k: v for k, v in d.items() if str(k).startswith('btc_')}
                 pos.signal_key = d.get('signal_key', '')
                 raw_strategy = str(d.get('source_strategy', '') or '').strip().lower()
@@ -4413,6 +5788,13 @@ class SqueezeBreakoutBot:
                 pos.target_distance_pct = float(d.get('target_distance_pct', 0.0) or 0.0)
                 pos.target_zone_bars_ago = int(d.get('target_zone_bars_ago', 0) or 0)
                 pos.hermes_confirm = self._public_hermes_confirm(d.get('hermes_confirm', {}))
+                pos.choppy_filter = self._position_choppy_filter(d.get('choppy_filter', {}))
+                pos.daily_pattern = self._position_daily_pattern(d.get('daily_pattern', {}))
+                if not pos.choppy_filter.get("recorded"):
+                    pos.choppy_filter = entry_choppy_audits.get(
+                        (pos.symbol, pos.signal_key),
+                        entry_choppy_audits.get((pos.symbol, ""), pos.choppy_filter),
+                    )
                 raw_armed_at = d.get('time_stop_armed_at', '')
                 pos.time_stop_armed_at = datetime.fromisoformat(raw_armed_at) if raw_armed_at else None
                 pos.time_stop_armed = True
@@ -4449,6 +5831,7 @@ class SqueezeBreakoutBot:
                             exchange_positions.append(symbol)
                             existing_pos = next((pp for pp in self.positions if pp.symbol == symbol), None)
                             if existing_pos is not None:
+                                self._position_r_anchor(existing_pos)
                                 old_entry = float(getattr(existing_pos, "entry_price", 0.0) or 0.0)
                                 if entry_price > 0:
                                     existing_pos.entry_price = entry_price
@@ -4537,23 +5920,43 @@ class SqueezeBreakoutBot:
                                     et = datetime.fromtimestamp(open_ms/1000, tz=timezone.utc) + timedelta(hours=8)
                             except:
                                 pass
-                            # 计算实际风险 (qty × SL距离), 超标时用配置风险做保本/锁利参考
-                            actual_risk = qty * abs(entry_price - sl_price)
-                            sync_risk = self.get_risk_for_interval(restore_interval)
-                            ref_risk = round(min(actual_risk, sync_risk), 2)
-                            if actual_risk > sync_risk * 1.1:
-                                self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
-                                                f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
                             initial_sl_price = getattr(matched_local, 'initial_sl', 0.0) if matched_local else 0.0
                             if not initial_sl_price:
                                 initial_sl_price = sl_price
+                            if matched_local:
+                                initial_entry_price, initial_risk_per_unit = self._position_r_anchor(
+                                    matched_local
+                                )
+                            else:
+                                initial_entry_price = entry_price
+                                initial_risk_per_unit = abs(
+                                    initial_entry_price - initial_sl_price
+                                )
+                            actual_risk = qty * initial_risk_per_unit
+                            sync_risk = self.get_risk_for_interval(restore_interval)
+                            persisted_risk = float(
+                                getattr(matched_local, "risk_usdt", 0.0) or 0.0
+                            ) if matched_local else 0.0
+                            ref_risk = round(
+                                persisted_risk if persisted_risk > 0 else min(actual_risk, sync_risk),
+                                2,
+                            )
+                            if actual_risk > sync_risk * 1.1:
+                                self._log.warning(f"[合约同步] {symbol} 恢复后风险${actual_risk:.2f}远超预算${self.cfg.risk_per_trade}, "
+                                                f"SL={sl_price:.4f} 距入场{abs(entry_price-sl_price):.4f}, 保本参考${ref_risk}")
                             pos = Position(
                                 symbol=symbol, direction=direction, entry_price=entry_price,
                                 entry_time=et, quantity=qty,
                                 sl_price=initial_sl_price, initial_sl=initial_sl_price, current_sl=sl_price,
                                 risk_usdt=ref_risk, signal_score=0,
                                 initial_band_hi=entry_price*1.02, initial_band_lo=entry_price*0.98,
+                                initial_entry_price=initial_entry_price,
+                                initial_risk_per_unit=initial_risk_per_unit,
                                 source_interval=restore_interval,
+                            )
+                            pos.half_risk_protected = (
+                                bool(getattr(matched_local, "half_risk_protected", False))
+                                if matched_local else False
                             )
                             pos.breakeven_triggered = breached
                             pos.breakeven_cooldown = matched_local.breakeven_cooldown if (breached and matched_local) else 0
@@ -4562,6 +5965,9 @@ class SqueezeBreakoutBot:
                             pos.lowest_price = getattr(matched_local, 'lowest_price', 999999.0) if matched_local else 999999.0
                             pos.max_favorable_r = getattr(matched_local, 'max_favorable_r', 0.0) if matched_local else 0.0
                             pos.max_adverse_r = getattr(matched_local, 'max_adverse_r', 0.0) if matched_local else 0.0
+                            pos.last_mfe_check_ms = getattr(matched_local, 'last_mfe_check_ms', 0) if matched_local else 0
+                            pos.excursion_price_source = getattr(matched_local, 'excursion_price_source', '') if matched_local else ''
+                            pos.stop_replace_state = getattr(matched_local, 'stop_replace_state', '') if matched_local else ''
                             pos.source_strategy = getattr(matched_local, 'source_strategy', '') if matched_local else ''
                             pos.signal_key = getattr(matched_local, 'signal_key', '') if matched_local else ''
                             if not pos.source_strategy:
@@ -4577,6 +5983,9 @@ class SqueezeBreakoutBot:
                             pos.target_zone_bars_ago = getattr(matched_local, 'target_zone_bars_ago', 0) if matched_local else 0
                             self._refresh_target_metrics(pos)
                             pos.hermes_confirm = self._public_hermes_confirm(getattr(matched_local, 'hermes_confirm', {}) if matched_local else {})
+                            pos.daily_pattern = self._position_daily_pattern(
+                                getattr(matched_local, 'daily_pattern', {}) if matched_local else {}
+                            )
                             pos.time_stop_armed = True
                             pos.time_stop_armed_at = getattr(matched_local, 'time_stop_armed_at', None) if matched_local else None
                             pos.time_stop_watch = getattr(matched_local, 'time_stop_watch', False) if matched_local else False
@@ -4599,13 +6008,6 @@ class SqueezeBreakoutBot:
                             pos._exchange_position_synced = True
                             self.positions.append(pos)
                             self._log.info(f"{symbol} restore source_interval={restore_interval}")
-                            # 恢复持仓后立即挂止损单到交易所
-                            sl_side = "SELL" if direction == "LONG" else "BUY"
-                            sl_result = self.client.stop_order(symbol, sl_side, round(sl_price, 8), round(qty, 8))
-                            if sl_result:
-                                self._log.info(f"{symbol} 止损单确认已挂 SL={sl_price:.4f} id={sl_result.get('orderId','?')}")
-                            else:
-                                self._log.warning(f"{symbol} 止损单挂单失败, bot内部兜底 SL={sl_price:.4f}")
                             self._log.warning(f"[合约同步] {symbol} {direction} 价{entry_price} 量{qty} "
                                             f"SL={sl_price:.4f} 风险${actual_risk:.2f}")
                 except Exception as e:
@@ -4672,15 +6074,91 @@ class SqueezeBreakoutBot:
         self.positions = deduped
 
         if self.positions:
-            # 给所有持仓补挂止损单 (stop_order 内部已去重, 不会重复创建)
+            # web_ui预加载和交易所新重建统一走同一条：先补全MFE并收紧，再只挂一次。
             if self.client is not None and self.cfg.market_type == "futures":
-                self._log.info(f"开始补挂止损: 共{len(self.positions)}个持仓")
-                for pos in self.positions:
-                    try:
-                        sl_side = "SELL" if pos.direction == "LONG" else "BUY"
-                        self.client.stop_order(pos.symbol, sl_side, round(pos.current_sl, 8), round(pos.quantity, 8))
-                    except Exception as e:
-                        self._log.error(f"{pos.symbol} 补挂止损异常: {e}")
+                self._log.info(f"开始恢复保护止损: 共{len(self.positions)}个持仓")
+            for pos in self.positions:
+                self._position_r_anchor(pos)
+                try:
+                    interval = str(
+                        getattr(pos, "source_interval", "")
+                        or getattr(self.cfg, "scan_interval", "15m")
+                    ).split(",")[0].strip() or "15m"
+                    recovery_df = fetch_klines(
+                        pos.symbol,
+                        interval,
+                        100,
+                        exchange=self.cfg.exchange,
+                        market_type=self.cfg.market_type,
+                        testnet=self.cfg.testnet,
+                        price_type="mark",
+                    )
+                    if recovery_df is not None and len(recovery_df) > 0:
+                        recovered_price = float(recovery_df["c"].iloc[-1])
+                        if float(getattr(pos, "current_price", 0.0) or 0.0) <= 0:
+                            pos.current_price = recovered_price
+                    price_source = (
+                        "mark"
+                        if self.cfg.exchange == "binance"
+                        and self.cfg.market_type == "futures"
+                        else ""
+                    )
+                    history, history_end_ms = self._history_with_unobserved_excursion(
+                        pos,
+                        interval,
+                        recovery_df,
+                        price_source,
+                    )
+                    old_price_source = str(
+                        getattr(pos, "excursion_price_source", "") or ""
+                    )
+                    merge_price_source = (
+                        price_source if history_end_ms > 0 else old_price_source
+                    )
+                    self._merge_position_excursion(
+                        pos,
+                        history,
+                        float(getattr(pos, "current_price", 0.0) or 0.0),
+                        merge_price_source,
+                    )
+                    if history_end_ms > 0:
+                        pos.last_mfe_check_ms = history_end_ms
+                except Exception as e:
+                    self._log.warning(f"{pos.symbol} 启动MFE恢复失败: {e}")
+
+                old_sl = float(pos.current_sl)
+                target_sl, stage = self._protection_recovery_target(pos)
+                current_market = float(getattr(pos, "current_price", 0.0) or 0.0)
+                valid_target = (
+                    current_market <= 0
+                    or (pos.direction == "LONG" and target_sl < current_market)
+                    or (pos.direction == "SHORT" and target_sl > current_market)
+                )
+                if target_sl != old_sl and not valid_target:
+                    self._log.warning(
+                        f"{pos.symbol} 启动保护跳过: action=invalid_price_side "
+                        f"current={current_market:.8f} target={target_sl:.8f}"
+                    )
+                    target_sl = old_sl
+                    stage = ""
+
+                if self.client is not None and self.cfg.market_type == "futures":
+                    applied = self._replace_protective_stop(
+                        pos,
+                        target_sl,
+                        rollback_sl=old_sl,
+                    )
+                else:
+                    pos.current_sl = target_sl
+                    applied = True
+                if applied and stage:
+                    pos.half_risk_protected = True
+                    if stage == "early":
+                        pos.breakeven_triggered = True
+                        pos.breakeven_cooldown = max(
+                            3, int(getattr(pos, "breakeven_cooldown", 0) or 0)
+                        )
+                    self._save_positions()
             # 恢复后保留原始止损价(分型止损), 仅刷新市场数据供UI显示
             for pos in self.positions:
                 if self.cfg.market_type == "futures" and getattr(pos, "_exchange_position_synced", False):
@@ -4698,7 +6176,7 @@ class SqueezeBreakoutBot:
                 except Exception as e:
                     self._log.warning(f"刷新{pos.symbol}失败: {e}")
             self.status_text = f"已恢复 {len(self.positions)} 个持仓"
-            # 重启不重挂止损单 (计划委托在交易所持久保留)
+            # 持久化恢复后的固定R、MFE与最终活动止损ID。
             self._save_positions()
 
     def _init_client(self):
@@ -4879,32 +6357,81 @@ class SqueezeBreakoutBot:
 
         return quantity, position_usdt, actual_risk
 
-    def _floor_qty(self, symbol, qty):
+    def _floor_qty(self, symbol, qty, market_order=True):
         """按交易对精度向下取整 (floor), 受交易所minQty/maxQty/step约束"""
         import math
         try:
             info = self.client.get_symbol_info(symbol)
             if info:
-                for f in info.get("filters", []):
-                    if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                        step = float(f["stepSize"])
-                        min_qty = float(f.get("minQty", step))
-                        max_qty = float(f.get("maxQty", 0))  # 0 = 不限
-                        decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
-                        floored = round(math.floor(qty / step) * step, decimals)
-                        if max_qty > 0 and floored > max_qty:
-                            floored = math.floor(max_qty / step) * step
-                            self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
-                        if floored < min_qty:
-                            self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
-                            return 0
-                        return floored
+                filters = {
+                    f.get("filterType"): f
+                    for f in info.get("filters", [])
+                    if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE")
+                }
+                preferred = "MARKET_LOT_SIZE" if market_order else "LOT_SIZE"
+                f = filters.get(preferred) or filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE")
+                if f:
+                    step = float(f["stepSize"])
+                    min_qty = float(f.get("minQty", step))
+                    max_qty = float(f.get("maxQty", 0))  # 0 = 不限
+                    decimals = max(0, min(8, len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0))
+                    floored = round(math.floor(qty / step) * step, decimals)
+                    if max_qty > 0 and floored > max_qty:
+                        floored = math.floor(max_qty / step) * step
+                        self._log.info(f"{symbol} 数量超交易所上限, 限制至{floored}")
+                    if floored < min_qty:
+                        self._log.warning(f"{symbol} 安全数量{floored:.6f}<最小{min_qty}, 仓位过小")
+                        return 0
+                    return floored
         except:
             pass
         if qty > 100: return math.floor(qty * 10) / 10
         if qty > 1: return math.floor(qty * 1000) / 1000
         if qty > 0.01: return math.floor(qty * 100000) / 100000
         return math.floor(qty * 100000000) / 100000000
+
+    def _prepare_futures_entry(self, symbol, entry_price, sl_price, qty):
+        """下市价单前应用Binance杠杆和最大名义价值约束。"""
+        entry_price = float(entry_price or 0.0)
+        sl_price = float(sl_price or 0.0)
+        qty = float(qty or 0.0)
+        pos_usdt = qty * entry_price
+        risk = qty * abs(entry_price - sl_price)
+        requested = max(1, int(float(getattr(self.cfg, "leverage", 1) or 1)))
+        meta = {
+            "requested_leverage": requested,
+            "effective_leverage": requested,
+            "max_notional_value": 0.0,
+        }
+        if self.client is None or self.cfg.market_type != "futures":
+            return qty, pos_usdt, risk, meta
+        if str(getattr(self.cfg, "exchange", "") or "").lower() != "binance":
+            self.client.set_leverage(symbol, requested)
+            return qty, pos_usdt, risk, meta
+
+        result = self.client.set_compatible_leverage(symbol, requested)
+        if not result:
+            meta["reason"] = "leverage_unavailable"
+            return 0.0, 0.0, 0.0, meta
+        if isinstance(result, dict):
+            meta["effective_leverage"] = int(float(result.get("leverage") or requested))
+            try:
+                meta["max_notional_value"] = float(result.get("maxNotionalValue") or 0.0)
+            except (TypeError, ValueError):
+                meta["max_notional_value"] = 0.0
+
+        max_notional = meta["max_notional_value"]
+        if max_notional > 0 and pos_usdt > max_notional * 0.98:
+            qty = self._floor_qty(symbol, max_notional * 0.98 / entry_price)
+            pos_usdt = qty * entry_price
+            risk = qty * abs(entry_price - sl_price)
+            meta["notional_capped"] = True
+        else:
+            meta["notional_capped"] = False
+        if qty <= 0:
+            meta["reason"] = "qty_too_small_after_leverage"
+            return 0.0, 0.0, 0.0, meta
+        return qty, pos_usdt, risk, meta
 
     # ========== 风控检查 ==========
     def _check_risk_limits(self) -> bool:
@@ -4934,9 +6461,13 @@ class SqueezeBreakoutBot:
 
         return True
 
-    def enter_rj_position(self, signal: dict) -> Optional[Position]:
-        """RJ-only demo entry: bypass structure-chain checks, keep shared sizing/exit/risk engine."""
-        signal["source_strategy"] = "rj_only"
+    def _enter_key_candle_position(self, signal: dict, source_strategy: str) -> Optional[Position]:
+        """Shared key-candle entry path for RJ-only and Predicta/EWO."""
+        source_strategy = str(source_strategy or "").strip().lower()
+        if source_strategy not in ("rj_only", "predicta_ewo"):
+            return None
+        strategy_label = "RJ-only" if source_strategy == "rj_only" else "Predicta/EWO"
+        signal["source_strategy"] = source_strategy
         symbol = signal.get("symbol", "")
         direction = signal.get("direction", "")
         signal_interval = str(signal.get("source_interval") or getattr(self.cfg, "scan_interval", "30m")).split(",")[0].strip() or "30m"
@@ -4950,7 +6481,7 @@ class SqueezeBreakoutBot:
                 "consecutive_losses": self.consecutive_losses,
             }))
             return None
-        if not signal.get("rj_only_stats_pass", True):
+        if source_strategy == "rj_only" and not signal.get("rj_only_stats_pass", True):
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "rj_only_stats_failed",
                 "stats_reason": signal.get("rj_only_stats_reason", ""),
@@ -4963,7 +6494,7 @@ class SqueezeBreakoutBot:
             }))
             return None
         if self.client is None and self.cfg.mode != "paper":
-            self._log.warning("RJ-only未配置测试网API, 无法真实模拟下单")
+            self._log.warning(f"{strategy_label}未配置测试网API, 无法真实模拟下单")
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "api_not_configured",
                 "mode": self.cfg.mode,
@@ -4987,27 +6518,41 @@ class SqueezeBreakoutBot:
             }))
             return None
 
-        lookback = max(220, min(1000, int(getattr(self.cfg, "rj_only_stats_lookback_bars", 1000) or 1000)))
-        df = fetch_klines(symbol, signal_interval, lookback, exchange=self.cfg.exchange)
-        if df is None or len(df) < 60:
+        lookback = (
+            max(220, min(1000, int(getattr(self.cfg, "rj_only_stats_lookback_bars", 1000) or 1000)))
+            if source_strategy == "rj_only" else 160
+        )
+        df = fetch_klines(
+            symbol, signal_interval, lookback,
+            exchange=self.cfg.exchange,
+            closed_only=True,
+        )
+        if df is None or len(df) < 40:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                 "reason": "kline_fetch_failed",
                 "kline_len": len(df) if df is not None else 0,
             }))
             return None
-        if bool(getattr(self.cfg, "rj_only_volume_filter", True)):
+        if source_strategy == "rj_only" and bool(getattr(self.cfg, "rj_only_volume_filter", True)):
             if not signal.get("rj_volume_filter_pass", True):
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                     "reason": "rj_volume_filter_failed",
                     "interval": signal_interval,
                 }))
                 return None
+        if self._attach_daily_pattern_for_entry(
+            signal,
+            source_strategy,
+            decision_time=int(time.time() * 1000),
+        ):
+            return None
         entry_price = float(signal.get("price") or df["c"].iloc[-1])
-        rj_stop_raw = signal.get("rj_only_stop_price")
-        sl_price = float(rj_stop_raw or 0.0)
+        stop_field = "rj_only_stop_price" if source_strategy == "rj_only" else "predicta_stop_price"
+        stop_raw = signal.get(stop_field)
+        sl_price = float(stop_raw or 0.0)
         if entry_price <= 0 or sl_price <= 0:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
-                "reason": "missing_rj_only_stop_price" if not rj_stop_raw else "invalid_rj_sl",
+                "reason": f"missing_{stop_field}" if not stop_raw else "invalid_key_candle_sl",
                 "entry": entry_price,
                 "sl": sl_price,
             }))
@@ -5041,12 +6586,22 @@ class SqueezeBreakoutBot:
                 "rj_setup_key": setup_key,
             }))
             return None
+        failed_key = self._failed_signal_key(signal_keys)
+        if failed_key:
+            self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                "reason": "order_failed_cooldown",
+                "interval": signal_interval,
+                "signal_key": signal_key,
+                "failed_key": failed_key,
+            }))
+            return None
 
-        rj_min_stop_pct = max(0.0, float(getattr(self.cfg, "rj_only_min_stop_pct", 0.003) or 0.0))
+        min_stop_field = "rj_only_min_stop_pct" if source_strategy == "rj_only" else "predicta_min_stop_pct"
+        key_min_stop_pct = max(0.0, float(getattr(self.cfg, min_stop_field, 0.003) or 0.0))
         qty, pos_usdt, risk = self.calc_position_size(
             symbol, direction, entry_price, sl_price,
             source_interval=signal_interval,
-            min_stop_pct=rj_min_stop_pct,
+            min_stop_pct=key_min_stop_pct,
         )
         if qty <= 0:
             self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
@@ -5089,6 +6644,7 @@ class SqueezeBreakoutBot:
             }))
             return None
 
+        leverage_meta = {}
         if self.client is not None:
             info = self.client.get_symbol_info(symbol)
             if info is None or (isinstance(info, dict) and info.get("status") == "BREAK"):
@@ -5099,6 +6655,18 @@ class SqueezeBreakoutBot:
                     "testnet": self.cfg.testnet,
                 }))
                 return None
+            if self.cfg.market_type == "futures":
+                qty, pos_usdt, risk, leverage_meta = self._prepare_futures_entry(
+                    symbol, entry_price, sl_price, qty
+                )
+                if qty <= 0:
+                    self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
+                        "reason": leverage_meta.get("reason", "leverage_unavailable"),
+                        "entry": entry_price,
+                        "sl": sl_price,
+                        **leverage_meta,
+                    }))
+                    return None
             if pos_usdt < 5.5 and self.cfg.market_type == "futures":
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
                     "reason": "min_notional",
@@ -5106,10 +6674,11 @@ class SqueezeBreakoutBot:
                     "min_notional": 5.5,
                 }))
                 return None
-            if self.cfg.market_type == "futures":
-                self.client.set_leverage(symbol, self.cfg.leverage)
 
-        hermes_state = self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
+        hermes_state = (
+            self._hermes_confirm_entry(signal, df, entry_price, sl_price, qty, pos_usdt, risk)
+            if source_strategy == "rj_only" else {"active": False, "pass": True}
+        )
         if hermes_state.get("active"):
             event_type = "hermes_confirm_pass" if hermes_state.get("pass") else "hermes_confirm_block"
             hermes_public = self._public_hermes_confirm(hermes_state)
@@ -5150,6 +6719,7 @@ class SqueezeBreakoutBot:
             "exchange": self.cfg.exchange,
             "mode": self.cfg.mode,
             "testnet": self.cfg.testnet,
+            **leverage_meta,
         }))
 
         fill_price = entry_price
@@ -5158,7 +6728,7 @@ class SqueezeBreakoutBot:
             side = "BUY" if direction == "LONG" else "SELL"
             order = self.client.market_order(symbol, side, qty if self.cfg.market_type == "futures" else pos_usdt)
             if order is None or ("orderId" not in str(order) and "trackingNo" not in str(order)):
-                self._log.error(f"RJ-only下单失败({symbol} {direction} qty={qty:.4f} pos=${pos_usdt:.0f}): {order}")
+                self._log.error(f"{strategy_label}下单失败({symbol} {direction} qty={qty:.4f} pos=${pos_usdt:.0f}): {order}")
                 for k in signal_keys:
                     self._mark_signal_failed(k, symbol, direction, signal_interval, signal, response=order)
                 self._append_signal_event("entry_reject", symbol, self._signal_snapshot(signal, {
@@ -5186,11 +6756,11 @@ class SqueezeBreakoutBot:
             try:
                 sl_result = self.client.stop_order(symbol, sl_side, round(sl_price, 8), round(qty, 8), tracking_no=tracking_no)
                 if sl_result:
-                    self._log.info(f"RJ-only交易所止损单已挂: {symbol} {sl_price:.4f}")
+                    self._log.info(f"{strategy_label}交易所止损单已挂: {symbol} {sl_price:.4f}")
                 else:
-                    self._log.warning(f"RJ-only交易所止损单未挂出, bot内部兜底: {symbol} SL={sl_price:.4f}")
+                    self._log.warning(f"{strategy_label}交易所止损单未挂出, bot内部兜底: {symbol} SL={sl_price:.4f}")
             except Exception as e:
-                self._log.error(f"RJ-only[{symbol}] 止损单挂单异常: {e}, 该单目前无交易所止损保护!")
+                self._log.error(f"{strategy_label}[{symbol}] 止损单挂单异常: {e}, 该单目前无交易所止损保护!")
 
         pos = Position(
             symbol=symbol,
@@ -5207,7 +6777,7 @@ class SqueezeBreakoutBot:
             initial_band_lo=initial_band_lo,
             tracking_no=tracking_no,
             source_interval=signal_interval,
-            source_strategy="rj_only",
+            source_strategy=source_strategy,
             btc_regime_fields=btc_regime_fields,
             signal_key=signal_key,
             target_zone_type=target_zone.get("target_zone_type", "none"),
@@ -5218,6 +6788,8 @@ class SqueezeBreakoutBot:
             target_distance_pct=float(target_zone.get("target_distance_pct", 0.0) or 0.0),
             target_zone_bars_ago=int(target_zone.get("target_zone_bars_ago", 0) or 0),
             hermes_confirm=self._public_hermes_confirm(hermes_state),
+            choppy_filter=self._position_choppy_filter(signal),
+            daily_pattern=self._position_daily_pattern(signal.get("daily_pattern", {})),
         )
         pos.time_stop_armed = True
         pos.time_stop_armed_at = pos.entry_time
@@ -5240,18 +6812,25 @@ class SqueezeBreakoutBot:
             "hermes_confirm": self._public_hermes_confirm(hermes_state),
             **target_zone,
             **btc_regime_fields,
+            **leverage_meta,
         }))
         mode_label = "测试网真实模拟" if self.client is not None else "纸笔模拟"
         self._log.info(
-            f"RJ-only{mode_label}开{direction}: {symbol} {signal_interval} "
+            f"{strategy_label}{mode_label}开{direction}: {symbol} {signal_interval} "
             f"entry={fill_price:.6f} SL={sl_price:.6f} "
             f"score={float(signal.get('score', 0.0) or 0.0):.1f} "
             f"hist={signal.get('rj_only_hist_win_rate', 0)}%/{signal.get('rj_only_hist_samples', 0)}样本"
         )
-        self.status_text = f"RJ模拟开仓 {symbol} {direction}"
+        self.status_text = f"{strategy_label}开仓 {symbol} {direction}"
         return pos
 
     # ========== 入场 ==========
+    def enter_rj_position(self, signal: dict) -> Optional[Position]:
+        return self._enter_key_candle_position(signal, "rj_only")
+
+    def enter_predicta_position(self, signal: dict) -> Optional[Position]:
+        return self._enter_key_candle_position(signal, "predicta_ewo")
+
     def enter_position(self, signal: dict) -> Optional[Position]:
         """根据起爆点信号开仓"""
         if not self._check_risk_limits():
@@ -5508,6 +7087,16 @@ class SqueezeBreakoutBot:
         if self.client is not None and self.cfg.market_type == "futures":
             self.client.set_leverage(symbol, self.cfg.leverage)
 
+        source_strategy = str(
+            signal.get("source_strategy", "structure") or "structure"
+        )
+        if self._attach_daily_pattern_for_entry(
+            signal,
+            source_strategy,
+            decision_time=int(time.time() * 1000),
+        ):
+            return None
+
         self._append_signal_event("entry_precheck_pass", symbol, self._signal_snapshot(signal, {
             "reason": "ready_to_order",
             "interval": signal_interval,
@@ -5603,6 +7192,7 @@ class SqueezeBreakoutBot:
             target_r=float(target_zone.get("target_r", 0.0) or 0.0),
             target_distance_pct=float(target_zone.get("target_distance_pct", 0.0) or 0.0),
             target_zone_bars_ago=int(target_zone.get("target_zone_bars_ago", 0) or 0),
+            daily_pattern=self._position_daily_pattern(signal.get("daily_pattern", {})),
         )
         pos.time_stop_armed = True
         pos.time_stop_armed_at = pos.entry_time
@@ -5871,9 +7461,17 @@ class SqueezeBreakoutBot:
         sig_upper = str(getattr(pos, 'signal_key', '') or '').upper()
         return strategy == 'rj_only' or sig_upper.startswith('RJ') or 'RJSETUP' in sig_upper
 
+    @staticmethod
+    def _is_time_stop_exempt_position(pos: Position) -> bool:
+        strategy = str(getattr(pos, 'source_strategy', '') or '').strip().lower()
+        signal_key = str(getattr(pos, 'signal_key', '') or '').upper()
+        return strategy == 'predicta_ewo' or signal_key.startswith('PREDICTA|')
+
     def _time_stop_exit_decision(self, pos: Position, inv: str, elapsed_bars: int,
                                  current_r: Optional[float], min_progress_r: float,
                                  source_label: str) -> Optional[str]:
+        if self._is_time_stop_exempt_position(pos):
+            return None
         if not getattr(self.cfg, 'enable_time_stop', True):
             return None
         if pos.breakeven_triggered or pos.partial_tp_triggered:
@@ -5989,6 +7587,7 @@ class SqueezeBreakoutBot:
         symbol = pos.symbol
         inv = getattr(pos, 'source_interval', self.cfg.scan_interval.split(',')[0] if ',' in self.cfg.scan_interval else self.cfg.scan_interval)
         inv = str(inv or '15m').split(',')[0].strip() or '15m'
+        r_entry, initial_risk = self._position_r_anchor(pos)
         # 未起爆超时先做本地快判: 如果历史最大推进都没到阈值, 不等行情接口直接释放僵尸仓。
         # 若历史曾到过阈值, 继续拉当前价, 按"当前R"决定是否因回落失败而退出。
         if (getattr(self.cfg, 'enable_time_stop', True)
@@ -6000,12 +7599,9 @@ class SqueezeBreakoutBot:
                 quick_r = None
                 try:
                     quick_price = float(getattr(pos, 'current_price', 0.0) or 0.0)
-                    quick_risk = abs(pos.entry_price - pos.initial_sl) if pos.initial_sl > 0 else (
-                        pos.risk_usdt / pos.quantity if pos.quantity > 0 else 0
-                    )
-                    if quick_price > 0 and quick_risk > 0:
-                        quick_r = ((quick_price - pos.entry_price) / quick_risk if pos.direction == 'LONG'
-                                   else (pos.entry_price - quick_price) / quick_risk)
+                    if quick_price > 0 and initial_risk > 0:
+                        quick_r = ((quick_price - r_entry) / initial_risk if pos.direction == 'LONG'
+                                   else (r_entry - quick_price) / initial_risk)
                 except:
                     quick_r = None
                 if quick_r is not None:
@@ -6014,14 +7610,23 @@ class SqueezeBreakoutBot:
                     )
                     if reason:
                         return reason
-                early_protect_on = bool(getattr(self.cfg, 'enable_early_protect', True))
-                if quick_r is None and not early_protect_on:
+                protection_on = (
+                    bool(getattr(self.cfg, "enable_early_protect", True))
+                    or float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0) > 0
+                )
+                if quick_r is None and not protection_on:
                     reason = self._time_stop_exit_decision(
                         pos, inv, elapsed_bars, None, min_progress_r, "local_timer"
                     )
                     if reason:
                         return reason
-        df = fetch_klines(symbol, inv, 100, exchange=self.cfg.exchange)
+        df = fetch_klines(
+            symbol, inv, 100,
+            exchange=self.cfg.exchange,
+            market_type=self.cfg.market_type,
+            testnet=self.cfg.testnet,
+            price_type="mark",
+        )
         if df is None or len(df) < 30:
             if (getattr(self.cfg, 'enable_time_stop', True)
                     and not pos.breakeven_triggered and not pos.partial_tp_triggered):
@@ -6038,12 +7643,6 @@ class SqueezeBreakoutBot:
         closes = df["c"]; highs = df["h"]; lows = df["l"]
         current_price = closes.iloc[-1]; current_high = highs.iloc[-1]; current_low = lows.iloc[-1]
         ema_ratchet_val = ema(closes, self.cfg.ema_ratchet).iloc[-1]
-
-        # 1R锚点
-        if pos.initial_sl > 0:
-            initial_risk = abs(pos.entry_price - pos.initial_sl)
-        else:
-            initial_risk = pos.risk_usdt / pos.quantity if pos.quantity > 0 else 0.01
 
         # 实时浮盈 (用收盘价算r_multiple; 用极值算二阶触发)
         exchange_pnl = None
@@ -6063,89 +7662,223 @@ class SqueezeBreakoutBot:
             (current_price - pos.entry_price) * pos.quantity if pos.direction == "LONG"
             else (pos.entry_price - current_price) * pos.quantity)
 
-        # R-Multiple (统一使用实时当前价 current_price)
+        excursion_source = (
+            "mark"
+            if self.cfg.exchange == "binance" and self.cfg.market_type == "futures"
+            else ""
+        )
+        previous_mfe_cursor = int(getattr(pos, "last_mfe_check_ms", 0) or 0)
+        post_entry_history, history_end_ms = self._history_with_unobserved_excursion(
+            pos,
+            inv,
+            df,
+            excursion_source,
+        )
+
+        if len(post_entry_history) > 0:
+            current_high = post_entry_history["h"].max()
+            current_low = post_entry_history["l"].min()
+        else:
+            current_high = current_price
+            current_low = current_price
+
+        # R-Multiple始终使用不可变的原始成交价和原始每单位风险。
         if initial_risk > 0:
             if pos.direction == "LONG":
-                r_multiple = (float(current_price) - pos.entry_price) / initial_risk
-                favorable_r = (float(current_high) - pos.entry_price) / initial_risk
-                adverse_r = max(0.0, (pos.entry_price - float(current_low)) / initial_risk)
+                r_multiple = (float(current_price) - r_entry) / initial_risk
+                favorable_r = (float(current_high) - r_entry) / initial_risk
+                adverse_r = max(0.0, (r_entry - float(current_low)) / initial_risk)
             else:
-                r_multiple = (pos.entry_price - float(current_price)) / initial_risk
-                favorable_r = (pos.entry_price - float(current_low)) / initial_risk
-                adverse_r = max(0.0, (float(current_high) - pos.entry_price) / initial_risk)
+                r_multiple = (r_entry - float(current_price)) / initial_risk
+                favorable_r = (r_entry - float(current_low)) / initial_risk
+                adverse_r = max(0.0, (float(current_high) - r_entry) / initial_risk)
         else:
             r_multiple = 0.0
             favorable_r = 0.0
             adverse_r = 0.0
-        old_max_r = getattr(pos, 'max_favorable_r', 0.0)
-        if favorable_r > old_max_r:
-            pos.max_favorable_r = favorable_r
-            min_progress_r = float(getattr(self.cfg, 'time_stop_min_r', 0.6) or 0.6)
-            if favorable_r >= min_progress_r or favorable_r - old_max_r >= 0.05:
-                self._save_positions()
-        old_adverse_r = getattr(pos, 'max_adverse_r', 0.0)
-        if adverse_r > old_adverse_r:
-            pos.max_adverse_r = adverse_r
-            if adverse_r - old_adverse_r >= 0.05:
-                self._save_positions()
+        old_excursion_source = str(getattr(pos, "excursion_price_source", "") or "")
+        merge_excursion_source = (
+            excursion_source if history_end_ms > 0 else old_excursion_source
+        )
+        excursion_changed = self._merge_position_excursion(
+            pos,
+            post_entry_history,
+            float(current_price),
+            merge_excursion_source,
+        )
+        cursor_changed = history_end_ms > previous_mfe_cursor
+        if cursor_changed:
+            pos.last_mfe_check_ms = history_end_ms
+        if excursion_changed or cursor_changed:
+            if (
+                merge_excursion_source
+                and old_excursion_source != merge_excursion_source
+            ):
+                self._log.info(
+                    f"{symbol} MFE/MAE switched to mark-price basis: "
+                    f"MFE={pos.max_favorable_r:.2f}R MAE={pos.max_adverse_r:.2f}R"
+                )
+            if not self._save_positions() and cursor_changed:
+                pos.last_mfe_check_ms = previous_mfe_cursor
 
-        # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
-        if (getattr(self.cfg, 'enable_early_protect', True)
-                and not pos.partial_tp_triggered
-                and initial_risk > 0
-                and pos.quantity > 0):
-            early_trigger_r = max(0.1, float(getattr(self.cfg, 'early_protect_r', 0.8) or 0.8))
-            early_lock_r = max(0.0, float(getattr(self.cfg, 'early_protect_lock_r', 0.0) or 0.0))
-            protect_r = max(float(r_multiple), float(favorable_r), float(getattr(pos, 'max_favorable_r', 0.0) or 0.0))
-            if protect_r >= early_trigger_r:
-                desired_sl = (
-                    pos.entry_price + initial_risk * early_lock_r
-                    if pos.direction == 'LONG'
-                    else pos.entry_price - initial_risk * early_lock_r
+        half_trigger_r = max(
+            0.0,
+            float(getattr(self.cfg, "half_risk_trigger_r", 0.0) or 0.0),
+        )
+        early_trigger_r = max(
+            0.1,
+            float(getattr(self.cfg, "early_protect_r", 0.8) or 0.8),
+        )
+        early_protect_on = bool(getattr(self.cfg, "enable_early_protect", True))
+        protect_r = max(
+            float(r_multiple),
+            float(favorable_r),
+            float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+        )
+
+        if (
+            half_trigger_r > 0
+            and not pos.partial_tp_triggered
+            and initial_risk > 0
+            and pos.quantity > 0
+            and protect_r >= half_trigger_r
+            and (not early_protect_on or protect_r < early_trigger_r)
+        ):
+            desired_sl = (
+                r_entry - initial_risk * 0.5
+                if pos.direction == "LONG"
+                else r_entry + initial_risk * 0.5
+            )
+            should_move = (
+                (pos.direction == "LONG" and desired_sl > pos.current_sl)
+                or (pos.direction == "SHORT" and desired_sl < pos.current_sl)
+            )
+            already_tighter = (
+                (pos.direction == "LONG" and pos.current_sl >= desired_sl)
+                or (pos.direction == "SHORT" and pos.current_sl <= desired_sl)
+            )
+            valid_price_side = (
+                (pos.direction == "LONG" and desired_sl < current_price)
+                or (pos.direction == "SHORT" and desired_sl > current_price)
+            )
+            if should_move and not valid_price_side:
+                self._log.warning(
+                    f"半损保护跳过: {symbol} action=invalid_price_side "
+                    f"current={current_price:.4f} target={desired_sl:.4f}"
                 )
-                should_move = (
-                    (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
-                    (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
+            elif should_move:
+                old_sl = pos.current_sl
+                pos.max_favorable_r = max(
+                    float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+                    float(protect_r),
                 )
-                if should_move:
-                    old_sl = pos.current_sl
-                    pos.current_sl = desired_sl
-                    pos.breakeven_triggered = True
-                    pos.breakeven_cooldown = 3
+                applied = self._replace_protective_stop(
+                    pos,
+                    desired_sl,
+                    rollback_sl=old_sl,
+                )
+                if applied:
+                    pos.half_risk_protected = True
                     self._log.info(
-                        f'提前保护: {symbol} ({inv}) R={r_multiple:.2f}>={early_trigger_r:.2f} '
-                        f'SL {old_sl:.4f}->{pos.current_sl:.4f} 锁{early_lock_r:.2f}R'
+                        f"半损保护: {symbol} ({inv}) MFE={protect_r:.2f}R>={half_trigger_r:.2f}R "
+                        f"SL {old_sl:.4f}->{pos.current_sl:.4f} 最大亏损收窄至0.50R"
                     )
-                    if self.client is not None:
-                        self.client.cancel_all_orders(symbol)
-                        sl_side = 'SELL' if pos.direction == 'LONG' else 'BUY'
-                        self.client.stop_order(
-                            symbol, sl_side, round(pos.current_sl, 8), round(pos.quantity, 8),
-                            tracking_no=pos.tracking_no
-                        )
                     self._append_signal_event("position_protect", symbol, {
                         "symbol": symbol,
                         "direction": pos.direction,
                         "interval": inv,
-                        "reason": "early_protect",
-                        "entry": round(float(pos.entry_price), 8),
+                        "reason": "half_risk_protect",
+                        "entry": round(float(r_entry), 8),
+                        "initial_sl": round(float(pos.initial_sl), 8),
                         "current_price": round(float(current_price), 8),
                         "old_sl": round(float(old_sl), 8),
                         "new_sl": round(float(pos.current_sl), 8),
                         "r": round(float(r_multiple), 4),
                         "protect_r": round(float(protect_r), 4),
-                        "mfe_r": round(float(getattr(pos, 'max_favorable_r', 0.0)), 4),
-                        "mae_r": round(float(getattr(pos, 'max_adverse_r', 0.0)), 4),
-                        "trigger_r": early_trigger_r,
-                        "lock_r": early_lock_r,
+                        "mfe_r": round(float(getattr(pos, "max_favorable_r", 0.0)), 4),
+                        "mae_r": round(float(getattr(pos, "max_adverse_r", 0.0)), 4),
+                        "trigger_r": half_trigger_r,
+                        "lock_r": -0.5,
+                        "action": "half_risk_applied",
                         "quantity": round(float(pos.quantity), 8),
                         "signal_key": getattr(pos, "signal_key", ""),
                     })
                     self._save_positions()
+            elif already_tighter and not pos.half_risk_protected:
+                pos.half_risk_protected = True
+                self._log.info(
+                    f"半损保护状态恢复: {symbol} action=already_tighter "
+                    f"current_sl={pos.current_sl:.4f} target={desired_sl:.4f}"
+                )
+                self._save_positions()
+
+        # ==== 提前保护: 还没到1.2R之前, 先把最大亏损收窄到保本附近 ====
+        if (early_protect_on
+                and not pos.partial_tp_triggered
+                and initial_risk > 0
+                and pos.quantity > 0):
+            early_lock_r = max(0.0, float(getattr(self.cfg, 'early_protect_lock_r', 0.0) or 0.0))
+            if protect_r >= early_trigger_r:
+                desired_sl = (
+                    r_entry + initial_risk * early_lock_r
+                    if pos.direction == 'LONG'
+                    else r_entry - initial_risk * early_lock_r
+                )
+                should_move = (
+                    (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
+                    (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
+                )
+                valid_price_side = (
+                    (pos.direction == 'LONG' and desired_sl < current_price)
+                    or (pos.direction == 'SHORT' and desired_sl > current_price)
+                )
+                if should_move and not valid_price_side:
+                    self._log.warning(
+                        f"提前保护跳过: {symbol} action=invalid_price_side "
+                        f"current={current_price:.4f} target={desired_sl:.4f}"
+                    )
+                elif should_move:
+                    old_sl = pos.current_sl
+                    pos.max_favorable_r = max(
+                        float(getattr(pos, "max_favorable_r", 0.0) or 0.0),
+                        float(protect_r),
+                    )
+                    if self._replace_protective_stop(
+                        pos,
+                        desired_sl,
+                        rollback_sl=old_sl,
+                    ):
+                        pos.half_risk_protected = True
+                        pos.breakeven_triggered = True
+                        pos.breakeven_cooldown = 3
+                        self._log.info(
+                            f'提前保护: {symbol} ({inv}) R={r_multiple:.2f}>={early_trigger_r:.2f} '
+                            f'SL {old_sl:.4f}->{pos.current_sl:.4f} 锁{early_lock_r:.2f}R'
+                        )
+                        self._append_signal_event("position_protect", symbol, {
+                            "symbol": symbol,
+                            "direction": pos.direction,
+                            "interval": inv,
+                            "reason": "early_protect",
+                            "entry": round(float(r_entry), 8),
+                            "current_price": round(float(current_price), 8),
+                            "old_sl": round(float(old_sl), 8),
+                            "new_sl": round(float(pos.current_sl), 8),
+                            "r": round(float(r_multiple), 4),
+                            "protect_r": round(float(protect_r), 4),
+                            "mfe_r": round(float(getattr(pos, 'max_favorable_r', 0.0)), 4),
+                            "mae_r": round(float(getattr(pos, 'max_adverse_r', 0.0)), 4),
+                            "trigger_r": early_trigger_r,
+                            "lock_r": early_lock_r,
+                            "quantity": round(float(pos.quantity), 8),
+                            "signal_key": getattr(pos, "signal_key", ""),
+                        })
+                        self._save_positions()
                 elif not pos.breakeven_triggered and (
                     (pos.direction == 'LONG' and pos.current_sl >= desired_sl) or
                     (pos.direction == 'SHORT' and pos.current_sl <= desired_sl)
                 ):
+                    pos.half_risk_protected = True
                     pos.breakeven_triggered = True
                     pos.breakeven_cooldown = 3
                     self._save_positions()
@@ -6169,7 +7902,7 @@ class SqueezeBreakoutBot:
                 self._log.info(f'{symbol} 数量无法减仓50%, 直接启用追踪')
                 pos.partial_tp_triggered = True
                 pos.breakeven_triggered = True  # 核心：点亮一阶防守，防止被一阶覆盖
-                new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                 pos.current_sl = new_sl
                 if self.client is not None:
                     self.client.cancel_all_orders(symbol)
@@ -6188,7 +7921,7 @@ class SqueezeBreakoutBot:
                         pos.quantity -= close_qty
                         pos.partial_tp_triggered = True
                         pos.breakeven_triggered = True  # 核心：点亮一阶防守
-                        new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                        new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                         pos.current_sl = new_sl
                         mode_label = 'ATR吊灯' if getattr(self.cfg, 'use_atr_trail', False) else 'EMA棘轮'
                         self._log.info(f'2.0R减仓: {symbol} 抛{close_qty:.4f} 余{pos.quantity:.4f} SL锁1R->{new_sl:.4f} [三阶={mode_label}]')
@@ -6258,7 +7991,7 @@ class SqueezeBreakoutBot:
                     pos.quantity -= close_qty
                     pos.partial_tp_triggered = True
                     pos.breakeven_triggered = True
-                    new_sl = pos.entry_price + initial_risk if pos.direction == 'LONG' else pos.entry_price - initial_risk
+                    new_sl = r_entry + initial_risk if pos.direction == 'LONG' else r_entry - initial_risk
                     pos.current_sl = new_sl
                     self._log.info(f'2.0R减仓(纸笔): {symbol} 抛{close_qty:.4f} 余{pos.quantity:.4f} SL锁1R->{new_sl:.4f}')
                     partial_pnl = self._calc_trade_pnl(pos.direction, pos.entry_price, current_price, close_qty)
@@ -6284,7 +8017,7 @@ class SqueezeBreakoutBot:
         # ==== 第一阶: 1.2R 绝对防守, 可在提前保本后继续升级锁0.2R ====
         elif r_multiple >= self.cfg.tier1_defense_r:
             buf = initial_risk * 0.2
-            desired_sl = pos.entry_price + buf if pos.direction == 'LONG' else pos.entry_price - buf
+            desired_sl = r_entry + buf if pos.direction == 'LONG' else r_entry - buf
             should_move = (
                 (pos.direction == 'LONG' and desired_sl > pos.current_sl) or
                 (pos.direction == 'SHORT' and desired_sl < pos.current_sl)
@@ -6307,7 +8040,7 @@ class SqueezeBreakoutBot:
                     "direction": pos.direction,
                     "interval": inv,
                     "reason": "tier1_defense_upgrade",
-                    "entry": round(float(pos.entry_price), 8),
+                    "entry": round(float(r_entry), 8),
                     "current_price": round(float(current_price), 8),
                     "old_sl": round(float(old_sl), 8),
                     "new_sl": round(float(pos.current_sl), 8),
@@ -6691,6 +8424,8 @@ class SqueezeBreakoutBot:
             'target_distance_pct': round(float(getattr(pos, 'target_distance_pct', 0.0) or 0.0), 4),
             'target_zone_bars_ago': int(getattr(pos, 'target_zone_bars_ago', 0) or 0),
             'hermes_confirm': self._public_hermes_confirm(getattr(pos, 'hermes_confirm', {})),
+            'choppy_filter': self._position_choppy_filter(getattr(pos, 'choppy_filter', {})),
+            'daily_pattern': self._position_daily_pattern(getattr(pos, 'daily_pattern', {})),
             **self._position_btc_fields(pos),
         }
         if raw_exit_reason != reason:
@@ -6838,6 +8573,14 @@ class SqueezeBreakoutBot:
                 btc_fields = self._btc_regime_fields()
             except Exception:
                 btc_fields = {"btc_regime": "btc_unknown", "btc_score": 0}
+            if self._entry_signal_source() == "predicta_ewo":
+                self._run_predicta_cycle(now, btc_fields, intervals)
+                self.status_text = "Predicta/EWO | 持仓%s | 候选%s | 日亏$%.0f" % (
+                    len(self.positions),
+                    len(self._predicta_setup_pool),
+                    self.daily_loss,
+                )
+                return
             if self._entry_signal_source() == "rj_only":
                 self._run_rj_only_cycle(now, btc_fields, intervals)
                 rj_mode_label = "RJ测试网" if self.cfg.mode != "paper" else "RJ纸笔"
@@ -7143,7 +8886,9 @@ class SqueezeBreakoutBot:
     def run_loop(self):
         """主循环 (在后台线程运行)"""
         self.running = True
-        if self._entry_signal_source() == "rj_only":
+        if self._entry_signal_source() == "predicta_ewo":
+            scan_interval_sec = max(300, int(getattr(self.cfg, "predicta_scan_interval_sec", 1800) or 1800))
+        elif self._entry_signal_source() == "rj_only":
             scan_interval_sec = max(300, int(getattr(self.cfg, "rj_only_scan_interval_sec", 1800) or 1800))
         else:
             scan_interval_sec = max(30, int(getattr(self.cfg, "engine_scan_interval_sec", 60) or 60))
@@ -7383,6 +9128,28 @@ class SqueezeBreakoutBot:
             collapsed.append(row)
         return collapsed[:max(0, int(limit or 40))]
 
+    def _predicta_setup_pool_rows(self, limit: int = 40) -> List[dict]:
+        rows = []
+        for key, item in (getattr(self, "_predicta_setup_pool", {}) or {}).items():
+            rows.append({
+                "key": key,
+                "symbol": str(item.get("symbol", "") or ""),
+                "direction": str(item.get("direction", "") or ""),
+                "source_interval": str(item.get("source_interval", "") or ""),
+                "source_strategy": "predicta_ewo",
+                "stage": "wait_ewo_break",
+                "stage_label": "WAIT",
+                "stage_text": "等待关键K突破 + EWO同向",
+                "price": float(item.get("price", 0.0) or 0.0),
+                "key_high": float(item.get("predicta_key_high", 0.0) or 0.0),
+                "key_low": float(item.get("predicta_key_low", 0.0) or 0.0),
+                "signal_ewo": float(item.get("predicta_signal_ewo", 0.0) or 0.0),
+                "confirm_bars": int(item.get("predicta_confirm_bars", 6) or 6),
+                "choppy_filter_is_choppy": bool(item.get("choppy_filter_is_choppy", False)),
+            })
+        rows.sort(key=lambda item: (item["symbol"], item["direction"]))
+        return rows[:max(0, int(limit or 40))]
+
     def _recent_signal_event_stats(self, limit: int = 800, ttl_sec: int = 8) -> dict:
         """Small cached event digest for the frontend pipeline HUD."""
         now_ts = time.time()
@@ -7424,6 +9191,7 @@ class SqueezeBreakoutBot:
             if name in (
                 "rj_only_scan_cycle", "rj_only_candidate", "rj_setup_add", "rj_setup_near_trigger",
                 "rj_setup_trigger_touch", "rj_setup_volume_wait", "rj_setup_trigger",
+                "rj_choppy_shadow",
                 "hermes_confirm_pass", "hermes_confirm_block", "entry_precheck_pass", "entry_filled",
                 "entry_reject",
             ):
@@ -7604,6 +9372,7 @@ class SqueezeBreakoutBot:
         rj_watchlist = getattr(self, "_rj_watchlist", {}) or {}
         rj_setup_pool_rows = self._rj_setup_pool_rows(limit=40, now_ts=now_ts)
         rj_pipeline = self._rj_pipeline_status(rj_setup_pool_rows)
+        r_performance = self._r_performance_summary()
         return {
             "fast": True,
             "running": self.running,
@@ -7637,6 +9406,8 @@ class SqueezeBreakoutBot:
                     "target_zone_price": round(float(getattr(p, "target_zone_price", 0.0) or 0.0), 6),
                     "target_r": round(float(getattr(p, "target_r", 0.0) or 0.0), 4),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                 }
                 for p in self.positions
             ],
@@ -7663,9 +9434,12 @@ class SqueezeBreakoutBot:
             "last_scan": self.last_scan_time.isoformat() if self.last_scan_time else "",
             "last_signals": self.last_signal_count,
             "trade_count": len(self.trade_log),
+            "r_performance": r_performance,
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
+            "predicta_setup_pool_size": len(getattr(self, "_predicta_setup_pool", {}) or {}),
+            "predicta_setup_pool": self._predicta_setup_pool_rows(limit=40),
             "rj_pipeline": rj_pipeline,
             "rj_watchlist_enabled": bool(getattr(self.cfg, "rj_only_watchlist_enabled", True)),
             "rj_watchlist_size": len(rj_watchlist.get("symbols", []) or []),
@@ -7783,6 +9557,7 @@ class SqueezeBreakoutBot:
         now_ts = time.time()
         rj_setup_pool_rows = self._rj_setup_pool_rows(limit=40, now_ts=now_ts)
         rj_pipeline = self._rj_pipeline_status(rj_setup_pool_rows)
+        r_performance = self._r_performance_summary()
         return {
             "running": self.running,
             "uptime": int((bj_now() - self.start_time).total_seconds()) if self.start_time else 0,
@@ -7823,6 +9598,8 @@ class SqueezeBreakoutBot:
                     "target_distance_pct": round(float(getattr(p, "target_distance_pct", 0.0) or 0.0), 4),
                     "target_zone_bars_ago": int(getattr(p, "target_zone_bars_ago", 0) or 0),
                     "hermes_confirm": self._public_hermes_confirm(getattr(p, "hermes_confirm", {})),
+                    "choppy_filter": self._position_choppy_filter(getattr(p, "choppy_filter", {})),
+                    "daily_pattern": self._position_daily_pattern(getattr(p, "daily_pattern", {})),
                 }
                 for p in self.positions
             ],
@@ -7849,9 +9626,12 @@ class SqueezeBreakoutBot:
             "last_scan": self.last_scan_time.isoformat() if self.last_scan_time else "",
             "last_signals": self.last_signal_count,
             "trade_count": len(self.trade_log),
+            "r_performance": r_performance,
             "signals": self.last_signals_data,
             "rj_setup_pool_size": len(getattr(self, "_rj_setup_pool", {}) or {}),
             "rj_setup_pool": rj_setup_pool_rows,
+            "predicta_setup_pool_size": len(getattr(self, "_predicta_setup_pool", {}) or {}),
+            "predicta_setup_pool": self._predicta_setup_pool_rows(limit=40),
             "rj_pipeline": rj_pipeline,
             "rj_watchlist_enabled": bool(getattr(self.cfg, "rj_only_watchlist_enabled", True)),
             "rj_watchlist_size": len(rj_watchlist.get("symbols", []) or []),

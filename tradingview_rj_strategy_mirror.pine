@@ -1,0 +1,464 @@
+//@version=5
+strategy("AXIOM RJ KD V8 策略回测", shorttitle="RJ V8 Strategy", overlay=true, pyramiding=0,
+     initial_capital=5000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.06, slippage=0,
+     process_orders_on_close=false, calc_on_order_fills=false, max_bars_back=2500,
+     max_labels_count=300, max_boxes_count=200, max_lines_count=100)
+
+// 单币种30分钟诊断策略。所有入场判断只使用已收盘K线；订单默认下一根开盘成交。
+isThirtyMinute = timeframe.isminutes and timeframe.multiplier == 30
+if barstate.isfirst and not isThirtyMinute
+    runtime.error("本策略仅支持30分钟图表")
+
+groupRJ = "RJ核心"
+kdjLen = input.int(9, "KDJ RSV长度", minval=1, group=groupRJ)
+kSmooth = input.int(3, "K线平滑长度", minval=1, group=groupRJ)
+dSmooth = input.int(3, "D线平滑长度", minval=1, group=groupRJ)
+purpleScale = input.float(0.88, "紫线倍率（围绕50）", minval=0.1, maxval=2.0, step=0.01, group=groupRJ)
+purpleOffset = input.float(0.0, "紫线偏移", minval=-50.0, maxval=50.0, step=0.1, group=groupRJ)
+
+groupSignal = "RJ信号与关键K"
+jLongLevel = input.float(0.0, "做多J回0", step=1.0, group=groupSignal)
+jShortLevel = input.float(100.0, "做空J回100", step=1.0, group=groupSignal)
+confirmBars = input.int(6, "关键K确认根数", minval=1, maxval=30, group=groupSignal)
+confirmAtrBuffer = input.float(0.08, "收盘突破ATR缓冲", minval=0.0, step=0.01, group=groupSignal)
+maxChasePct = input.float(2.0, "最大追价百分比", minval=0.0, step=0.1, group=groupSignal)
+minJRSpread = input.float(0.0, "交叉信号最小J/紫线差", minval=0.0, step=0.5, group=groupSignal)
+
+groupKeyFilter = "信号关键K过滤"
+useVolumeFilter = input.bool(true, "启用信号K成交量", group=groupKeyFilter)
+volLen = input.int(20, "成交量均线长度", minval=1, group=groupKeyFilter)
+volMult = input.float(1.1, "信号K成交量倍数", minval=0.0, step=0.1, group=groupKeyFilter)
+useSrFilter = input.bool(true, "启用支撑压力与背离", group=groupKeyFilter)
+srPivotLeft = input.int(5, "支撑压力左侧K数", minval=1, maxval=30, group=groupKeyFilter)
+srPivotRight = input.int(3, "支撑压力右侧K数", minval=1, maxval=30, group=groupKeyFilter)
+srNearAtrMult = input.float(0.8, "贴近支撑压力ATR倍数", minval=0.0, step=0.1, group=groupKeyFilter)
+srNearPct = input.float(0.8, "贴近支撑压力百分比", minval=0.0, step=0.1, group=groupKeyFilter)
+requireDivergence = input.bool(true, "要求J线背离", group=groupKeyFilter)
+divLookbackBars = input.int(80, "背离有效K数", minval=1, maxval=500, group=groupKeyFilter)
+useEarlyDivergence = input.bool(true, "允许正在形成的背离", group=groupKeyFilter)
+
+groupChoppy = "自适应震荡过滤"
+choppyMode = input.string("硬过滤", "震荡过滤模式", options=["关闭", "仅记录", "硬过滤"], group=groupChoppy)
+choppyAtrLen = input.int(14, "短期ATR", minval=2, group=groupChoppy)
+choppyBaselineLen = input.int(100, "ATR基线", minval=20, group=groupChoppy)
+choppyBoxLen = input.int(48, "箱体K线数", minval=10, group=groupChoppy)
+choppyAtrRatio = input.float(0.70, "波动衰减比率", minval=0.1, maxval=1.5, step=0.05, group=groupChoppy)
+choppyBoxAtrMult = input.float(2.5, "箱体最小ATR倍数", minval=0.1, step=0.1, group=groupChoppy)
+
+groupStats = "RJ近期胜率"
+statsMode = input.string("硬过滤", "近期胜率模式", options=["关闭", "仅记录", "硬过滤"], group=groupStats)
+statsLookbackBars = input.int(1000, "统计回看K数", minval=100, maxval=5000, group=groupStats)
+statsHorizonBars = input.int(12, "单样本观察K数", minval=1, maxval=100, group=groupStats)
+statsTargetR = input.float(1.0, "样本盈利目标R", minval=0.2, step=0.1, group=groupStats)
+statsMinSamples = input.int(8, "最低样本数", minval=1, group=groupStats)
+statsMinWinRate = input.float(52.0, "最低胜率%", minval=0.0, maxval=100.0, step=1.0, group=groupStats)
+statsMinAvgR = input.float(0.0, "最低平均R", step=0.05, group=groupStats)
+
+groupRisk = "止损与三阶出场"
+atrLen = input.int(14, "ATR长度", minval=2, group=groupRisk)
+keyStopAtrMult = input.float(0.5, "关键K止损ATR倍数", minval=0.0, step=0.1, group=groupRisk)
+minStopPct = input.float(0.3, "最小止损百分比", minval=0.0, step=0.1, group=groupRisk) / 100.0
+maxStopPct = input.float(8.0, "最大止损百分比", minval=0.1, step=0.5, group=groupRisk) / 100.0
+earlyProtectR = input.float(0.8, "提前保护触发R", minval=0.1, step=0.1, group=groupRisk)
+earlyLockR = input.float(0.25, "提前保护锁定R", minval=0.0, step=0.05, group=groupRisk)
+tier1R = input.float(1.2, "一阶防守触发R", minval=0.1, step=0.1, group=groupRisk)
+tier1LockR = input.float(0.2, "一阶防守锁定R", minval=0.0, step=0.05, group=groupRisk)
+tier2R = input.float(2.0, "二阶减仓触发R", minval=0.2, step=0.1, group=groupRisk)
+tier2LockR = input.float(1.0, "二阶减仓后锁定R", minval=0.0, step=0.1, group=groupRisk)
+chandelierMult = input.float(3.5, "30分钟ATR吊灯倍数", minval=0.1, step=0.1, group=groupRisk)
+
+groupBacktest = "回测范围与显示"
+startTime = input.time(1704067200000, "开始时间", group=groupBacktest)
+endTime = input.time(1924991940000, "结束时间", group=groupBacktest)
+showBackground = input.bool(true, "显示RJ背景", group=groupBacktest)
+showKeyBoxes = input.bool(true, "显示关键K盒子", group=groupBacktest)
+showStatus = input.bool(true, "显示状态表", group=groupBacktest)
+
+// ---------- RJ线 ----------
+ll = ta.lowest(low, kdjLen)
+hh = ta.highest(high, kdjLen)
+rsv = hh == ll ? 50.0 : (close - ll) / (hh - ll) * 100.0
+kLine = ta.sma(rsv, kSmooth)
+dLine = ta.sma(kLine, dSmooth)
+jLine = 3.0 * kLine - 2.0 * dLine
+rLine = math.max(0.0, math.min(100.0, 50.0 + (kLine - 50.0) * purpleScale + purpleOffset))
+rjBull = jLine >= rLine
+bgcolor(showBackground ? color.new(rjBull ? color.green : color.red, 91) : na, title="RJ背景")
+
+barClosed = barstate.isconfirmed
+atrValue = ta.atr(atrLen)
+volBaseline = ta.sma(volume, volLen)[1]
+volumeRatio = not na(volBaseline) and volBaseline > 0.0 ? volume / volBaseline : na
+
+crossLongRaw = ta.crossover(jLine, rLine)
+crossShortRaw = ta.crossunder(jLine, rLine)
+var bool oversoldArmed = false
+var bool overboughtArmed = false
+levelLong = false
+levelShort = false
+if barClosed
+    if jLine < jLongLevel
+        oversoldArmed := true
+    if jLine > jShortLevel
+        overboughtArmed := true
+    levelLong := oversoldArmed and jLine >= jLongLevel
+    levelShort := overboughtArmed and jLine <= jShortLevel
+    if levelLong
+        oversoldArmed := false
+    if levelShort
+        overboughtArmed := false
+
+// ---------- 支撑压力与J背离（只在信号关键K读取） ----------
+pricePivotLow = ta.pivotlow(low, srPivotLeft, srPivotRight)
+pricePivotHigh = ta.pivothigh(high, srPivotLeft, srPivotRight)
+var float lastSupport = na
+var float lastResistance = na
+var float prevPivotLowPrice = na
+var float prevPivotLowJ = na
+var float prevPivotHighPrice = na
+var float prevPivotHighJ = na
+var int lastBullDivBar = na
+var int lastBearDivBar = na
+
+earlyBullDiv = useEarlyDivergence and not na(prevPivotLowPrice) and not na(prevPivotLowJ) and low < prevPivotLowPrice and jLine > prevPivotLowJ
+earlyBearDiv = useEarlyDivergence and not na(prevPivotHighPrice) and not na(prevPivotHighJ) and high > prevPivotHighPrice and jLine < prevPivotHighJ
+if not na(pricePivotLow)
+    pivotJ = jLine[srPivotRight]
+    if not na(prevPivotLowPrice) and not na(prevPivotLowJ) and pricePivotLow < prevPivotLowPrice and pivotJ > prevPivotLowJ
+        lastBullDivBar := bar_index - srPivotRight
+    lastSupport := pricePivotLow
+    prevPivotLowPrice := pricePivotLow
+    prevPivotLowJ := pivotJ
+if not na(pricePivotHigh)
+    pivotJ = jLine[srPivotRight]
+    if not na(prevPivotHighPrice) and not na(prevPivotHighJ) and pricePivotHigh > prevPivotHighPrice and pivotJ < prevPivotHighJ
+        lastBearDivBar := bar_index - srPivotRight
+    lastResistance := pricePivotHigh
+    prevPivotHighPrice := pricePivotHigh
+    prevPivotHighJ := pivotJ
+
+nearSupport = not na(lastSupport) and (math.abs(low - lastSupport) <= atrValue * srNearAtrMult or math.abs(low - lastSupport) / close * 100.0 <= srNearPct)
+nearResistance = not na(lastResistance) and (math.abs(high - lastResistance) <= atrValue * srNearAtrMult or math.abs(high - lastResistance) / close * 100.0 <= srNearPct)
+bullDivActive = earlyBullDiv or (not na(lastBullDivBar) and bar_index - lastBullDivBar <= divLookbackBars)
+bearDivActive = earlyBearDiv or (not na(lastBearDivBar) and bar_index - lastBearDivBar <= divLookbackBars)
+longSrOk = not useSrFilter or (nearSupport and (not requireDivergence or bullDivActive))
+shortSrOk = not useSrFilter or (nearResistance and (not requireDivergence or bearDivActive))
+
+// ---------- 自适应震荡判定：当前bar就是不可变的信号关键K ----------
+choppyAtr = ta.atr(choppyAtrLen)
+choppyAtrBaseline = ta.sma(choppyAtr, choppyBaselineLen)
+choppyBoxHigh = ta.highest(high[1], choppyBoxLen)
+choppyBoxLow = ta.lowest(low[1], choppyBoxLen)
+choppyAvailable = not na(choppyAtr) and not na(choppyAtrBaseline) and not na(choppyBoxHigh) and not na(choppyBoxLow) and choppyBoxLow > 0.0 and choppyBoxHigh > choppyBoxLow and close > 0.0
+atrContraction = choppyAvailable and choppyAtr < choppyAtrBaseline * choppyAtrRatio
+boxAmplitude = choppyAvailable ? (choppyBoxHigh - choppyBoxLow) / choppyBoxLow : na
+boxThreshold = choppyAvailable ? choppyBoxAtrMult * choppyAtr / close : na
+boxSqueeze = choppyAvailable and boxAmplitude < boxThreshold
+boxPosition = choppyAvailable ? (close - choppyBoxLow) / (choppyBoxHigh - choppyBoxLow) : na
+middleChop = choppyAvailable and boxPosition > 0.40 and boxPosition < 0.60
+currentChoppy = atrContraction or boxSqueeze or middleChop
+
+// ---------- 因果近期胜率样本 ----------
+var pendingDirections = array.new_int()
+var pendingEntries = array.new_float()
+var pendingStops = array.new_float()
+var pendingTargets = array.new_float()
+var pendingConfirmBars = array.new_int()
+var completedDirections = array.new_int()
+var completedResults = array.new_float()
+var completedConfirmBars = array.new_int()
+
+// 每个样本从确认后的下一根开始；同一根同时触及止损和目标时按止损优先。
+pendingIndex = 0
+while pendingIndex < array.size(pendingDirections)
+    sampleDir = array.get(pendingDirections, pendingIndex)
+    sampleEntry = array.get(pendingEntries, pendingIndex)
+    sampleStop = array.get(pendingStops, pendingIndex)
+    sampleTarget = array.get(pendingTargets, pendingIndex)
+    sampleConfirmBar = array.get(pendingConfirmBars, pendingIndex)
+    sampleRisk = math.abs(sampleEntry - sampleStop)
+    sampleDone = false
+    sampleResult = 0.0
+    if barClosed and bar_index > sampleConfirmBar
+        stopHit = sampleDir == 1 ? low <= sampleStop : high >= sampleStop
+        targetHit = sampleDir == 1 ? high >= sampleTarget : low <= sampleTarget
+        if stopHit
+            sampleResult := -1.0
+            sampleDone := true
+        else if targetHit
+            sampleResult := statsTargetR
+            sampleDone := true
+        else if bar_index - sampleConfirmBar >= statsHorizonBars
+            sampleResult := sampleRisk > 0.0 ? (sampleDir == 1 ? (close - sampleEntry) / sampleRisk : (sampleEntry - close) / sampleRisk) : 0.0
+            sampleDone := true
+    if sampleDone
+        array.push(completedDirections, sampleDir)
+        array.push(completedResults, sampleResult)
+        array.push(completedConfirmBars, sampleConfirmBar)
+        array.remove(pendingDirections, pendingIndex)
+        array.remove(pendingEntries, pendingIndex)
+        array.remove(pendingStops, pendingIndex)
+        array.remove(pendingTargets, pendingIndex)
+        array.remove(pendingConfirmBars, pendingIndex)
+    else
+        pendingIndex += 1
+
+completedIndex = 0
+while completedIndex < array.size(completedDirections)
+    if bar_index - array.get(completedConfirmBars, completedIndex) > statsLookbackBars
+        array.remove(completedDirections, completedIndex)
+        array.remove(completedResults, completedIndex)
+        array.remove(completedConfirmBars, completedIndex)
+    else
+        completedIndex += 1
+
+f_recent_stats(_direction) =>
+    int sampleCount = 0
+    int winCount = 0
+    float resultSum = 0.0
+    int resultSize = array.size(completedResults)
+    if resultSize > 0
+        for resultIndex = 0 to resultSize - 1
+            if array.get(completedDirections, resultIndex) == _direction
+                resultValue = array.get(completedResults, resultIndex)
+                sampleCount += 1
+                winCount += resultValue > 0.0 ? 1 : 0
+                resultSum += resultValue
+    float winRate = sampleCount > 0 ? winCount * 100.0 / sampleCount : 0.0
+    float avgR = sampleCount > 0 ? resultSum / sampleCount : 0.0
+    [sampleCount, winRate, avgR]
+
+[longSamples, longWinRate, longAvgR] = f_recent_stats(1)
+[shortSamples, shortWinRate, shortAvgR] = f_recent_stats(-1)
+longStatsPass = statsMode == "关闭" or (longSamples >= statsMinSamples and longWinRate >= statsMinWinRate and longAvgR >= statsMinAvgR)
+shortStatsPass = statsMode == "关闭" or (shortSamples >= statsMinSamples and shortWinRate >= statsMinWinRate and shortAvgR >= statsMinAvgR)
+
+// ---------- 关键K候选 ----------
+var int setupDir = 0
+var int setupKeyBar = na
+var float setupKeyHigh = na
+var float setupKeyLow = na
+var float setupStop = na
+var bool setupPrimary = false
+var bool setupKeyFilterOk = false
+var bool keyChoppy = false
+var bool keyAtrContraction = false
+var bool keyBoxSqueeze = false
+var bool keyMiddleChop = false
+var float keyAtrRatio = na
+var float keyBoxPosition = na
+var float keyVolumeRatio = na
+
+rawLongKey = barClosed and (levelLong or crossLongRaw)
+rawShortKey = barClosed and (levelShort or crossShortRaw)
+longSpreadOk = levelLong or minJRSpread <= 0.0 or jLine - rLine >= minJRSpread
+shortSpreadOk = levelShort or minJRSpread <= 0.0 or rLine - jLine >= minJRSpread
+keyVolumeOk = not useVolumeFilter or (not na(volumeRatio) and volumeRatio >= volMult)
+choppyHardPass = choppyMode != "硬过滤" or not choppyAvailable or not currentChoppy
+inDateRange = time >= startTime and time <= endTime
+
+longRawAccepted = rawLongKey and setupDir == 0
+shortRawAccepted = rawShortKey and setupDir == 0
+longKeyFilterOk = longSpreadOk and keyVolumeOk and longSrOk and choppyHardPass
+shortKeyFilterOk = shortSpreadOk and keyVolumeOk and shortSrOk and choppyHardPass
+longKeyAccepted = longRawAccepted and longKeyFilterOk
+shortKeyAccepted = shortRawAccepted and shortKeyFilterOk
+
+// 原始RJ关键K全部保留用于近期胜率；过滤结果只控制真实策略订单。
+if longRawAccepted
+    setupDir := 1
+    setupKeyBar := bar_index
+    setupKeyHigh := high
+    setupKeyLow := low
+    setupStop := low - atrValue * keyStopAtrMult
+    setupPrimary := levelLong
+    setupKeyFilterOk := longKeyFilterOk
+    keyChoppy := currentChoppy
+    keyAtrContraction := atrContraction
+    keyBoxSqueeze := boxSqueeze
+    keyMiddleChop := middleChop
+    keyAtrRatio := choppyAvailable and choppyAtrBaseline > 0.0 ? choppyAtr / choppyAtrBaseline : na
+    keyBoxPosition := boxPosition
+    keyVolumeRatio := volumeRatio
+    if showKeyBoxes
+        box.new(bar_index, high, bar_index + confirmBars, low, border_color=color.new(color.lime, 35), bgcolor=color.new(color.lime, 91))
+else if shortRawAccepted
+    setupDir := -1
+    setupKeyBar := bar_index
+    setupKeyHigh := high
+    setupKeyLow := low
+    setupStop := high + atrValue * keyStopAtrMult
+    setupPrimary := levelShort
+    setupKeyFilterOk := shortKeyFilterOk
+    keyChoppy := currentChoppy
+    keyAtrContraction := atrContraction
+    keyBoxSqueeze := boxSqueeze
+    keyMiddleChop := middleChop
+    keyAtrRatio := choppyAvailable and choppyAtrBaseline > 0.0 ? choppyAtr / choppyAtrBaseline : na
+    keyBoxPosition := boxPosition
+    keyVolumeRatio := volumeRatio
+    if showKeyBoxes
+        box.new(bar_index, high, bar_index + confirmBars, low, border_color=color.new(color.red, 35), bgcolor=color.new(color.red, 91))
+
+longCoreConfirm = false
+shortCoreConfirm = false
+longEntrySignal = false
+shortEntrySignal = false
+float plannedStop = na
+
+if barClosed and setupDir != 0 and bar_index > setupKeyBar
+    setupAge = bar_index - setupKeyBar
+    invalidated = setupDir == 1 ? close < setupKeyLow : close > setupKeyHigh
+    confirmLevel = setupDir == 1 ? setupKeyHigh + atrValue * confirmAtrBuffer : setupKeyLow - atrValue * confirmAtrBuffer
+    confirmed = setupDir == 1 ? close > confirmLevel : close < confirmLevel
+    chasePct = confirmLevel > 0.0 ? math.abs(close - confirmLevel) / confirmLevel * 100.0 : 999.0
+    if invalidated or setupAge > confirmBars
+        setupDir := 0
+        setupKeyBar := na
+    else if confirmed
+        coreEntry = close
+        coreStop = setupStop
+        coreRiskFloor = coreEntry * minStopPct
+        if setupDir == 1 and coreEntry - coreStop < coreRiskFloor
+            coreStop := coreEntry - coreRiskFloor
+        if setupDir == -1 and coreStop - coreEntry < coreRiskFloor
+            coreStop := coreEntry + coreRiskFloor
+        coreRisk = math.abs(coreEntry - coreStop)
+        coreStopPct = coreEntry > 0.0 ? coreRisk / coreEntry : 999.0
+        riskValid = coreRisk > 0.0 and coreStopPct <= maxStopPct
+        directionStatsPass = setupDir == 1 ? longStatsPass : shortStatsPass
+        statsHardPass = statsMode != "硬过滤" or directionStatsPass
+        entryAllowed = riskValid and setupKeyFilterOk and chasePct <= maxChasePct and statsHardPass and inDateRange and strategy.position_size == 0
+        if riskValid
+            newSampleTarget = setupDir == 1 ? coreEntry + coreRisk * statsTargetR : coreEntry - coreRisk * statsTargetR
+            array.push(pendingDirections, setupDir)
+            array.push(pendingEntries, coreEntry)
+            array.push(pendingStops, coreStop)
+            array.push(pendingTargets, newSampleTarget)
+            array.push(pendingConfirmBars, bar_index)
+        if setupDir == 1
+            longCoreConfirm := true
+            longEntrySignal := entryAllowed
+        else
+            shortCoreConfirm := true
+            shortEntrySignal := entryAllowed
+        plannedStop := coreStop
+        setupDir := 0
+        setupKeyBar := na
+
+// ---------- 策略订单：确认收盘发单，默认下一根开盘成交 ----------
+var float pendingTradeStop = na
+if longEntrySignal
+    pendingTradeStop := plannedStop
+    strategy.entry("RJ-L", strategy.long, comment=keyChoppy ? "RJ多|震荡影子" : "RJ多|活跃")
+    strategy.exit("RJ-L-X", "RJ-L", stop=plannedStop)
+if shortEntrySignal
+    pendingTradeStop := plannedStop
+    strategy.entry("RJ-S", strategy.short, comment=keyChoppy ? "RJ空|震荡影子" : "RJ空|活跃")
+    strategy.exit("RJ-S-X", "RJ-S", stop=plannedStop)
+
+var float tradeEntry = na
+var float tradeInitialStop = na
+var float tradeActiveStop = na
+var float tradeRisk = na
+var float favorableExtreme = na
+var bool tier1Active = false
+var bool tier2Done = false
+
+newLongPosition = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShortPosition = strategy.position_size < 0 and strategy.position_size[1] >= 0
+if newLongPosition or newShortPosition
+    tradeEntry := strategy.position_avg_price
+    tradeInitialStop := pendingTradeStop
+    tradeActiveStop := pendingTradeStop
+    tradeRisk := math.abs(tradeEntry - tradeInitialStop)
+    favorableExtreme := tradeEntry
+    tier1Active := false
+    tier2Done := false
+
+if strategy.position_size > 0 and not na(tradeRisk) and tradeRisk > 0.0
+    favorableExtreme := math.max(nz(favorableExtreme, tradeEntry), high)
+    favorableR = (favorableExtreme - tradeEntry) / tradeRisk
+    if favorableR >= earlyProtectR
+        tradeActiveStop := math.max(tradeActiveStop, tradeEntry + tradeRisk * earlyLockR)
+    if favorableR >= tier1R
+        tier1Active := true
+        tradeActiveStop := math.max(tradeActiveStop, tradeEntry + tradeRisk * tier1LockR)
+    if favorableR >= tier2R and not tier2Done
+        tier2Done := true
+        strategy.close("RJ-L", qty_percent=50, comment="2R减仓50%")
+        tradeActiveStop := math.max(tradeActiveStop, tradeEntry + tradeRisk * tier2LockR)
+    if tier1Active
+        tradeActiveStop := math.max(tradeActiveStop, favorableExtreme - atrValue * chandelierMult)
+    strategy.exit("RJ-L-X", "RJ-L", stop=tradeActiveStop)
+
+if strategy.position_size < 0 and not na(tradeRisk) and tradeRisk > 0.0
+    favorableExtreme := math.min(nz(favorableExtreme, tradeEntry), low)
+    favorableR = (tradeEntry - favorableExtreme) / tradeRisk
+    if favorableR >= earlyProtectR
+        tradeActiveStop := math.min(tradeActiveStop, tradeEntry - tradeRisk * earlyLockR)
+    if favorableR >= tier1R
+        tier1Active := true
+        tradeActiveStop := math.min(tradeActiveStop, tradeEntry - tradeRisk * tier1LockR)
+    if favorableR >= tier2R and not tier2Done
+        tier2Done := true
+        strategy.close("RJ-S", qty_percent=50, comment="2R减仓50%")
+        tradeActiveStop := math.min(tradeActiveStop, tradeEntry - tradeRisk * tier2LockR)
+    if tier1Active
+        tradeActiveStop := math.min(tradeActiveStop, favorableExtreme + atrValue * chandelierMult)
+    strategy.exit("RJ-S-X", "RJ-S", stop=tradeActiveStop)
+
+positionClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if positionClosed
+    tradeEntry := na
+    tradeInitialStop := na
+    tradeActiveStop := na
+    tradeRisk := na
+    favorableExtreme := na
+    pendingTradeStop := na
+
+// ---------- 图表证据 ----------
+plot(strategy.position_size != 0 ? tradeInitialStop : na, "初始止损", color=color.new(color.gray, 45), style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeActiveStop : na, "动态止损", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(setupDir != 0 ? setupKeyHigh : na, "关键K高点", color=color.new(color.lime, 55), style=plot.style_linebr)
+plot(setupDir != 0 ? setupKeyLow : na, "关键K低点", color=color.new(color.red, 55), style=plot.style_linebr)
+plotshape(longKeyAccepted, "做多关键K", shape.triangleup, location.belowbar, color=levelLong ? color.lime : color.aqua, size=size.tiny, text="K多")
+plotshape(shortKeyAccepted, "做空关键K", shape.triangledown, location.abovebar, color=levelShort ? color.red : color.orange, size=size.tiny, text="K空")
+plotshape(longEntrySignal, "确认做多", shape.labelup, location.belowbar, color=color.new(color.lime, 0), text="多", textcolor=color.black, size=size.tiny)
+plotshape(shortEntrySignal, "确认做空", shape.labeldown, location.abovebar, color=color.new(color.red, 0), text="空", textcolor=color.white, size=size.tiny)
+plotshape((longRawAccepted or shortRawAccepted) and currentChoppy, "震荡关键K", shape.circle, location.bottom, color=color.yellow, size=size.tiny, text="震")
+
+f_choppy_text() =>
+    not keyChoppy ? "活跃" : keyAtrContraction ? "震荡·波动衰减" : keyBoxSqueeze ? "震荡·箱体收缩" : keyMiddleChop ? "震荡·中轴" : "震荡"
+
+f_stats_text(_samples, _winRate, _avgR) =>
+    str.tostring(_winRate, "#.0") + "% / " + str.tostring(_samples) + "笔 / " + str.tostring(_avgR, "#.00") + "R"
+
+var table statusTable = table.new(position.top_right, 2, 10, border_width=1)
+if showStatus and barstate.islast
+    activeDirection = setupDir != 0 ? setupDir : strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+    activeStatsPass = activeDirection == -1 ? shortStatsPass : longStatsPass
+    table.cell(statusTable, 0, 0, "RJ状态", text_color=color.white, bgcolor=color.new(color.black, 10))
+    table.cell(statusTable, 1, 0, rjBull ? "偏多" : "偏空", text_color=rjBull ? color.lime : color.red)
+    table.cell(statusTable, 0, 1, "震荡过滤", text_color=color.white)
+    table.cell(statusTable, 1, 1, f_choppy_text(), text_color=keyChoppy ? color.yellow : color.lime)
+    table.cell(statusTable, 0, 2, "ATR比率", text_color=color.white)
+    table.cell(statusTable, 1, 2, na(keyAtrRatio) ? "--" : str.tostring(keyAtrRatio, "#.00"), text_color=color.silver)
+    table.cell(statusTable, 0, 3, "箱体位置", text_color=color.white)
+    table.cell(statusTable, 1, 3, na(keyBoxPosition) ? "--" : str.tostring(keyBoxPosition * 100.0, "#.0") + "%", text_color=color.silver)
+    table.cell(statusTable, 0, 4, "做多近期", text_color=color.white)
+    table.cell(statusTable, 1, 4, f_stats_text(longSamples, longWinRate, longAvgR), text_color=longStatsPass ? color.lime : color.red)
+    table.cell(statusTable, 0, 5, "做空近期", text_color=color.white)
+    table.cell(statusTable, 1, 5, f_stats_text(shortSamples, shortWinRate, shortAvgR), text_color=shortStatsPass ? color.lime : color.red)
+    table.cell(statusTable, 0, 6, "当前胜率门控", text_color=color.white)
+    table.cell(statusTable, 1, 6, statsMode == "关闭" ? "关闭" : activeStatsPass ? "通过" : "拦截", text_color=statsMode == "关闭" ? color.gray : activeStatsPass ? color.lime : color.red)
+    table.cell(statusTable, 0, 7, "信号K量能", text_color=color.white)
+    table.cell(statusTable, 1, 7, na(keyVolumeRatio) ? "--" : str.tostring(keyVolumeRatio, "#.00") + "x", text_color=not useVolumeFilter or keyVolumeRatio >= volMult ? color.lime : color.red)
+    table.cell(statusTable, 0, 8, "策略交易", text_color=color.white)
+    table.cell(statusTable, 1, 8, str.tostring(strategy.closedtrades) + "笔 / 胜" + str.tostring(strategy.wintrades), text_color=color.aqua)
+    table.cell(statusTable, 0, 9, "净利润", text_color=color.white)
+    table.cell(statusTable, 1, 9, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.lime : color.red)
+
+alertcondition(longEntrySignal, "RJ策略确认做多", "RJ策略确认做多：{{ticker}} {{interval}}")
+alertcondition(shortEntrySignal, "RJ策略确认做空", "RJ策略确认做空：{{ticker}} {{interval}}")
