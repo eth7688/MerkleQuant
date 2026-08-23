@@ -3,6 +3,7 @@ from unittest.mock import patch
 from pathlib import Path
 import sys
 import hashlib
+import json
 import math
 
 import numpy as np
@@ -32,6 +33,11 @@ from momentum_compression import (
 BASE_OT = 1_700_000_000_000
 LEGACY_REQUIRED_COLUMNS = ("ot", "o", "h", "l", "c", "v")
 FLOAT_TOLERANCE = 1e-12  # Detects rule-threshold drift while allowing arithmetic order noise.
+LUMIA_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "lumiausdt_binance_futures_15m_20260823_1300.json"
+)
 
 
 def compression_frame(bars=20, side="LONG"):
@@ -468,6 +474,45 @@ class CompressionIndicatorTests(unittest.TestCase):
                                evaluated_at_ms=evaluated_at_ms, htf_alignment="UNKNOWN")
         self.assertEqual(first["compression_id"], second["compression_id"])
         self.assertEqual(first["upper_boundary_price"], second["upper_boundary_price"])
+
+
+class CompressionHistoricalRegressionTests(unittest.TestCase):
+    def test_lumia_binance_window_is_rejected_for_insufficient_contraction(self):
+        payload = json.loads(LUMIA_FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual(payload["source"], "Binance Futures /fapi/v1/klines")
+        self.assertEqual(payload["symbol"], "LUMIAUSDT")
+        self.assertEqual(payload["interval"], "15m")
+        self.assertEqual(payload["query"]["endTime"], 1787461199999)
+        canonical = json.dumps(
+            payload["ohlcv"], sort_keys=True, separators=(",", ":"),
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical.encode()).hexdigest(),
+            payload["ohlcv_sha256"],
+        )
+        frame = pd.DataFrame(payload["ohlcv"])
+        result = evaluate_side(
+            payload["symbol"],
+            "SHORT",
+            frame,
+            payload["live_price"],
+            evaluated_at_ms=payload["evaluated_at_ms"],
+            htf_alignment="UNKNOWN",
+        )
+        self.assertEqual(result["state"], "REJECTED")
+        self.assertIn(
+            "INSUFFICIENT_CONTRACTION", result["rejection_reasons"],
+        )
+        indicators = add_compression_indicators(frame)
+        former_window = indicators[
+            (indicators["ot"] >= payload["former_window_start_time"])
+            & (indicators["ot"] <= payload["former_window_end_time"])
+        ].reset_index(drop=True)
+        self.assertEqual(len(former_window), 16)
+        self.assertAlmostEqual(
+            _range_contraction_ratio(former_window),
+            1.416058394160586,
+        )
 
 
 class CompressionRuleTests(unittest.TestCase):
