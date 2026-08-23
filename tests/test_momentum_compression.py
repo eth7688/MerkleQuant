@@ -38,6 +38,7 @@ LUMIA_FIXTURE = (
     / "fixtures"
     / "lumiausdt_binance_futures_15m_20260823_1300.json"
 )
+LUMIA_OHLCV_SHA256 = "3e01a5d0e36af34b66953cfd3f38142ec4bd2d11b5160532fd9b8edcf3844e65"
 
 
 def compression_frame(bars=20, side="LONG"):
@@ -482,13 +483,20 @@ class CompressionHistoricalRegressionTests(unittest.TestCase):
         self.assertEqual(payload["source"], "Binance Futures /fapi/v1/klines")
         self.assertEqual(payload["symbol"], "LUMIAUSDT")
         self.assertEqual(payload["interval"], "15m")
+        self.assertEqual(payload["market_type"], "futures")
+        self.assertFalse(payload["testnet"])
+        self.assertEqual(payload["query"]["limit"], 220)
         self.assertEqual(payload["query"]["endTime"], 1787461199999)
+        self.assertEqual(len(payload["ohlcv"]), 220)
+        self.assertEqual(payload["ohlcv"][0]["ot"], 1787263200000)
+        self.assertEqual(payload["ohlcv"][-1]["ot"], 1787460300000)
+        self.assertEqual(payload["ohlcv_sha256"], LUMIA_OHLCV_SHA256)
         canonical = json.dumps(
             payload["ohlcv"], sort_keys=True, separators=(",", ":"),
         )
         self.assertEqual(
             hashlib.sha256(canonical.encode()).hexdigest(),
-            payload["ohlcv_sha256"],
+            LUMIA_OHLCV_SHA256,
         )
         frame = pd.DataFrame(payload["ohlcv"])
         result = evaluate_side(
@@ -512,6 +520,12 @@ class CompressionHistoricalRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(
             _range_contraction_ratio(former_window),
             1.416058394160586,
+        )
+        self.assertEqual(
+            _non_length_rules(
+                former_window, "SHORT", CompressionParams(),
+            )["rejection_reasons"],
+            ["INSUFFICIENT_CONTRACTION"],
         )
 
 

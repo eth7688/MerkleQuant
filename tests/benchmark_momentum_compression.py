@@ -39,6 +39,8 @@ def frame_for(seed, bars=220):
         "c": close,
         "v": np.full(bars, 1000.0 + seed),
     })
+    # The normal anomaly enters the selected suffix's first third, forcing a
+    # late qualifying window under the range-contraction rule.
     anomaly_index = 20 + (seed % 3) if deep else 180 + (seed % 5)
     anomaly_size = 20.0 if deep else 80.0 + 0.1 * (seed % 3)
     if side == "LONG":
