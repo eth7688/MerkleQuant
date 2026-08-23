@@ -231,7 +231,7 @@ class CompressionStatePersistenceTests(unittest.TestCase):
 
         self.assertEqual(loaded["last_scan_failures"], [])
 
-    def test_failure_details_reject_unbounded_or_invalid_payloads(self):
+    def test_failure_details_reject_overlong_messages(self):
         state = default_state()
         state["last_scan_failures"] = [{
             "symbol": "KEEPUSDT", "stage": "15m_klines", "error_type": "TimeoutError",

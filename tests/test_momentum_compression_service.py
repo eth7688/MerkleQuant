@@ -211,6 +211,30 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
         self.assertEqual(report["errors"], 1)
         self.assertEqual(stored["last_scan_failures"], [expected])
 
+    def test_more_than_one_thousand_final_failures_are_all_persisted(self):
+        from momentum_compression_service import CompressionSymbolScanError, scan_compression_market
+
+        symbols = [f"FAIL{index:04d}USDT" for index in range(1_001)]
+
+        def fail(symbol, **_):
+            raise CompressionSymbolScanError({
+                "symbol": symbol, "stage": "15m_klines",
+                "error_type": "TimeoutError", "message": "upstream slow", "attempts": 2,
+            })
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch("momentum_compression_service.fetch_compression_universe", return_value=(symbols, {})), \
+                 patch("momentum_compression_service.fetch_live_prices", return_value={symbol: 105.0 for symbol in symbols}), \
+                 patch("momentum_compression_service._scan_symbol", side_effect=fail):
+                report = scan_compression_market(root / "state.json", root)
+            stored = load_compression_state(root / "state.json")
+
+        self.assertEqual(report["errors"], len(report["failed_details"]))
+        self.assertEqual(len(report["failed_details"]), len(symbols))
+        self.assertEqual(set(report["failed_symbols"]), set(symbols))
+        self.assertEqual(stored["last_scan_failures"], report["failed_details"])
+
     def test_live_ticker_rejects_nan_and_infinity(self):
         from momentum_compression_service import fetch_live_price
 

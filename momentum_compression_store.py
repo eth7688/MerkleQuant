@@ -143,7 +143,7 @@ def _validate_fresh_event(event):
 
 
 def _validate_scan_failures(failures):
-    if not isinstance(failures, list) or len(failures) > 1000:
+    if not isinstance(failures, list):
         raise ValueError("invalid scan failures")
     required = {"symbol", "stage", "error_type", "message", "attempts"}
     for item in failures:

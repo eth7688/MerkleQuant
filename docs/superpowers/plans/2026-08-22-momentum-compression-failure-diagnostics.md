@@ -99,6 +99,7 @@ git commit -m "fix: expose compression kline request errors"
 - Consumes: `fetch_klines()` with `raise_errors=True` from Task 1.
 - Produces: `CompressionSymbolScanError`, `_failure_detail(symbol, error, *, stage, attempts) -> dict`, state key `last_scan_failures: list[dict]`, and report key `failed_details: list[dict]`.
 - Failure item schema: `{"symbol": str, "stage": str, "error_type": str, "message": str, "attempts": int}`.
+- Retain only the latest scan's failure list; do not impose a per-scan item count cap. Validate the exact schema and limit each message to 160 characters.
 
 - [ ] **Step 1: Write failing retry tests**
 
@@ -284,7 +285,7 @@ Add this validator and call it from `_validate_state()`:
 
 ```python
 def _validate_scan_failures(failures):
-    if not isinstance(failures, list) or len(failures) > 1000:
+    if not isinstance(failures, list):
         raise ValueError("invalid scan failures")
     required = {"symbol", "stage", "error_type", "message", "attempts"}
     for item in failures:
