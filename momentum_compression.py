@@ -79,6 +79,23 @@ def _fit_shifted_envelope(frame: pd.DataFrame, pivot_highs: list[int], pivot_low
     }
 
 
+def _range_contraction_ratio(frame: pd.DataFrame) -> float:
+    third = len(frame) // 3
+    if third <= 0:
+        return float("inf")
+    ranges = (
+        frame["h"].reset_index(drop=True)
+        - frame["l"].reset_index(drop=True)
+    )
+    first_mean = float(ranges.iloc[:third].mean())
+    last_mean = float(ranges.iloc[-third:].mean())
+    if not math.isfinite(first_mean) or first_mean <= 0:
+        return float("inf")
+    if not math.isfinite(last_mean):
+        return float("inf")
+    return last_mean / first_mean
+
+
 def _common_structure(frame: pd.DataFrame, params: CompressionParams) -> dict:
     pivot_highs, pivot_lows = _pivots(frame, params.pivot_span)
     envelope = _fit_shifted_envelope(frame, pivot_highs, pivot_lows)
@@ -88,16 +105,11 @@ def _common_structure(frame: pd.DataFrame, params: CompressionParams) -> dict:
             "pivot_lows": pivot_lows,
             "envelope": {},
         }
-    widths = envelope["upper"] - envelope["lower"]
-    contraction_ratio = (
-        float(widths.iloc[-1] / widths.iloc[0])
-        if widths.iloc[0] else float("inf")
-    )
     return {
         "pivot_highs": pivot_highs,
         "pivot_lows": pivot_lows,
         "envelope": envelope,
-        "contraction_ratio": contraction_ratio,
+        "contraction_ratio": _range_contraction_ratio(frame),
     }
 
 
@@ -163,11 +175,13 @@ def _non_length_rules(frame, side, params, *, common=None):
         directional_events = _touch_events(
             frame["h"], upper, atr, params.touch_tolerance_atr
         )
-    if (
-        not math.isfinite(float(atr.iloc[-1]))
-        or abs(float(ema8.iloc[-1] - ema21.iloc[-1]))
-        > float(atr.iloc[-1]) * params.max_ema_distance_atr
-    ):
+    last_atr = float(atr.iloc[-1])
+    ema_distance_atr = (
+        abs(float(frame["c"].iloc[-1] - ema8.iloc[-1])) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0
+        else float("inf")
+    )
+    if ema_distance_atr > params.max_ema_distance_atr:
         reasons.append("EMA_DISTANCE_TOO_WIDE")
     swing = _swing_structure(frame, pivot_highs, pivot_lows, side)
     if not swing["valid"]:
@@ -181,6 +195,7 @@ def _non_length_rules(frame, side, params, *, common=None):
         "rejection_reasons": reasons, "pivot_highs": pivot_highs, "pivot_lows": pivot_lows,
         "envelope": envelope, "directional_events": directional_events,
         "swing": swing, "contraction_ratio": contraction_ratio,
+        "ema_distance_atr": ema_distance_atr,
     }
 
 
@@ -325,10 +340,6 @@ def _evaluate_prepared_side(
         )
     upper, lower = envelope["upper"], envelope["lower"]
     atr14 = float(window["atr14"].iloc[-1])
-    metrics["ema_distance_atr"] = (
-        abs(float(window["ema8"].iloc[-1] - window["ema21"].iloc[-1])) / atr14
-        if atr14 else float("inf")
-    )
     score, score_components = _quality_score(metrics, params)
     result = {
         "symbol": symbol, "side": side, "evaluated_at": evaluated_at_ms,

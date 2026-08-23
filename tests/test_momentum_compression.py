@@ -16,10 +16,12 @@ from benchmark_momentum_compression import frame_for as benchmark_frame_for
 from momentum_compression import (
     CompressionParams,
     _classify_without_episode,
+    _common_structure,
     _quality_score,
     _non_length_rules,
     _maximal_structural_suffix,
     _pivots,
+    _range_contraction_ratio,
     _touch_events,
     add_compression_indicators,
     evaluate_both_sides,
@@ -48,6 +50,13 @@ def compression_frame(bars=20, side="LONG"):
         "v": np.full(bars, 1000.0),
     })
     return frame
+
+
+def range_frame(ranges):
+    return pd.DataFrame({
+        "h": [100.0 + value for value in ranges],
+        "l": [100.0] * len(ranges),
+    })
 
 
 def valid_compression_frame(bars=40):
@@ -114,12 +123,20 @@ def legacy_common_structure(frame, params):
     envelope = legacy_fit_shifted_envelope(frame, pivot_highs, pivot_lows)
     if not envelope:
         return {"pivot_highs": pivot_highs, "pivot_lows": pivot_lows, "envelope": {}}
-    widths = envelope["upper"] - envelope["lower"]
+    third = len(frame) // 3
+    ranges = frame["h"].reset_index(drop=True) - frame["l"].reset_index(drop=True)
+    first_mean = float(ranges.iloc[:third].mean()) if third else float("nan")
+    last_mean = float(ranges.iloc[-third:].mean()) if third else float("nan")
+    contraction_ratio = (
+        last_mean / first_mean
+        if math.isfinite(first_mean) and first_mean > 0 and math.isfinite(last_mean)
+        else float("inf")
+    )
     return {
         "pivot_highs": pivot_highs,
         "pivot_lows": pivot_lows,
         "envelope": envelope,
-        "contraction_ratio": float(widths.iloc[-1] / widths.iloc[0]) if widths.iloc[0] else float("inf"),
+        "contraction_ratio": contraction_ratio,
     }
 
 
@@ -181,10 +198,13 @@ def legacy_non_length_rules(frame, side, params):
         if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()):
             reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = legacy_touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
-    if (
-        not math.isfinite(float(atr.iloc[-1]))
-        or abs(float(ema8.iloc[-1] - ema21.iloc[-1])) > float(atr.iloc[-1]) * params.max_ema_distance_atr
-    ):
+    last_atr = float(atr.iloc[-1])
+    ema_distance_atr = (
+        abs(float(frame["c"].iloc[-1] - ema8.iloc[-1])) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0
+        else float("inf")
+    )
+    if ema_distance_atr > params.max_ema_distance_atr:
         reasons.append("EMA_DISTANCE_TOO_WIDE")
     swing = legacy_swing_structure(frame, pivot_highs, pivot_lows, side)
     if not swing["valid"]:
@@ -197,6 +217,7 @@ def legacy_non_length_rules(frame, side, params):
         "rejection_reasons": reasons, "pivot_highs": pivot_highs, "pivot_lows": pivot_lows,
         "envelope": envelope, "directional_events": directional_events,
         "swing": swing, "contraction_ratio": common["contraction_ratio"],
+        "ema_distance_atr": ema_distance_atr,
     }
 
 
@@ -322,10 +343,6 @@ def independent_legacy_evaluate_side(
         return legacy_rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params, bars, window)
     upper, lower = envelope["upper"], envelope["lower"]
     atr14 = float(window["atr14"].iloc[-1])
-    metrics["ema_distance_atr"] = (
-        abs(float(window["ema8"].iloc[-1] - window["ema21"].iloc[-1])) / atr14
-        if atr14 else float("inf")
-    )
     score, score_components = legacy_quality_score(metrics, params)
     result = {
         "symbol": symbol, "side": side, "evaluated_at": evaluated_at_ms,
@@ -454,6 +471,23 @@ class CompressionIndicatorTests(unittest.TestCase):
 
 
 class CompressionRuleTests(unittest.TestCase):
+    def test_range_contraction_accepts_exact_threshold(self):
+        frame = range_frame([2.0] * 5 + [9.0] + [1.3] * 5)
+        self.assertAlmostEqual(_range_contraction_ratio(frame), 0.65)
+
+    def test_range_contraction_rejects_value_above_threshold(self):
+        above = 0.650001
+        frame = range_frame([2.0] * 5 + [9.0] + [2.0 * above] * 5)
+        self.assertGreater(_range_contraction_ratio(frame), 0.65)
+
+    def test_range_contraction_excludes_middle_remainder(self):
+        frame = range_frame([2.0] * 5 + [500.0, 700.0] + [1.0] * 5)
+        self.assertAlmostEqual(_range_contraction_ratio(frame), 0.5)
+
+    def test_range_contraction_rejects_nonpositive_first_mean(self):
+        frame = range_frame([0.0] * 5 + [1.0] * 5)
+        self.assertTrue(math.isinf(_range_contraction_ratio(frame)))
+
     def test_vectorized_pivots_match_legacy_for_unique_and_tied_extrema(self):
         rng = np.random.default_rng(20260822)
         for bars in (5, 15, 40, 220):
@@ -624,11 +658,33 @@ class CompressionRuleTests(unittest.TestCase):
         rules = _non_length_rules(indicators, "LONG", CompressionParams())
         self.assertIn("CLOSE_IN_EMA_BAND", rules["rejection_reasons"])
 
-    def test_ema_distance_is_a_hard_rejection(self):
+    def test_close_to_ema8_distance_accepts_exactly_one_atr(self):
         indicators = add_compression_indicators(valid_compression_frame())
-        indicators.loc[indicators.index[-1], "ema8"] = indicators.loc[indicators.index[-1], "ema21"] + indicators.loc[indicators.index[-1], "atr14"] * 2
-        rules = _non_length_rules(indicators, "LONG", CompressionParams())
+        last = indicators.index[-1]
+        common = _common_structure(indicators, CompressionParams())
+        common["contraction_ratio"] = 0.65
+        indicators.loc[last, ["ema8", "ema21", "atr14", "c"]] = [
+            100.0, 99.0, 1.0, 101.0,
+        ]
+        rules = _non_length_rules(
+            indicators, "LONG", CompressionParams(), common=common,
+        )
+        self.assertNotIn("EMA_DISTANCE_TOO_WIDE", rules["rejection_reasons"])
+        self.assertAlmostEqual(rules["ema_distance_atr"], 1.0)
+
+    def test_close_to_ema8_distance_rejects_above_one_atr(self):
+        indicators = add_compression_indicators(valid_compression_frame())
+        last = indicators.index[-1]
+        common = _common_structure(indicators, CompressionParams())
+        common["contraction_ratio"] = 0.65
+        indicators.loc[last, ["ema8", "ema21", "atr14", "c"]] = [
+            100.0, 99.0, 1.0, 101.000001,
+        ]
+        rules = _non_length_rules(
+            indicators, "LONG", CompressionParams(), common=common,
+        )
         self.assertIn("EMA_DISTANCE_TOO_WIDE", rules["rejection_reasons"])
+        self.assertGreater(rules["ema_distance_atr"], 1.0)
 
     def test_long_requires_three_lower_wick_events(self):
         indicators = add_compression_indicators(valid_compression_frame(15))
@@ -679,9 +735,14 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual(len(window), len(indicators) - 1)
         self.assertEqual(rules["rejection_reasons"], [])
 
-    def test_benchmark_deep_fixture_traverses_more_than_two_candidate_geometries(self):
+    def test_suffix_search_traverses_many_candidate_geometries_with_range_rule(self):
         frame, metadata = benchmark_frame_for(0)
         self.assertEqual(metadata["cohort"], "deep")
+        indexes = np.arange(len(frame), dtype=float)
+        pulse = 0.7 * np.sin(indexes * np.pi / 3)
+        frame["h"] = frame["c"] + 3.0 + pulse
+        frame["l"] = frame["c"] - 3.0 + pulse
+        frame.loc[60, "h"] += 10.0
         evaluated_at = int(frame["ot"].iloc[-1] + 900_000)
         with patch(
             "momentum_compression._common_structure",
