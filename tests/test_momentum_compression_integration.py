@@ -260,8 +260,8 @@ class CompressionDashboardUiTests(unittest.TestCase):
             "episode_rows": [{"symbol": "FAILEDUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "live_price": 12.5, "breakout_at": 1720000000000, "breakout_price": 11.9, "sound_status": "unknown", "wechat_status": "failed", "quality_score": 20}],
             "rejection_counts": {"<img src=x>": float("inf")},
             "scan_failures": [{
-                "symbol": "BADUSDT", "stage": "15m_klines", "error_type": "TimeoutError",
-                "message": "upstream <slow>", "attempts": 2,
+                "symbol": "<failure-symbol>", "stage": "<failure-stage>",
+                "error_type": "<failure-type>", "message": "<failure-message>", "attempts": 2,
             }],
         })
         rendered = result["stats"]["innerHTML"] + result["main"]["innerHTML"]
@@ -287,10 +287,33 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("&lt;i&gt;wechat&lt;/i&gt;", rendered)
         self.assertIn("FRESHUSDT", rendered)
         self.assertIn("扫描失败明细", rendered)
-        self.assertIn("BADUSDT", rendered)
-        self.assertIn("upstream &lt;slow&gt;", rendered)
-        self.assertNotIn("upstream <slow>", rendered)
+        for escaped in ("&lt;failure-symbol&gt;", "&lt;failure-stage&gt;", "&lt;failure-type&gt;", "&lt;failure-message&gt;"):
+            self.assertIn(escaped, rendered)
+        for raw in ("<failure-symbol>", "<failure-stage>", "<failure-type>", "<failure-message>"):
+            self.assertNotIn(raw, rendered)
+        self.assertIn("<td>2</td>", rendered)
         self.assertNotRegex(rendered, r"NaN|Infinity")
+
+    def test_renderer_retains_full_symbols_in_each_compression_table(self):
+        rendered = render_compression_payload({
+            "pool_rows": [
+                {"symbol": "POOLONLYUSDT", "side": "LONG", "state": "PRE_BREAKOUT"},
+                {"symbol": "CURRENTONLYUSDT", "side": "SHORT", "state": "BREAKOUT_ACTIVE_SHORT"},
+            ],
+            "episode_rows": [{"symbol": "TERMINALONLYUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED"}],
+        })["main"]["innerHTML"]
+
+        pool_section = rendered[rendered.index("LONG 观察池"):rendered.index("SHORT 观察池")]
+        current_section = rendered[rendered.index("当前突破"):rendered.index("终止结构")]
+        terminal_section = rendered[rendered.index("终止结构"):rendered.index("拒绝统计")]
+        self.assertIn("POOLONLYUSDT", pool_section)
+        self.assertIn("CURRENTONLYUSDT", current_section)
+        self.assertIn("TERMINALONLYUSDT", terminal_section)
+
+    def test_renderer_omits_failure_details_without_a_failure_list(self):
+        for scan_failures in ([], {"symbol": "not-a-list"}):
+            rendered = render_compression_payload({"scan_failures": scan_failures})["main"]["innerHTML"]
+            self.assertNotIn("扫描失败明细", rendered)
 
     def test_renderer_gives_each_wechat_delivery_state_a_distinct_chinese_label(self):
         statuses = ("not_eligible", "pending", "delivered", "failed", "indeterminate", "unknown")
