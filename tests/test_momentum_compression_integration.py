@@ -81,6 +81,24 @@ class CompressionApiTests(unittest.TestCase):
             "message": "upstream <slow>", "attempts": 2,
         }])
 
+    def test_status_uses_persisted_failures_for_scan_error_count(self):
+        self._login()
+        failures = [{
+            "symbol": "BADUSDT", "stage": "15m_klines", "error_type": "TimeoutError",
+            "message": "upstream slow", "attempts": 2,
+        }]
+        with patch.object(web_ui, "load_compression_state", return_value={
+            "pool": {}, "episodes": {}, "last_scan_failures": failures,
+        }), \
+             patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
+             patch.object(web_ui, "_compression_scan_summary", {"scanned": 7, "eligible": 2, "errors": 0}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value=set()), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        self.assertEqual(payload["scan_failures"], failures)
+        self.assertEqual(payload["scan"]["errors"], len(payload["scan_failures"]))
+
     def test_status_marks_unknown_conflict_and_nonconfirmed_rows_not_eligible_for_wechat(self):
         self._login()
         pool = {

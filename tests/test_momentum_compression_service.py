@@ -187,6 +187,9 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
                 report = scan_compression_market(root / "state.json", root, max_workers=1)
 
         self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(
+            [call.kwargs.get("raise_errors") for call in fetch.call_args_list], [True, True]
+        )
         self.assertEqual(report["errors"], 0)
         self.assertEqual(report["failed_details"], [])
 
@@ -233,6 +236,9 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
         self.assertEqual(report["errors"], len(report["failed_details"]))
         self.assertEqual(len(report["failed_details"]), len(symbols))
         self.assertEqual(set(report["failed_symbols"]), set(symbols))
+        self.assertEqual(
+            report["failed_symbols"], [item["symbol"] for item in report["failed_details"]]
+        )
         self.assertEqual(stored["last_scan_failures"], report["failed_details"])
 
     def test_live_ticker_rejects_nan_and_infinity(self):

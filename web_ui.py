@@ -4490,6 +4490,8 @@ def compression_status():
     with _compression_monitor_lock:
         rejection_counts = dict(_compression_rejection_counts)
         scan_summary = dict(_compression_scan_summary)
+    scan_failures = list(compression_state.get("last_scan_failures", []))
+    scan_summary["errors"] = len(scan_failures)
     with _compression_alert_lock:
         alert_status = dict(_compression_alert_status)
     try:
@@ -4518,7 +4520,7 @@ def compression_status():
         "monitor": monitor,
         "pool_rows": alert_facts(compression_state["pool"].values()),
         "episode_rows": alert_facts(compression_state["episodes"].values()),
-        "scan_failures": list(compression_state.get("last_scan_failures", [])),
+        "scan_failures": scan_failures,
         "rejection_counts": rejection_counts,
         "scan": scan_summary,
         "alert": alert_status,
