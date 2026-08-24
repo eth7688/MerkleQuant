@@ -53,7 +53,14 @@ class CompressionMonitor:
         time_ms=None,
         sleep=time.sleep,
         thread_factory=threading.Thread,
+        stream_stale_after_ms=15_000,
     ):
+        if (
+            not isinstance(stream_stale_after_ms, int)
+            or isinstance(stream_stale_after_ms, bool)
+            or stream_stale_after_ms <= 0
+        ):
+            raise ValueError("stream_stale_after_ms must be a positive integer")
         self.state_path = Path(state_path)
         self.snapshot_dir = Path(snapshot_dir)
         self.event_callback = event_callback
@@ -64,6 +71,7 @@ class CompressionMonitor:
         self.time_ms = time_ms or (lambda: int(time.time() * 1000))
         self.sleep = sleep
         self.thread_factory = thread_factory
+        self.stream_stale_after_ms = stream_stale_after_ms
         self._state_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -74,6 +82,7 @@ class CompressionMonitor:
         self._stream_connected = False
         self._stream_ever_connected = False
         self._price_stream_status = "stopped"
+        self._last_stream_message_at_ms = 0
         self._last_scan_at = 0
         self._scan_started_at = 0
         self._scan_duration_ms = 0
@@ -137,16 +146,22 @@ class CompressionMonitor:
             return
         symbols = self._pool_symbols()
         prices = {}
+        message_at = self.time_ms() if now_ms is None else now_ms
+        has_valid_stream_price = False
         for row in rows:
-            if not isinstance(row, dict) or row.get("s") not in symbols:
-                self._dropped_price_rows += 1
-                continue
-            price = self._finite_price(row.get("c"))
-            if price is not None:
-                prices[row["s"]] = price
+            symbol = row.get("s") if isinstance(row, dict) else None
+            price = self._finite_price(row.get("c")) if isinstance(row, dict) else None
+            if isinstance(symbol, str) and symbol and price is not None:
+                has_valid_stream_price = True
+                if symbol in symbols:
+                    prices[symbol] = price
+                else:
+                    self._dropped_price_rows += 1
             else:
                 self._dropped_price_rows += 1
-        self._apply_prices(prices, self.time_ms() if now_ms is None else now_ms)
+        if has_valid_stream_price:
+            self._last_stream_message_at_ms = message_at
+        self._apply_prices(prices, message_at)
 
     def rest_fallback_once(self, *, now_ms=None) -> bool:
         try:
@@ -171,6 +186,7 @@ class CompressionMonitor:
         self._stream_connected = True
         self._stream_ever_connected = True
         self._price_stream_status = "connected"
+        self._last_stream_message_at_ms = self.time_ms()
 
     def _on_message(self, app, message):
         self.handle_message(message)
@@ -366,6 +382,7 @@ class CompressionMonitor:
             "scan_overdue": structure_scanning and self._scan_started_at > 0
             and self.time_ms() - self._scan_started_at >= 900_000,
             "price_stream_status": self._price_stream_status,
+            "last_price_message_at": self._last_stream_message_at_ms,
             "last_scan_at": self._last_scan_at or state["last_structure_scan_at"],
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,
             "last_error": self._last_error or state["last_error"],

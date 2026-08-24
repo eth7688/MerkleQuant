@@ -64,6 +64,27 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
         self.assertEqual(applied, {"POOLUSDT": 10.5})
 
+    def test_open_and_valid_message_update_stream_heartbeat(self):
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 1_000)
+            monitor._on_open(object())
+            self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
+
+            monitor.handle_message(
+                json.dumps([{"s": "OTHERUSDT", "c": "99"}]),
+                now_ms=2_000,
+            )
+
+        self.assertEqual(monitor.status()["last_price_message_at"], 2_000)
+
+    def test_malformed_or_nonfinite_message_does_not_refresh_stream_heartbeat(self):
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 1_000)
+            monitor._on_open(object())
+            monitor.handle_message(json.dumps([{"s": "POOLUSDT", "c": "bad"}]), now_ms=2_000)
+
+        self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
+
     def test_rest_fallback_filters_pool_prices(self):
         class Response:
             def raise_for_status(self):
