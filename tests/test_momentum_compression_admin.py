@@ -36,6 +36,8 @@ class CompressionInternalApiTests(unittest.TestCase):
             "scan_started_at": 99,
             "scan_duration_ms": 456,
             "scan_overdue": True,
+            "price_stream_status": "stale",
+            "last_price_message_at": 88,
             "last_error": "",
             "unexpected": "must not leak",
         }
@@ -57,6 +59,8 @@ class CompressionInternalApiTests(unittest.TestCase):
                     "scan_started_at": 99,
                     "scan_duration_ms": 456,
                     "scan_overdue": True,
+                    "price_stream_status": "stale",
+                    "last_price_message_at": 88,
                     "last_error": "",
                 },
                 "scan": {"scanned": 12, "eligible": 3, "errors": 1},

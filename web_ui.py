@@ -4556,6 +4556,7 @@ def _compression_internal_status():
             for key in (
                 "running", "auto_enabled", "last_scan_at", "next_scan_at",
                 "structure_scanning", "scan_started_at", "scan_duration_ms", "scan_overdue",
+                "price_stream_status", "last_price_message_at",
                 "last_error",
             )
         },
