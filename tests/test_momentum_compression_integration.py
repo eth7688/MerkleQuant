@@ -314,6 +314,21 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("<td>2</td>", rendered)
         self.assertNotRegex(rendered, r"NaN|Infinity")
 
+    def test_rejection_counts_are_sorted_by_count_then_name(self):
+        rendered = render_compression_payload({
+            "rejection_counts": {
+                "A_LOW": 1,
+                "Z_HIGH": 5,
+                "B_MIDDLE": 3,
+                "A_HIGH": 5,
+            },
+        })["main"]["innerHTML"]
+        rejection_section = rendered[rendered.index("拒绝统计"):]
+
+        self.assertLess(rejection_section.index("A_HIGH"), rejection_section.index("Z_HIGH"))
+        self.assertLess(rejection_section.index("Z_HIGH"), rejection_section.index("B_MIDDLE"))
+        self.assertLess(rejection_section.index("B_MIDDLE"), rejection_section.index("A_LOW"))
+
     def test_renderer_retains_full_symbols_in_each_compression_table(self):
         rendered = render_compression_payload({
             "pool_rows": [

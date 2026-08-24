@@ -133,6 +133,32 @@ class HtfAlignmentTests(unittest.TestCase):
 
 
 class CompressionScanFailureIsolationTests(unittest.TestCase):
+    def test_scan_symbol_supports_server_fetch_signature_without_raise_errors(self):
+        from momentum_compression_service import _scan_symbol
+
+        calls = []
+
+        def server_fetch(
+            symbol, interval, limit=200, exchange=None, closed_only=True,
+            market_type=None, testnet=None,
+        ):
+            calls.append((symbol, interval, limit, exchange, closed_only, market_type, testnet))
+            return trend_frame("LONG", 220)
+
+        with patch("momentum_compression_service.fetch_klines", side_effect=server_fetch), patch(
+            "momentum_compression_service.evaluate_both_sides", return_value=[]
+        ):
+            evaluations, frames, _ = _scan_symbol(
+                "KEEPUSDT", live_price=105.0, evaluated_at_ms=BASE_TIME
+            )
+
+        self.assertEqual(evaluations, [])
+        self.assertIn("KEEPUSDT", frames)
+        self.assertEqual(
+            calls,
+            [("KEEPUSDT", "15m", 220, "binance", True, "futures", False)],
+        )
+
     def test_scan_uses_one_bulk_price_snapshot_for_all_symbols(self):
         from momentum_compression_service import scan_compression_market
 
@@ -181,7 +207,7 @@ class CompressionScanFailureIsolationTests(unittest.TestCase):
             root = Path(folder)
             with patch("momentum_compression_service.fetch_compression_universe", return_value=(["KEEPUSDT"], {})), \
                  patch("momentum_compression_service.fetch_live_prices", return_value={"KEEPUSDT": 105.0}), \
-                 patch("momentum_compression_service.fetch_klines", side_effect=[TimeoutError("slow"), frame]) as fetch, \
+                 patch("momentum_compression_service.fetch_klines", autospec=True, side_effect=[TimeoutError("slow"), frame]) as fetch, \
                  patch("momentum_compression_service.evaluate_both_sides", return_value=[]), \
                  patch("momentum_compression_service.time.sleep"):
                 report = scan_compression_market(root / "state.json", root, max_workers=1)

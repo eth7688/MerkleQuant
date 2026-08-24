@@ -1,6 +1,7 @@
 """Binance Futures market scan coordinator for 15 minute compression signals."""
 
 import copy
+import inspect
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -149,9 +150,20 @@ def _scan_symbol(symbol: str, *, live_price: float, evaluated_at_ms: int) -> tup
     frame = None
     for attempt in (1, 2):
         try:
+            fetch_options = {
+                "exchange": "binance", "closed_only": True,
+                "market_type": "futures", "testnet": False,
+            }
+            try:
+                supports_raise_errors = (
+                    "raise_errors" in inspect.signature(fetch_klines).parameters
+                )
+            except (TypeError, ValueError):
+                supports_raise_errors = False
+            if supports_raise_errors:
+                fetch_options["raise_errors"] = True
             frame = fetch_klines(
-                symbol, "15m", 220, exchange="binance", closed_only=True,
-                market_type="futures", testnet=False, raise_errors=True,
+                symbol, "15m", 220, **fetch_options,
             )
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise ValueError("15m candle history is unavailable")
