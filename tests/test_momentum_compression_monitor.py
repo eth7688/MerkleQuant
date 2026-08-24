@@ -168,6 +168,87 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertEqual(events[0]["state"], "BREAKOUT_FRESH_LONG")
         self.assertEqual(events[0]["live_price"], 12.0)
 
+    def test_committed_current_source_keeps_callback_after_replacement_takes_gate(self):
+        commit_complete = threading.Event()
+        takeover_attempted = threading.Event()
+        takeover_complete = threading.Event()
+        events = []
+
+        class HandoffGate:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._source_thread = None
+
+            def __enter__(self):
+                self._lock.acquire()
+                if self._source_thread is None:
+                    self._source_thread = threading.get_ident()
+                return self
+
+            def __exit__(self, *args):
+                source_thread = threading.get_ident() == self._source_thread
+                self._lock.release()
+                if source_thread:
+                    if not takeover_complete.wait(1):
+                        raise AssertionError("replacement did not complete gate handoff")
+                else:
+                    takeover_complete.set()
+
+            def locked(self):
+                return self._lock.locked()
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root)
+            source_a = object()
+            source_b = object()
+            monitor._app = source_a
+            monitor._stream_commit_lock = HandoffGate()
+            commit_prices = monitor._commit_prices
+
+            def commit_then_wait_for_takeover(prices, now_ms):
+                result = commit_prices(prices, now_ms)
+                commit_complete.set()
+                self.assertTrue(takeover_attempted.wait(1))
+                return result
+
+            def callback(delivered_events):
+                events.extend(delivered_events)
+                self.assertFalse(monitor._state_lock.locked())
+                self.assertFalse(monitor._lifecycle_lock.locked())
+                self.assertFalse(monitor._stream_commit_lock.locked())
+                self.assertEqual(
+                    load_compression_state(root / "state.json")["pool"]["pool-long"]["live_price"],
+                    12.0,
+                )
+
+            monitor._commit_prices = commit_then_wait_for_takeover
+            monitor.event_callback = callback
+
+            def take_over_from_b():
+                self.assertTrue(commit_complete.wait(1))
+                takeover_attempted.set()
+                monitor._bind_stream_app(source_b)
+
+            takeover = threading.Thread(target=take_over_from_b)
+            source = threading.Thread(
+                target=lambda: monitor.handle_message(
+                    json.dumps([{"s": "POOLUSDT", "c": "12"}]),
+                    now_ms=2_000,
+                    source_app=source_a,
+                )
+            )
+            takeover.start()
+            source.start()
+            source.join(1)
+            takeover.join(1)
+
+        self.assertFalse(source.is_alive())
+        self.assertFalse(takeover.is_alive())
+        self.assertIs(monitor._app, source_b)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["state"], "BREAKOUT_FRESH_LONG")
+
     def test_current_source_can_commit_prices(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -229,20 +310,43 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertEqual(calls, [{"now_ms": 2_000}])
 
     def test_fallback_deadline_keeps_rest_start_cadence_from_request_start(self):
-        clock = iter((0, 1_000))
-        sleeps = []
+        clock = [0]
+        request_timeouts, request_starts, sleeps = [], [], []
+        requests_in_flight = [0]
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"symbol": "POOLUSDT", "price": "10.5"}]
+
+        def http_get(*args, **kwargs):
+            self.assertEqual(requests_in_flight[0], 0)
+            requests_in_flight[0] += 1
+            request_starts.append(clock[0])
+            request_timeouts.append(kwargs["timeout"])
+            clock[0] += 1_000
+            requests_in_flight[0] -= 1
+            return Response()
+
         with TemporaryDirectory() as folder:
-            monitor = self._monitor(Path(folder), time_ms=lambda: next(clock))
-            monitor.rest_fallback_once = lambda **kwargs: True
+            monitor = self._monitor(Path(folder), time_ms=lambda: clock[0], http_get=http_get)
 
             def sleep(seconds):
                 sleeps.append(seconds)
-                monitor._stop.set()
+                clock[0] += int(seconds * 1_000)
+                if len(sleeps) == 2:
+                    monitor._stop.set()
 
             monitor.sleep = sleep
             monitor._fallback_loop()
 
-        self.assertEqual(sleeps, [4])
+        self.assertEqual(request_timeouts, [4, 4])
+        self.assertTrue(all(timeout < 5 for timeout in request_timeouts))
+        self.assertEqual(request_starts, [0, 5_000])
+        self.assertEqual(sleeps, [4, 4])
+        self.assertEqual(requests_in_flight, [0])
 
     def test_watchdog_closes_stale_stream_while_rest_request_is_blocked(self):
         request_started = threading.Event()

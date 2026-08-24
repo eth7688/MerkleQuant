@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - requirements supplies this in producti
 FUTURES_MINI_TICKER_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
 FUTURES_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 _RECONNECT_DELAYS = (1, 2, 5, 10, 30)
+_REST_FALLBACK_TIMEOUT_SECONDS = 4
 
 
 def next_closed_15m_scan_at(now: datetime) -> datetime:
@@ -127,14 +128,15 @@ class CompressionMonitor:
         if source_app is None:
             events = self._commit_prices(prices, now_ms)
         else:
+            events = None
             with self._stream_commit_lock:
                 with self._lifecycle_lock:
                     if source_app is not self._app or source_app is self._close_intent_app:
                         return
-                events = self._commit_prices(prices, now_ms)
-            with self._lifecycle_lock:
-                if source_app is not self._app or source_app is self._close_intent_app:
-                    return
+                committed_events = self._commit_prices(prices, now_ms)
+                with self._lifecycle_lock:
+                    if source_app is self._app and source_app is not self._close_intent_app:
+                        events = committed_events
         if events:
             try:
                 self.event_callback(events)
@@ -197,7 +199,7 @@ class CompressionMonitor:
         if not symbols:
             return True
         try:
-            response = self.http_get(FUTURES_PRICE_URL, timeout=10)
+            response = self.http_get(FUTURES_PRICE_URL, timeout=_REST_FALLBACK_TIMEOUT_SECONDS)
             response.raise_for_status()
             rows = response.json()
         except Exception as error:
