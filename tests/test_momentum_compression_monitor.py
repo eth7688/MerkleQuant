@@ -43,12 +43,13 @@ class SchedulerTests(unittest.TestCase):
 
 
 class CompressionMonitorPriceTests(unittest.TestCase):
-    def _monitor(self, root, **kwargs):
+    def _monitor(self, root, *, with_pool=True, **kwargs):
         from momentum_compression_monitor import CompressionMonitor
 
         state_path = root / "state.json"
         state = default_state()
-        state["pool"]["pool-long"] = pool_item()
+        if with_pool:
+            state["pool"]["pool-long"] = pool_item()
         save_compression_state(state_path, state)
         return CompressionMonitor(state_path, root, lambda events: None, **kwargs)
 
@@ -102,6 +103,95 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(applied, {"POOLUSDT": 10.5})
+
+    def test_rest_fallback_skips_request_when_pool_is_empty(self):
+        calls = []
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(
+                Path(folder),
+                with_pool=False,
+                http_get=lambda *args, **kwargs: calls.append(args),
+            )
+            result = monitor.rest_fallback_once(now_ms=2_000)
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+
+    def test_fallback_cycle_uses_rest_even_while_stream_is_connected(self):
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 2_000)
+            monitor._stream_connected = True
+            calls = []
+            monitor.rest_fallback_once = lambda **kwargs: calls.append(kwargs) or True
+            monitor.sleep = lambda seconds: monitor._stop.set()
+            monitor._fallback_loop()
+
+        self.assertEqual(calls, [{"now_ms": 2_000}])
+
+    def test_connected_stream_is_closed_once_after_fifteen_seconds_without_prices(self):
+        class App:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 16_000)
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+
+            self.assertTrue(monitor._close_stale_stream(16_000))
+            self.assertFalse(monitor._close_stale_stream(16_001))
+
+        self.assertEqual(app.close_calls, 1)
+        self.assertFalse(monitor._stream_connected)
+        self.assertEqual(monitor.status()["price_stream_status"], "stale")
+
+    def test_tree_rest_breakout_emits_once_when_websocket_repeats_the_price(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"symbol": "TREEUSDT", "price": "0.03972"}]
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            state = default_state()
+            state["pool"]["tree-long"] = {
+                **pool_item("TREEUSDT"),
+                "compression_id": "tree-long",
+                "upper_boundary_price": 0.03969363636363638,
+                "lower_boundary_price": 0.03945749999999999,
+                "breakout_buffer_price": 0.000010545513981230876,
+                "htf_alignment": "UNKNOWN",
+            }
+            save_compression_state(root / "state.json", state)
+            callbacks = []
+            from momentum_compression_monitor import CompressionMonitor
+            monitor = CompressionMonitor(
+                root / "state.json",
+                root,
+                callbacks.extend,
+                http_get=lambda *args, **kwargs: Response(),
+                time_ms=lambda: 2_000,
+            )
+            monitor._stream_connected = True
+            monitor._last_stream_message_at_ms = 2_000
+            monitor.sleep = lambda seconds: monitor._stop.set()
+            monitor._fallback_loop()
+            monitor.handle_message(
+                json.dumps([{"s": "TREEUSDT", "c": "0.03973"}]),
+                now_ms=2_100,
+            )
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0]["state"], "BREAKOUT_FRESH_LONG")
+        self.assertEqual(callbacks[0]["live_price"], 0.03972)
 
     def test_reconnect_delays_follow_documented_caps(self):
         from momentum_compression_monitor import CompressionMonitor

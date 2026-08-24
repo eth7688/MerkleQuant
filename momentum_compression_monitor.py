@@ -164,6 +164,9 @@ class CompressionMonitor:
         self._apply_prices(prices, message_at)
 
     def rest_fallback_once(self, *, now_ms=None) -> bool:
+        symbols = self._pool_symbols()
+        if not symbols:
+            return True
         try:
             response = self.http_get(FUTURES_PRICE_URL, timeout=10)
             response.raise_for_status()
@@ -171,7 +174,6 @@ class CompressionMonitor:
         except Exception as error:
             self._last_error = f"REST fallback: {error}"
             return False
-        symbols = self._pool_symbols()
         prices = {}
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or row.get("symbol") not in symbols:
@@ -180,6 +182,24 @@ class CompressionMonitor:
             if price is not None:
                 prices[row["symbol"]] = price
         self._apply_prices(prices, self.time_ms() if now_ms is None else now_ms)
+        return True
+
+    def _close_stale_stream(self, now_ms: int) -> bool:
+        with self._lifecycle_lock:
+            if (
+                not self._stream_connected
+                or self._last_stream_message_at_ms <= 0
+                or now_ms - self._last_stream_message_at_ms < self.stream_stale_after_ms
+            ):
+                return False
+            self._stream_connected = False
+            self._price_stream_status = "stale"
+            app = self._app
+        if app is not None:
+            try:
+                app.close()
+            except Exception as error:
+                self._last_error = f"WebSocket stale close: {error}"
         return True
 
     def _on_open(self, app):
@@ -197,7 +217,7 @@ class CompressionMonitor:
 
     def _on_close(self, app, *args):
         self._stream_connected = False
-        if not self._stop.is_set():
+        if not self._stop.is_set() and self._price_stream_status != "stale":
             self._price_stream_status = "reconnecting"
 
     def _stream_loop(self):
@@ -223,7 +243,8 @@ class CompressionMonitor:
                 self._last_error = f"WebSocket: {error}"
             if self._stop.is_set():
                 break
-            self._price_stream_status = "reconnecting"
+            if self._price_stream_status != "stale":
+                self._price_stream_status = "reconnecting"
             if self._stream_ever_connected:
                 attempt = 0
             self.sleep(self.reconnect_delay(attempt))
@@ -231,8 +252,9 @@ class CompressionMonitor:
 
     def _fallback_loop(self):
         while not self._stop.is_set():
-            if not self._stream_connected:
-                self.rest_fallback_once()
+            now_ms = self.time_ms()
+            self._close_stale_stream(now_ms)
+            self.rest_fallback_once(now_ms=now_ms)
             self.sleep(5)
 
     def _scheduler_loop(self):
