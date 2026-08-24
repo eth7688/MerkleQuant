@@ -39,6 +39,7 @@ class CompressionInternalApiTests(unittest.TestCase):
             "price_stream_status": "stale",
             "last_price_message_at": 88,
             "last_error": "",
+            "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
             "unexpected": "must not leak",
         }
         with patch.object(web_ui._compression_monitor, "status", return_value=monitor), patch.object(
@@ -63,7 +64,12 @@ class CompressionInternalApiTests(unittest.TestCase):
                     "last_price_message_at": 88,
                     "last_error": "",
                 },
-                "scan": {"scanned": 12, "eligible": 3, "errors": 1},
+                "scan": {
+                    "scanned": 12,
+                    "eligible": 3,
+                    "errors": 1,
+                    "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+                },
             },
         )
 

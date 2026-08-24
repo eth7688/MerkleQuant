@@ -4560,7 +4560,10 @@ def _compression_internal_status():
                 "last_error",
             )
         },
-        "scan": {key: scan.get(key, 0) for key in ("scanned", "eligible", "errors")},
+        "scan": {
+            **{key: scan.get(key, 0) for key in ("scanned", "eligible", "errors")},
+            "rejection_counts": dict(monitor.get("rejection_counts", {})),
+        },
     }
 
 

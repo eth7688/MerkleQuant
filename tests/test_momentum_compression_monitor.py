@@ -796,6 +796,49 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
         self.assertTrue(overdue["scan_overdue"])
 
+    def test_successful_scan_publishes_rejection_counts(self):
+        report = {
+            "evaluated_at": 123,
+            "events": [],
+            "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+        }
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), lambda *args: report)
+
+            self.assertEqual(monitor.status()["rejection_counts"], {})
+            self.assertTrue(monitor.scan_now("manual"))
+            self.assertEqual(
+                monitor.status()["rejection_counts"],
+                {"INSUFFICIENT_PIVOTS": 7},
+            )
+
+    def test_failed_scan_keeps_last_successful_rejection_counts(self):
+        reports = iter((
+            {
+                "evaluated_at": 123,
+                "events": [],
+                "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+            },
+            RuntimeError("scan failed"),
+        ))
+
+        def scan(*args):
+            report = next(reports)
+            if isinstance(report, Exception):
+                raise report
+            return report
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), scan)
+            self.assertTrue(monitor.scan_now("manual"))
+            self.assertFalse(monitor.scan_now("manual"))
+            status = monitor.status()
+
+        self.assertEqual(
+            status["rejection_counts"], {"INSUFFICIENT_PIVOTS": 7}
+        )
+        self.assertEqual(status["last_error"], "manual scan: scan failed")
+
     def test_scan_dispatches_only_events_newer_than_enable_cursor_baseline(self):
         events = []
         reports = iter((

@@ -91,6 +91,7 @@ class CompressionMonitor:
         self._scan_duration_ms = 0
         self._next_scan_at = None
         self._last_error = ""
+        self._last_rejection_counts = {}
         self._dropped_price_rows = 0
         self._event_cursor = 0
         self._generation = 0
@@ -341,6 +342,14 @@ class CompressionMonitor:
         self._scan_started_at = self.time_ms()
         try:
             report = self.scan(self.state_path, self.snapshot_dir)
+            raw_rejection_counts = report.get("rejection_counts", {})
+            rejection_counts = {
+                key: value
+                for key, value in raw_rejection_counts.items()
+                if isinstance(key, str) and type(value) is int and value >= 0
+            } if isinstance(raw_rejection_counts, dict) else {}
+            with self._lifecycle_lock:
+                self._last_rejection_counts = rejection_counts
             events = [
                 event for event in report.get("events", [])
                 if isinstance(event, dict) and isinstance(event.get("event_id"), int)
@@ -467,6 +476,7 @@ class CompressionMonitor:
             running = self._running
             price_stream_status = self._price_stream_status
             last_price_message_at = self._last_stream_message_at_ms
+            rejection_counts = dict(self._last_rejection_counts)
         structure_scanning = self._scan_lock.locked()
         return {
             "running": running,
@@ -481,6 +491,7 @@ class CompressionMonitor:
             "last_scan_at": self._last_scan_at or state["last_structure_scan_at"],
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,
             "last_error": self._last_error or state["last_error"],
+            "rejection_counts": rejection_counts,
             "pool_size": len(state["pool"]),
             "today_fresh": sum(
                 1 for event in state["fresh_outbox"]
