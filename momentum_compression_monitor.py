@@ -75,6 +75,7 @@ class CompressionMonitor:
         self._state_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
+        self._stream_commit_lock = threading.Lock()
         self._stop = threading.Event()
         self._threads = []
         self._app = None
@@ -126,10 +127,14 @@ class CompressionMonitor:
         if source_app is None:
             events = self._commit_prices(prices, now_ms)
         else:
+            with self._stream_commit_lock:
+                with self._lifecycle_lock:
+                    if source_app is not self._app or source_app is self._close_intent_app:
+                        return
+                events = self._commit_prices(prices, now_ms)
             with self._lifecycle_lock:
                 if source_app is not self._app or source_app is self._close_intent_app:
                     return
-                events = self._commit_prices(prices, now_ms)
         if events:
             try:
                 self.event_callback(events)
@@ -220,6 +225,7 @@ class CompressionMonitor:
             self._price_stream_status = "stale"
             app = self._app
             self._close_intent_app = app
+            self._app = None
         if app is not None:
             try:
                 app.close()
@@ -254,6 +260,15 @@ class CompressionMonitor:
             if not self._stop.is_set():
                 self._price_stream_status = "reconnecting"
 
+    def _bind_stream_app(self, app) -> bool:
+        with self._stream_commit_lock:
+            with self._lifecycle_lock:
+                if self._stop.is_set():
+                    return False
+                self._app = app
+                self._close_intent_app = None
+                return True
+
     def _stream_loop(self):
         attempt = 0
         while not self._stop.is_set():
@@ -274,9 +289,8 @@ class CompressionMonitor:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                with self._lifecycle_lock:
-                    self._app = app
-                    self._close_intent_app = None
+                if not self._bind_stream_app(app):
+                    break
                 app.run_forever()
             except Exception as error:
                 with self._lifecycle_lock:
@@ -299,10 +313,15 @@ class CompressionMonitor:
 
     def _fallback_loop(self):
         while not self._stop.is_set():
-            now_ms = self.time_ms()
-            self._close_stale_stream(now_ms)
-            self.rest_fallback_once(now_ms=now_ms)
-            self.sleep(5)
+            started_at_ms = self.time_ms()
+            self.rest_fallback_once(now_ms=started_at_ms)
+            delay_seconds = max(0, (started_at_ms + 5_000 - self.time_ms()) / 1_000)
+            self.sleep(delay_seconds)
+
+    def _watchdog_loop(self):
+        while not self._stop.is_set():
+            self._close_stale_stream(self.time_ms())
+            self.sleep(1)
 
     def _scheduler_loop(self):
         while not self._stop.is_set():
@@ -358,7 +377,7 @@ class CompressionMonitor:
             self._restart_pending = False
             self._generation += 1
             generation = self._generation
-            workers = (self._stream_loop, self._fallback_loop, self._scheduler_loop)
+            workers = (self._stream_loop, self._fallback_loop, self._watchdog_loop, self._scheduler_loop)
             self._active_worker_count = len(workers)
             self._threads = [
                 self.thread_factory(
@@ -367,7 +386,8 @@ class CompressionMonitor:
                     daemon=True,
                 )
                 for worker, name in zip(workers, (
-                    "compression-price-stream", "compression-price-fallback", "compression-15m-scheduler",
+                    "compression-price-stream", "compression-price-fallback", "compression-price-watchdog",
+                    "compression-15m-scheduler",
                 ))
             ]
             for thread in self._threads:
@@ -400,6 +420,9 @@ class CompressionMonitor:
         with self._lifecycle_lock:
             self._stop.set()
             app = self._app
+            self._close_intent_app = app
+            self._app = None
+            self._stream_connected = False
             threads = tuple(self._threads)
         if app is not None:
             try:
@@ -412,10 +435,9 @@ class CompressionMonitor:
             if remaining <= 0:
                 break
             thread.join(remaining)
-        self._stream_connected = False
         with self._lifecycle_lock:
             still_running = self._running and self._active_worker_count > 0
-        self._price_stream_status = "stopping" if still_running else "stopped"
+            self._price_stream_status = "stopping" if still_running else "stopped"
         return not still_running
 
     def set_auto_enabled(self, enabled: bool) -> dict:
@@ -441,6 +463,8 @@ class CompressionMonitor:
             state = load_compression_state(self.state_path)
         with self._lifecycle_lock:
             running = self._running
+            price_stream_status = self._price_stream_status
+            last_price_message_at = self._last_stream_message_at_ms
         structure_scanning = self._scan_lock.locked()
         return {
             "running": running,
@@ -450,8 +474,8 @@ class CompressionMonitor:
             "scan_duration_ms": self._scan_duration_ms,
             "scan_overdue": structure_scanning and self._scan_started_at > 0
             and self.time_ms() - self._scan_started_at >= 900_000,
-            "price_stream_status": self._price_stream_status,
-            "last_price_message_at": self._last_stream_message_at_ms,
+            "price_stream_status": price_stream_status,
+            "last_price_message_at": last_price_message_at,
             "last_scan_at": self._last_scan_at or state["last_structure_scan_at"],
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,
             "last_error": self._last_error or state["last_error"],

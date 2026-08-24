@@ -146,8 +146,7 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
             def take_over_from_b():
                 takeover_attempted.set()
-                with monitor._lifecycle_lock:
-                    monitor._app = source_b
+                monitor._bind_stream_app(source_b)
                 takeover_complete.set()
 
             takeover = threading.Thread(target=take_over_from_b)
@@ -229,6 +228,59 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
         self.assertEqual(calls, [{"now_ms": 2_000}])
 
+    def test_fallback_deadline_keeps_rest_start_cadence_from_request_start(self):
+        clock = iter((0, 1_000))
+        sleeps = []
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: next(clock))
+            monitor.rest_fallback_once = lambda **kwargs: True
+
+            def sleep(seconds):
+                sleeps.append(seconds)
+                monitor._stop.set()
+
+            monitor.sleep = sleep
+            monitor._fallback_loop()
+
+        self.assertEqual(sleeps, [4])
+
+    def test_watchdog_closes_stale_stream_while_rest_request_is_blocked(self):
+        request_started = threading.Event()
+        release_request = threading.Event()
+
+        class App:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        def blocking_get(*args, **kwargs):
+            request_started.set()
+            self.assertTrue(release_request.wait(1))
+            raise RuntimeError("request released")
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(
+                Path(folder), http_get=blocking_get, time_ms=lambda: 16_000,
+            )
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+            fallback = threading.Thread(target=monitor.rest_fallback_once)
+            fallback.start()
+            self.assertTrue(request_started.wait(1))
+            monitor.sleep = lambda seconds: monitor._stop.set()
+            monitor._watchdog_loop()
+            release_request.set()
+            fallback.join(1)
+
+        self.assertFalse(fallback.is_alive())
+        self.assertEqual(app.close_calls, 1)
+        self.assertEqual(monitor.status()["price_stream_status"], "stale")
+
     def test_connected_stream_is_closed_once_after_fifteen_seconds_without_prices(self):
         class App:
             def __init__(self):
@@ -307,6 +359,73 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertFalse(monitor._stream_connected)
         self.assertEqual(monitor.status()["price_stream_status"], "stale")
         self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
+
+    def test_stop_timeout_revokes_current_app_before_late_message(self):
+        class App:
+            def close(self):
+                return None
+
+        events = []
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root, time_ms=lambda: 2_000)
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._stream_ever_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+            monitor._running = True
+            monitor._active_worker_count = 1
+            monitor.event_callback = events.extend
+
+            self.assertFalse(monitor.stop(timeout=0))
+            monitor._on_message(app, json.dumps([{"s": "POOLUSDT", "c": "12"}]))
+            item = load_compression_state(root / "state.json")["pool"]["pool-long"]
+
+        self.assertIsNone(item.get("live_price"))
+        self.assertEqual(events, [])
+        self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
+
+    def test_stale_revocation_is_not_blocked_by_source_price_persistence(self):
+        commit_started = threading.Event()
+        allow_commit = threading.Event()
+        close_complete = threading.Event()
+
+        class App:
+            def close(self):
+                close_complete.set()
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+            commit_prices = monitor._commit_prices
+
+            def block_commit(prices, now_ms):
+                commit_started.set()
+                self.assertTrue(allow_commit.wait(1))
+                return commit_prices(prices, now_ms)
+
+            monitor._commit_prices = block_commit
+            worker = threading.Thread(
+                target=lambda: monitor.handle_message(
+                    json.dumps([{"s": "POOLUSDT", "c": "12"}]),
+                    now_ms=2_000,
+                    source_app=app,
+                )
+            )
+            worker.start()
+            self.assertTrue(commit_started.wait(1))
+            self.assertTrue(monitor._close_stale_stream(17_000))
+            allow_commit.set()
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(close_complete.is_set())
 
     def test_delayed_callbacks_from_old_app_cannot_mutate_current_app_state(self):
         with TemporaryDirectory() as folder:
@@ -665,6 +784,7 @@ class CompressionMonitorScanTests(unittest.TestCase):
             monitor.thread_factory = ControlledThread
             monitor._stream_loop = lambda: None
             monitor._fallback_loop = lambda: None
+            monitor._watchdog_loop = lambda: None
             monitor._scheduler_loop = lambda: None
             state = default_state()
             state["auto_enabled"] = True
@@ -672,11 +792,11 @@ class CompressionMonitorScanTests(unittest.TestCase):
             self.assertTrue(monitor.start())
             self.assertFalse(monitor.stop(timeout=0))
             monitor.set_auto_enabled(True)
-            self.assertEqual(len(created), 3)
+            self.assertEqual(len(created), 4)
             for worker in list(created):
                 worker.target()
 
-        self.assertEqual(len(created), 6)
+        self.assertEqual(len(created), 8)
         self.assertTrue(monitor.status()["running"])
 
     def test_stop_uses_one_total_timeout_budget_for_blocking_workers(self):
@@ -722,7 +842,7 @@ class CompressionMonitorScanTests(unittest.TestCase):
 
             def start(self):
                 self.started = True
-                if len(created) == 3 and self is created[0]:
+                if len(created) == 4 and self is created[0]:
                     first_started.set()
                     allow_first_start.wait(1)
 
@@ -743,6 +863,7 @@ class CompressionMonitorScanTests(unittest.TestCase):
             monitor.thread_factory = BlockingThread
             monitor._stream_loop = lambda: None
             monitor._fallback_loop = lambda: None
+            monitor._watchdog_loop = lambda: None
             monitor._scheduler_loop = lambda: None
             state = default_state()
             state["auto_enabled"] = True
