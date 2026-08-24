@@ -108,9 +108,11 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(applied, {"POOLUSDT": 10.5})
 
-    def test_replaced_source_cannot_commit_prices_or_events_after_final_boundary(self):
-        reached_final_boundary = threading.Event()
+    def test_current_source_commits_before_replacement_can_take_over(self):
+        commit_started = threading.Event()
         allow_commit = threading.Event()
+        takeover_attempted = threading.Event()
+        takeover_complete = threading.Event()
         errors, events = [], []
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -119,17 +121,14 @@ class CompressionMonitorPriceTests(unittest.TestCase):
             source_b = object()
             monitor._app = source_a
             monitor.event_callback = events.extend
-            apply_prices = monitor._apply_prices
+            commit_prices = monitor._commit_prices
 
-            def block_before_commit(prices, now_ms, *, source_app=None):
-                reached_final_boundary.set()
+            def block_commit(prices, now_ms):
+                commit_started.set()
                 self.assertTrue(allow_commit.wait(1))
-                if source_app is None:
-                    apply_prices(prices, now_ms)
-                else:
-                    apply_prices(prices, now_ms, source_app=source_app)
+                return commit_prices(prices, now_ms)
 
-            monitor._apply_prices = block_before_commit
+            monitor._commit_prices = block_commit
 
             def handle_from_a():
                 try:
@@ -143,17 +142,32 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
             worker = threading.Thread(target=handle_from_a)
             worker.start()
-            self.assertTrue(reached_final_boundary.wait(1))
-            with monitor._lifecycle_lock:
-                monitor._app = source_b
+            self.assertTrue(commit_started.wait(1))
+
+            def take_over_from_b():
+                takeover_attempted.set()
+                with monitor._lifecycle_lock:
+                    monitor._app = source_b
+                takeover_complete.set()
+
+            takeover = threading.Thread(target=take_over_from_b)
+            takeover.start()
+            self.assertTrue(takeover_attempted.wait(1))
+            self.assertFalse(takeover_complete.wait(0.1))
             allow_commit.set()
             worker.join(1)
+            takeover.join(1)
             pool_item_after = load_compression_state(root / "state.json")["pool"]["pool-long"]
 
         self.assertFalse(worker.is_alive())
+        self.assertFalse(takeover.is_alive())
         self.assertEqual(errors, [])
-        self.assertNotIn("live_price", pool_item_after)
-        self.assertEqual(events, [])
+        self.assertTrue(takeover_complete.is_set())
+        self.assertEqual(pool_item_after["live_price"], 12.0)
+        self.assertEqual(pool_item_after["state"], "BREAKOUT_FRESH_LONG")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["state"], "BREAKOUT_FRESH_LONG")
+        self.assertEqual(events[0]["live_price"], 12.0)
 
     def test_current_source_can_commit_prices(self):
         with TemporaryDirectory() as folder:
