@@ -68,7 +68,9 @@ class CompressionMonitorPriceTests(unittest.TestCase):
     def test_open_and_valid_message_update_stream_heartbeat(self):
         with TemporaryDirectory() as folder:
             monitor = self._monitor(Path(folder), time_ms=lambda: 1_000)
-            monitor._on_open(object())
+            app = object()
+            monitor._app = app
+            monitor._on_open(app)
             self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
 
             monitor.handle_message(
@@ -81,7 +83,9 @@ class CompressionMonitorPriceTests(unittest.TestCase):
     def test_malformed_or_nonfinite_message_does_not_refresh_stream_heartbeat(self):
         with TemporaryDirectory() as folder:
             monitor = self._monitor(Path(folder), time_ms=lambda: 1_000)
-            monitor._on_open(object())
+            app = object()
+            monitor._app = app
+            monitor._on_open(app)
             monitor.handle_message(json.dumps([{"s": "POOLUSDT", "c": "bad"}]), now_ms=2_000)
 
         self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
@@ -150,6 +154,110 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertEqual(app.close_calls, 1)
         self.assertFalse(monitor._stream_connected)
         self.assertEqual(monitor.status()["price_stream_status"], "stale")
+
+    def test_fresh_message_linearized_before_stale_check_keeps_current_stream_open(self):
+        class App:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+
+            monitor.handle_message(
+                json.dumps([{"s": "POOLUSDT", "c": "10.5"}]),
+                now_ms=16_000,
+                source_app=app,
+            )
+            self.assertFalse(monitor._close_stale_stream(16_000))
+
+        self.assertEqual(app.close_calls, 0)
+        self.assertTrue(monitor._stream_connected)
+        self.assertEqual(monitor.status()["price_stream_status"], "connected")
+        self.assertEqual(monitor.status()["last_price_message_at"], 16_000)
+
+    def test_stale_close_intent_prevents_late_current_message_from_restoring_health(self):
+        class App:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+            app = App()
+            monitor._app = app
+            monitor._stream_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 1_000
+
+            self.assertTrue(monitor._close_stale_stream(16_000))
+            monitor.handle_message(
+                json.dumps([{"s": "POOLUSDT", "c": "10.5"}]),
+                now_ms=16_001,
+                source_app=app,
+            )
+
+        self.assertEqual(app.close_calls, 1)
+        self.assertFalse(monitor._stream_connected)
+        self.assertEqual(monitor.status()["price_stream_status"], "stale")
+        self.assertEqual(monitor.status()["last_price_message_at"], 1_000)
+
+    def test_delayed_callbacks_from_old_app_cannot_mutate_current_app_state(self):
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 3_000)
+            old_app = object()
+            current_app = object()
+            monitor._app = current_app
+            monitor._stream_connected = True
+            monitor._stream_ever_connected = True
+            monitor._price_stream_status = "connected"
+            monitor._last_stream_message_at_ms = 2_000
+
+            monitor._on_open(old_app)
+            monitor._on_message(old_app, json.dumps([{"s": "POOLUSDT", "c": "10.5"}]))
+            monitor._on_error(old_app, RuntimeError("old app failure"))
+            monitor._on_close(old_app)
+
+        self.assertTrue(monitor._stream_connected)
+        self.assertTrue(monitor._stream_ever_connected)
+        self.assertEqual(monitor.status()["price_stream_status"], "connected")
+        self.assertEqual(monitor.status()["last_price_message_at"], 2_000)
+        self.assertEqual(monitor.status()["last_error"], "")
+
+    def test_websocket_factory_failure_leaves_no_stale_app_ownership(self):
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+
+            def websocket_factory(url, **callbacks):
+                raise RuntimeError("factory unavailable")
+
+            monitor.websocket_factory = websocket_factory
+            monitor.sleep = lambda delay: monitor._stop.set()
+            monitor._stream_loop()
+
+        self.assertIsNone(monitor._app)
+        self.assertEqual(monitor.status()["last_error"], "WebSocket: factory unavailable")
+
+    def test_finished_socket_releases_current_app_before_stopping(self):
+        class App:
+            def run_forever(self):
+                monitor._stop.set()
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder))
+            monitor.websocket_factory = lambda url, **callbacks: App()
+            monitor._stream_loop()
+
+        self.assertIsNone(monitor._app)
 
     def test_stale_close_callback_stays_stale_before_the_next_socket_reconnects(self):
         apps, lifecycle_states, sleep_states = [], [], []

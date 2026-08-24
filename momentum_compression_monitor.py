@@ -78,6 +78,7 @@ class CompressionMonitor:
         self._stop = threading.Event()
         self._threads = []
         self._app = None
+        self._close_intent_app = None
         self._running = False
         self._stream_connected = False
         self._stream_ever_connected = False
@@ -133,7 +134,11 @@ class CompressionMonitor:
             return None
         return price if math.isfinite(price) and price > 0 else None
 
-    def handle_message(self, message, *, now_ms=None) -> None:
+    def handle_message(self, message, *, now_ms=None, source_app=None) -> None:
+        if source_app is not None:
+            with self._lifecycle_lock:
+                if source_app is not self._app or source_app is self._close_intent_app:
+                    return
         try:
             rows = json.loads(message)
         except (TypeError, json.JSONDecodeError):
@@ -161,6 +166,11 @@ class CompressionMonitor:
                 self._dropped_price_rows += 1
         if has_valid_stream_price:
             with self._lifecycle_lock:
+                if (
+                    source_app is not None
+                    and (source_app is not self._app or source_app is self._close_intent_app)
+                ):
+                    return
                 self._last_stream_message_at_ms = message_at
         self._apply_prices(prices, message_at)
 
@@ -196,6 +206,7 @@ class CompressionMonitor:
             self._stream_connected = False
             self._price_stream_status = "stale"
             app = self._app
+            self._close_intent_app = app
         if app is not None:
             try:
                 app.close()
@@ -205,23 +216,29 @@ class CompressionMonitor:
 
     def _on_open(self, app):
         with self._lifecycle_lock:
+            if app is not self._app or app is self._close_intent_app:
+                return
             self._stream_connected = True
             self._stream_ever_connected = True
             self._price_stream_status = "connected"
             self._last_stream_message_at_ms = self.time_ms()
 
     def _on_message(self, app, message):
-        self.handle_message(message)
+        self.handle_message(message, source_app=app)
 
     def _on_error(self, app, error):
         with self._lifecycle_lock:
+            if app is not self._app or app is self._close_intent_app:
+                return
             self._stream_connected = False
-        self._last_error = f"WebSocket: {error}"
+            self._last_error = f"WebSocket: {error}"
 
     def _on_close(self, app, *args):
         with self._lifecycle_lock:
+            if app is not self._app or app is self._close_intent_app:
+                return
             self._stream_connected = False
-            if not self._stop.is_set() and self._price_stream_status != "stale":
+            if not self._stop.is_set():
                 self._price_stream_status = "reconnecting"
 
     def _stream_loop(self):
@@ -235,6 +252,7 @@ class CompressionMonitor:
             with self._lifecycle_lock:
                 self._price_stream_status = "connecting"
                 self._stream_ever_connected = False
+            app = None
             try:
                 app = self.websocket_factory(
                     FUTURES_MINI_TICKER_URL,
@@ -245,14 +263,19 @@ class CompressionMonitor:
                 )
                 with self._lifecycle_lock:
                     self._app = app
+                    self._close_intent_app = None
                 app.run_forever()
             except Exception as error:
                 with self._lifecycle_lock:
-                    self._stream_connected = False
-                self._last_error = f"WebSocket: {error}"
-            if self._stop.is_set():
-                break
+                    if app is None or app is self._app:
+                        self._stream_connected = False
+                        self._last_error = f"WebSocket: {error}"
             with self._lifecycle_lock:
+                if app is self._app:
+                    self._app = None
+                    self._stream_connected = False
+                if self._stop.is_set():
+                    break
                 if self._price_stream_status != "stale":
                     self._price_stream_status = "reconnecting"
                 stream_ever_connected = self._stream_ever_connected
