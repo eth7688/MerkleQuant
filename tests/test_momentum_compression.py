@@ -193,18 +193,18 @@ def legacy_non_length_rules(frame, side, params):
     upper, lower = envelope["upper"], envelope["lower"]
     atr = frame["atr14"].replace(0, np.nan)
     ema8, ema21 = frame["ema8"], frame["ema21"]
+    ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
+    ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
     if side == "LONG":
         if not bool((ema8 > ema21).all()):
             reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] > pd.concat((ema8, ema21), axis=1).max(axis=1)).all()):
-            reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = legacy_touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
     else:
         if not bool((ema8 < ema21).all()):
             reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()):
-            reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = legacy_touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
+    if bool(((frame["c"] >= ema_low) & (frame["c"] <= ema_high)).any()):
+        reasons.append("CLOSE_IN_EMA_BAND")
     last_atr = float(atr.iloc[-1])
     ema_distance_atr = (
         abs(float(frame["c"].iloc[-1] - ema8.iloc[-1])) / last_atr
@@ -231,17 +231,27 @@ def legacy_non_length_rules(frame, side, params):
 def legacy_maximal_structural_suffix(indicators, side, params):
     if indicators.empty:
         return indicators, {"rejection_reasons": ["EMPTY_DATA"]}
-    selected = indicators
     minimum = 2 * params.pivot_span + 1
-    selected_rules = legacy_non_length_rules(indicators, side, params)
-    for start in range(len(indicators)):
-        candidate = indicators.iloc[start:].reset_index(drop=True)
-        if len(candidate) < minimum:
-            continue
+    ema8 = indicators["ema8"].to_numpy(dtype=float, copy=False)
+    ema21 = indicators["ema21"].to_numpy(dtype=float, copy=False)
+    close = indicators["c"].to_numpy(dtype=float, copy=False)
+    outside = (close < np.minimum(ema8, ema21)) | (close > np.maximum(ema8, ema21))
+    ordered = (ema8 > ema21) if side == "LONG" else (ema8 < ema21)
+    invalid = np.flatnonzero(~(ordered & outside))
+    first_start = int(invalid[-1] + 1) if invalid.size else 0
+    if len(indicators) - first_start < minimum:
+        candidate = indicators.iloc[first_start:]
+        return candidate, legacy_non_length_rules(candidate, side, params)
+    best = None
+    for start in range(first_start, len(indicators) - minimum + 1):
+        candidate = indicators.iloc[start:]
         rules = legacy_non_length_rules(candidate, side, params)
         if not rules["rejection_reasons"]:
             return candidate, rules
-    return selected, selected_rules
+        rank = (len(rules["rejection_reasons"]), -len(candidate))
+        if best is None or rank < best[0]:
+            best = (rank, candidate, rules)
+    return best[1], best[2]
 
 
 def legacy_pivots(frame, span):
@@ -570,7 +580,11 @@ class CompressionRuleTests(unittest.TestCase):
                 evaluated_at_ms=evaluated_at,
                 htf_alignment_by_side={},
             )
-        starts = [int(call.args[0]["ot"].iloc[0]) for call in common.call_args_list]
+        starts = [
+            int(call.args[0]["ot"].iloc[0])
+            for call in common.call_args_list
+            if not call.args[0].empty
+        ]
         self.assertEqual(len(starts), len(set(starts)))
 
     def test_ema_pruning_skips_only_suffixes_that_are_provably_invalid(self):
@@ -638,12 +652,21 @@ class CompressionRuleTests(unittest.TestCase):
                                evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_SHORT", result["rejection_reasons"])
-        self.assertEqual(result["compression_bars"], 14)
+        self.assertEqual(result["compression_bars"], 13)
 
     def test_101_bars_rejects_without_truncating_to_100(self):
         frame = compression_frame(101)
-        result = evaluate_side("TESTUSDT", "LONG", frame, 100.0,
-                               evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
+        with patch(
+            "momentum_compression._maximal_structural_suffix",
+            side_effect=lambda indicators, *_args, **_kwargs: (
+                indicators, {"rejection_reasons": []},
+            ),
+        ):
+            result = evaluate_side(
+                "TESTUSDT", "LONG", frame, 100.0,
+                evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000),
+                htf_alignment="UNKNOWN",
+            )
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_LONG", result["rejection_reasons"])
         self.assertEqual(result["compression_bars"], 101)
@@ -716,6 +739,33 @@ class CompressionRuleTests(unittest.TestCase):
         indicators.loc[indicators.index[-1], "c"] = indicators.loc[indicators.index[-1], "ema8"]
         rules = _non_length_rules(indicators, "LONG", CompressionParams())
         self.assertIn("CLOSE_IN_EMA_BAND", rules["rejection_reasons"])
+
+    def test_g04_accepts_close_on_either_side_of_ordered_ema_band(self):
+        long_frame = add_compression_indicators(valid_compression_frame(15))
+        long_frame["ema8"], long_frame["ema21"], long_frame["c"] = 100.0, 99.0, 98.0
+        long_rules = _non_length_rules(long_frame, "LONG", CompressionParams())
+
+        short_frame = add_compression_indicators(valid_compression_frame(15))
+        short_frame["ema8"], short_frame["ema21"], short_frame["c"] = 99.0, 100.0, 101.0
+        short_rules = _non_length_rules(short_frame, "SHORT", CompressionParams())
+
+        self.assertNotIn("CLOSE_IN_EMA_BAND", long_rules["rejection_reasons"])
+        self.assertNotIn("CLOSE_IN_EMA_BAND", short_rules["rejection_reasons"])
+
+    def test_g04_rejects_close_equal_to_either_ema_boundary(self):
+        long_frame = add_compression_indicators(valid_compression_frame(15))
+        long_frame["ema8"], long_frame["ema21"], long_frame["c"] = 100.0, 99.0, 100.0
+        short_frame = add_compression_indicators(valid_compression_frame(15))
+        short_frame["ema8"], short_frame["ema21"], short_frame["c"] = 99.0, 100.0, 99.0
+
+        self.assertIn(
+            "CLOSE_IN_EMA_BAND",
+            _non_length_rules(long_frame, "LONG", CompressionParams())["rejection_reasons"],
+        )
+        self.assertIn(
+            "CLOSE_IN_EMA_BAND",
+            _non_length_rules(short_frame, "SHORT", CompressionParams())["rejection_reasons"],
+        )
 
     def test_close_to_ema8_distance_accepts_exactly_one_atr(self):
         indicators = add_compression_indicators(valid_compression_frame())
@@ -793,6 +843,44 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual(int(window["ot"].iloc[0]), int(indicators["ot"].iloc[1]))
         self.assertEqual(len(window), len(indicators) - 1)
         self.assertEqual(rules["rejection_reasons"], [])
+
+    def test_failed_suffix_search_returns_best_real_suffix_not_full_history(self):
+        indicators = add_compression_indicators(valid_compression_frame(220))
+        indicators["ema8"], indicators["ema21"], indicators["c"] = 100.0, 99.0, 101.0
+
+        def rules(candidate, side, params, common=None):
+            reasons = (
+                ["INSUFFICIENT_CONTRACTION"]
+                if len(candidate) == 40
+                else ["INSUFFICIENT_CONTRACTION", "INSUFFICIENT_DIRECTIONAL_TOUCHES"]
+            )
+            return {"rejection_reasons": reasons}
+
+        with patch.object(compression_module, "_non_length_rules", side_effect=rules), patch.object(
+            compression_module, "_common_structure", return_value={}
+        ):
+            window, rules = _maximal_structural_suffix(
+                indicators, "LONG", CompressionParams()
+            )
+
+        self.assertEqual(len(window), 40)
+        self.assertEqual(rules["rejection_reasons"], ["INSUFFICIENT_CONTRACTION"])
+
+    def test_failed_suffix_search_reports_real_latest_ema_streak(self):
+        indicators = add_compression_indicators(valid_compression_frame(30))
+        indicators["ema8"], indicators["ema21"], indicators["c"] = 101.0, 100.0, 102.0
+        indicators.loc[18:, ["ema8", "ema21", "c"]] = [99.0, 100.0, 98.0]
+
+        with patch.object(
+            compression_module,
+            "_non_length_rules",
+            return_value={"rejection_reasons": ["INSUFFICIENT_PIVOTS"]},
+        ), patch.object(compression_module, "_common_structure", return_value={}):
+            window, _ = _maximal_structural_suffix(
+                indicators, "SHORT", CompressionParams()
+            )
+
+        self.assertEqual(len(window), 12)
 
     def test_suffix_search_traverses_many_candidate_geometries_with_range_rule(self):
         frame, metadata = benchmark_frame_for(0)

@@ -159,22 +159,22 @@ def _non_length_rules(frame, side, params, *, common=None):
     upper, lower = envelope["upper"], envelope["lower"]
     atr = frame["atr14"].replace(0, np.nan)
     ema8, ema21 = frame["ema8"], frame["ema21"]
+    ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
+    ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
     if side == "LONG":
         if not bool((ema8 > ema21).all()):
             reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] > pd.concat((ema8, ema21), axis=1).max(axis=1)).all()):
-            reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = _touch_events(
             frame["l"], lower, atr, params.touch_tolerance_atr
         )
     else:
         if not bool((ema8 < ema21).all()):
             reasons.append("EMA_DIRECTION")
-        if not bool((frame["c"] < pd.concat((ema8, ema21), axis=1).min(axis=1)).all()):
-            reasons.append("CLOSE_IN_EMA_BAND")
         directional_events = _touch_events(
             frame["h"], upper, atr, params.touch_tolerance_atr
         )
+    if bool(((frame["c"] >= ema_low) & (frame["c"] <= ema_high)).any()):
+        reasons.append("CLOSE_IN_EMA_BAND")
     last_atr = float(atr.iloc[-1])
     ema_distance_atr = (
         abs(float(frame["c"].iloc[-1] - ema8.iloc[-1])) / last_atr
@@ -203,10 +203,13 @@ def _ema_candidate_start(indicators: pd.DataFrame, side: str) -> int:
     ema8 = indicators["ema8"].to_numpy(dtype=float, copy=False)
     ema21 = indicators["ema21"].to_numpy(dtype=float, copy=False)
     close = indicators["c"].to_numpy(dtype=float, copy=False)
+    outside_band = (close < np.minimum(ema8, ema21)) | (
+        close > np.maximum(ema8, ema21)
+    )
     if side == "LONG":
-        valid = (ema8 > ema21) & (close > np.maximum(ema8, ema21))
+        valid = (ema8 > ema21) & outside_band
     else:
-        valid = (ema8 < ema21) & (close < np.minimum(ema8, ema21))
+        valid = (ema8 < ema21) & outside_band
     invalid = np.flatnonzero(~valid)
     return int(invalid[-1] + 1) if invalid.size else 0
 
@@ -229,18 +232,20 @@ def _maximal_structural_suffix(
             cache[candidate_length] = common
         return _non_length_rules(candidate, side, params, common=common)
 
-    selected_rules = rules_for(indicators)
-    if not selected_rules["rejection_reasons"]:
-        return indicators, selected_rules
-    if "EMA_DISTANCE_TOO_WIDE" in selected_rules["rejection_reasons"]:
-        return indicators, selected_rules
-    first_start = max(1, _ema_candidate_start(indicators, side))
+    first_start = _ema_candidate_start(indicators, side)
+    if len(indicators) - first_start < minimum:
+        candidate = indicators.iloc[first_start:]
+        return candidate, rules_for(candidate)
+    best = None
     for start in range(first_start, len(indicators) - minimum + 1):
         candidate = indicators.iloc[start:]
         rules = rules_for(candidate)
         if not rules["rejection_reasons"]:
             return candidate, rules
-    return indicators, selected_rules
+        rank = (len(rules["rejection_reasons"]), -len(candidate))
+        if best is None or rank < best[0]:
+            best = (rank, candidate, rules)
+    return best[1], best[2]
 
 
 def _quality_score(metrics: dict, params: CompressionParams) -> tuple[float, dict]:
