@@ -151,6 +151,68 @@ class CompressionMonitorPriceTests(unittest.TestCase):
         self.assertFalse(monitor._stream_connected)
         self.assertEqual(monitor.status()["price_stream_status"], "stale")
 
+    def test_stale_close_callback_stays_stale_before_the_next_socket_reconnects(self):
+        apps, lifecycle_states, sleep_states = [], [], []
+        app_started = threading.Event()
+        allow_open = threading.Event()
+        opened = threading.Event()
+        proceed_to_stale_close = threading.Event()
+
+        class App:
+            def __init__(self, **callbacks):
+                self.callbacks = callbacks
+                apps.append(self)
+
+            def close(self):
+                self.callbacks["on_close"](self)
+
+            def run_forever(self):
+                if len(apps) == 1:
+                    app_started.set()
+                    allow_open.wait(1)
+                    self.callbacks["on_open"](self)
+                    opened.set()
+                    proceed_to_stale_close.wait(1)
+                    self.callbacks["on_message"](
+                        self,
+                        json.dumps([{"s": "POOLUSDT", "c": "10.5"}]),
+                    )
+                    if not monitor._close_stale_stream(16_000):
+                        raise AssertionError("expected stale stream close")
+                    lifecycle_states.append(monitor._price_stream_status)
+                    return
+                lifecycle_states.append(monitor._price_stream_status)
+                self.callbacks["on_open"](self)
+                self.callbacks["on_close"](self)
+                lifecycle_states.append(monitor._price_stream_status)
+                monitor._stop.set()
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), time_ms=lambda: 1_000)
+            def websocket_factory(url, **callbacks):
+                return App(**callbacks)
+
+            monitor.websocket_factory = websocket_factory
+            monitor.sleep = lambda delay: sleep_states.append(monitor._price_stream_status)
+
+            worker = threading.Thread(target=monitor._stream_loop)
+            worker.start()
+            self.assertTrue(app_started.wait(1))
+            monitor._lifecycle_lock.acquire()
+            try:
+                allow_open.set()
+                self.assertFalse(opened.wait(0.05))
+            finally:
+                monitor._lifecycle_lock.release()
+
+            self.assertTrue(opened.wait(1))
+            proceed_to_stale_close.set()
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(lifecycle_states, ["stale", "connecting", "reconnecting"])
+        self.assertEqual(sleep_states, ["stale"])
+
     def test_tree_rest_breakout_emits_once_when_websocket_repeats_the_price(self):
         class Response:
             def raise_for_status(self):

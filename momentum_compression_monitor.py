@@ -160,7 +160,8 @@ class CompressionMonitor:
             else:
                 self._dropped_price_rows += 1
         if has_valid_stream_price:
-            self._last_stream_message_at_ms = message_at
+            with self._lifecycle_lock:
+                self._last_stream_message_at_ms = message_at
         self._apply_prices(prices, message_at)
 
     def rest_fallback_once(self, *, now_ms=None) -> bool:
@@ -203,49 +204,59 @@ class CompressionMonitor:
         return True
 
     def _on_open(self, app):
-        self._stream_connected = True
-        self._stream_ever_connected = True
-        self._price_stream_status = "connected"
-        self._last_stream_message_at_ms = self.time_ms()
+        with self._lifecycle_lock:
+            self._stream_connected = True
+            self._stream_ever_connected = True
+            self._price_stream_status = "connected"
+            self._last_stream_message_at_ms = self.time_ms()
 
     def _on_message(self, app, message):
         self.handle_message(message)
 
     def _on_error(self, app, error):
-        self._stream_connected = False
+        with self._lifecycle_lock:
+            self._stream_connected = False
         self._last_error = f"WebSocket: {error}"
 
     def _on_close(self, app, *args):
-        self._stream_connected = False
-        if not self._stop.is_set() and self._price_stream_status != "stale":
-            self._price_stream_status = "reconnecting"
+        with self._lifecycle_lock:
+            self._stream_connected = False
+            if not self._stop.is_set() and self._price_stream_status != "stale":
+                self._price_stream_status = "reconnecting"
 
     def _stream_loop(self):
         attempt = 0
         while not self._stop.is_set():
             if self.websocket_factory is None:
                 self._last_error = "websocket-client dependency is unavailable"
-                self._price_stream_status = "unavailable"
+                with self._lifecycle_lock:
+                    self._price_stream_status = "unavailable"
                 return
-            self._price_stream_status = "connecting"
-            self._stream_ever_connected = False
+            with self._lifecycle_lock:
+                self._price_stream_status = "connecting"
+                self._stream_ever_connected = False
             try:
-                self._app = self.websocket_factory(
+                app = self.websocket_factory(
                     FUTURES_MINI_TICKER_URL,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self._app.run_forever()
+                with self._lifecycle_lock:
+                    self._app = app
+                app.run_forever()
             except Exception as error:
-                self._stream_connected = False
+                with self._lifecycle_lock:
+                    self._stream_connected = False
                 self._last_error = f"WebSocket: {error}"
             if self._stop.is_set():
                 break
-            if self._price_stream_status != "stale":
-                self._price_stream_status = "reconnecting"
-            if self._stream_ever_connected:
+            with self._lifecycle_lock:
+                if self._price_stream_status != "stale":
+                    self._price_stream_status = "reconnecting"
+                stream_ever_connected = self._stream_ever_connected
+            if stream_ever_connected:
                 attempt = 0
             self.sleep(self.reconnect_delay(attempt))
             attempt += 1
