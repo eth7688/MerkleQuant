@@ -235,7 +235,7 @@ def _maximal_structural_suffix(
     first_start = _ema_candidate_start(indicators, side)
     if len(indicators) - first_start < minimum:
         candidate = indicators.iloc[first_start:]
-        return candidate, rules_for(candidate)
+        return candidate, {"rejection_reasons": []}
     best = None
     for start in range(first_start, len(indicators) - minimum + 1):
         candidate = indicators.iloc[start:]

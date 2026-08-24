@@ -241,7 +241,7 @@ def legacy_maximal_structural_suffix(indicators, side, params):
     first_start = int(invalid[-1] + 1) if invalid.size else 0
     if len(indicators) - first_start < minimum:
         candidate = indicators.iloc[first_start:]
-        return candidate, legacy_non_length_rules(candidate, side, params)
+        return candidate, {"rejection_reasons": []}
     best = None
     for start in range(first_start, len(indicators) - minimum + 1):
         candidate = indicators.iloc[start:]
@@ -876,11 +876,23 @@ class CompressionRuleTests(unittest.TestCase):
             "_non_length_rules",
             return_value={"rejection_reasons": ["INSUFFICIENT_PIVOTS"]},
         ), patch.object(compression_module, "_common_structure", return_value={}):
-            window, _ = _maximal_structural_suffix(
+            window, rules = _maximal_structural_suffix(
                 indicators, "SHORT", CompressionParams()
             )
 
         self.assertEqual(len(window), 12)
+
+    def test_substructural_ema_streak_defers_to_window_length_rejection(self):
+        indicators = add_compression_indicators(valid_compression_frame(30))
+        indicators["ema8"], indicators["ema21"], indicators["c"] = 101.0, 100.0, 102.0
+        indicators.loc[28:, ["ema8", "ema21", "c"]] = [99.0, 100.0, 98.0]
+
+        window, rules = _maximal_structural_suffix(
+            indicators, "SHORT", CompressionParams()
+        )
+
+        self.assertEqual(len(window), 2)
+        self.assertEqual(rules["rejection_reasons"], [])
 
     def test_suffix_search_traverses_many_candidate_geometries_with_range_rule(self):
         frame, metadata = benchmark_frame_for(0)
