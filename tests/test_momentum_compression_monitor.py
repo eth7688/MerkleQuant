@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from momentum_compression_store import default_state, save_compression_state
+from momentum_compression_store import default_state, load_compression_state, save_compression_state
 
 
 def pool_item(symbol="POOLUSDT"):
@@ -107,6 +107,89 @@ class CompressionMonitorPriceTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(applied, {"POOLUSDT": 10.5})
+
+    def test_replaced_source_cannot_commit_prices_or_events_after_final_boundary(self):
+        reached_final_boundary = threading.Event()
+        allow_commit = threading.Event()
+        errors, events = [], []
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root)
+            source_a = object()
+            source_b = object()
+            monitor._app = source_a
+            monitor.event_callback = events.extend
+            apply_prices = monitor._apply_prices
+
+            def block_before_commit(prices, now_ms, *, source_app=None):
+                reached_final_boundary.set()
+                self.assertTrue(allow_commit.wait(1))
+                if source_app is None:
+                    apply_prices(prices, now_ms)
+                else:
+                    apply_prices(prices, now_ms, source_app=source_app)
+
+            monitor._apply_prices = block_before_commit
+
+            def handle_from_a():
+                try:
+                    monitor.handle_message(
+                        json.dumps([{"s": "POOLUSDT", "c": "12"}]),
+                        now_ms=2_000,
+                        source_app=source_a,
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=handle_from_a)
+            worker.start()
+            self.assertTrue(reached_final_boundary.wait(1))
+            with monitor._lifecycle_lock:
+                monitor._app = source_b
+            allow_commit.set()
+            worker.join(1)
+            pool_item_after = load_compression_state(root / "state.json")["pool"]["pool-long"]
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("live_price", pool_item_after)
+        self.assertEqual(events, [])
+
+    def test_current_source_can_commit_prices(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root)
+            app = object()
+            monitor._app = app
+
+            monitor.handle_message(
+                json.dumps([{"s": "POOLUSDT", "c": "10.5"}]),
+                now_ms=2_000,
+                source_app=app,
+            )
+            pool_item_after = load_compression_state(root / "state.json")["pool"]["pool-long"]
+
+        self.assertEqual(pool_item_after["live_price"], 10.5)
+
+    def test_rest_fallback_commits_when_current_source_has_close_intent(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"symbol": "POOLUSDT", "price": "10.5"}]
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            monitor = self._monitor(root, http_get=lambda *args, **kwargs: Response())
+            app = object()
+            monitor._app = app
+            monitor._close_intent_app = app
+
+            monitor.rest_fallback_once(now_ms=2_000)
+            pool_item_after = load_compression_state(root / "state.json")["pool"]["pool-long"]
+
+        self.assertEqual(pool_item_after["live_price"], 10.5)
 
     def test_rest_fallback_skips_request_when_pool_is_empty(self):
         calls = []

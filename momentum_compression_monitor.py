@@ -112,14 +112,24 @@ class CompressionMonitor:
         with self._state_lock:
             return {item["symbol"] for item in load_compression_state(self.state_path)["pool"].values()}
 
-    def _apply_prices(self, prices: dict[str, float], now_ms: int) -> None:
-        if not prices:
-            return
+    def _commit_prices(self, prices: dict[str, float], now_ms: int) -> list[dict]:
         with self._state_lock:
             with compression_state_lock(self.state_path):
                 state = load_compression_state(self.state_path)
                 state, events = apply_live_prices(state, prices, now_ms)
                 save_compression_state(self.state_path, state)
+        return events
+
+    def _apply_prices(self, prices: dict[str, float], now_ms: int, *, source_app=None) -> None:
+        if not prices:
+            return
+        if source_app is None:
+            events = self._commit_prices(prices, now_ms)
+        else:
+            with self._lifecycle_lock:
+                if source_app is not self._app or source_app is self._close_intent_app:
+                    return
+                events = self._commit_prices(prices, now_ms)
         if events:
             try:
                 self.event_callback(events)
@@ -172,7 +182,10 @@ class CompressionMonitor:
                 ):
                     return
                 self._last_stream_message_at_ms = message_at
-        self._apply_prices(prices, message_at)
+        if source_app is None:
+            self._apply_prices(prices, message_at)
+        else:
+            self._apply_prices(prices, message_at, source_app=source_app)
 
     def rest_fallback_once(self, *, now_ms=None) -> bool:
         symbols = self._pool_symbols()
