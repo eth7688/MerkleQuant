@@ -155,7 +155,8 @@ def _validate_event(event: dict) -> None:
         raise ValueError("compression alert event is invalid")
 
 
-def _wechat_eligible(event: dict) -> bool:
+def compression_wechat_eligible(event: dict) -> bool:
+    """Return the single delivery-policy decision for immutable breakout events."""
     structure = event["structure"]
     tier = structure.get("candidate_tier", _STRICT_TIER)
     alignment = event["htf_alignment"]
@@ -229,7 +230,7 @@ def _public_event(source: dict, alert_id: int, now_ms: int) -> dict:
 
 
 def _reconcile_delivery_queue_unlocked(state: dict) -> bool:
-    retained = [item for item in state["delivery_queue"] if _wechat_eligible(item["event"])]
+    retained = [item for item in state["delivery_queue"] if compression_wechat_eligible(item["event"])]
     changed = len(retained) != len(state["delivery_queue"])
     state["delivery_queue"] = retained
     return changed
@@ -240,7 +241,7 @@ def _recover_eligible_queue_unlocked(state: dict, events: list[dict]) -> bool:
     queued_ids = {item["alert_id"] for item in state["delivery_queue"]}
     recovered = False
     for event in events:
-        if not _wechat_eligible(event) or event["alert_id"] in queued_ids:
+        if not compression_wechat_eligible(event) or event["alert_id"] in queued_ids:
             continue
         state["delivery_queue"].append({
             "alert_id": event["alert_id"], "event": copy.deepcopy(event),
@@ -285,7 +286,7 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
                 continue
             known.add(candidate["compression_id"])
             created.append(candidate)
-            if _wechat_eligible(candidate):
+            if compression_wechat_eligible(candidate):
                 state["delivery_queue"].append({
                     "alert_id": candidate["alert_id"], "event": copy.deepcopy(candidate),
                     "status": "pending", "attempts": 0, "last_attempt_at": 0,

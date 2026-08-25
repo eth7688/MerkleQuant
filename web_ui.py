@@ -30,6 +30,7 @@ from momentum_reflow_alerts import (
     read_public_alerts,
 )
 from momentum_compression_alerts import (
+    compression_wechat_eligible,
     compression_delivery_statuses,
     compression_sound_available_ids,
     deliver_due_compression_wechat,
@@ -4434,7 +4435,7 @@ def _process_compression_events(events, now_ms):
         with _compression_alert_lock:
             _compression_alert_status["last_error"] = _sanitize_compression_alert_error(error)
         return []
-    if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+    if any(compression_wechat_eligible(event) for event in created):
         _compression_alert_wakeup.set()
     return created
 
@@ -4466,7 +4467,7 @@ def _compression_alert_worker_loop():
                     MOMENTUM_COMPRESSION_ALERT_STATE,
                     int(time.time() * 1000),
                 )
-                if any(event.get("htf_alignment") == "CONFIRMED" for event in created):
+                if any(compression_wechat_eligible(event) for event in created):
                     _compression_alert_wakeup.set()
                 result = deliver_due_compression_wechat(
                     MOMENTUM_COMPRESSION_ALERT_SETTINGS,
@@ -4555,18 +4556,32 @@ def compression_status():
     except ValueError:
         wechat_statuses = {}
 
+    fresh_events = {
+        event.get("compression_id"): event
+        for event in compression_state.get("fresh_outbox", [])
+        if isinstance(event, dict) and isinstance(event.get("compression_id"), str)
+        and isinstance(event.get("structure"), dict)
+    }
+
     def alert_facts(rows):
         mapped = []
         for row in rows:
             item = dict(row)
-            item["candidate_tier"] = "WATCH" if item.get("candidate_tier") == "WATCH" else "STRICT"
             compression_id = item.get("compression_id")
-            item["sound_status"] = "available" if compression_id in sound_available_ids else "unknown"
-            eligible_for_wechat = (
-                item.get("htf_alignment") == "CONFIRMED"
-                if item["candidate_tier"] == "STRICT"
-                else item.get("htf_alignment") in {"CONFIRMED", "UNKNOWN"}
+            event = fresh_events.get(compression_id)
+            event_row = event is not None and (
+                item.get("state", "").startswith("BREAKOUT_")
+                or item.get("state") == "BREAKOUT_FAILED"
             )
+            if event_row:
+                item["candidate_tier"] = event["structure"].get("candidate_tier")
+                item["htf_alignment"] = event.get("htf_alignment")
+            item["candidate_tier"] = "WATCH" if item.get("candidate_tier") == "WATCH" else "STRICT"
+            item["sound_status"] = "available" if compression_id in sound_available_ids else "unknown"
+            delivery_event = event if event_row else {
+                "structure": item, "htf_alignment": item.get("htf_alignment", "UNKNOWN"),
+            }
+            eligible_for_wechat = compression_wechat_eligible(delivery_event)
             item["wechat_status"] = (
                 wechat_statuses.get(compression_id, "unknown")
                 if eligible_for_wechat else "not_eligible"

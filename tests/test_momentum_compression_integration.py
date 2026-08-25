@@ -177,6 +177,72 @@ class CompressionApiTests(unittest.TestCase):
 
         self.assertEqual(payload["pool_rows"][0]["wechat_status"], "pending")
 
+    def test_breakout_status_uses_immutable_event_tier_and_alignment_after_reconciliation(self):
+        self._login()
+        pool = {
+            "same": {
+                "compression_id": "same", "symbol": "WATCHUSDT", "side": "LONG",
+                "state": "BREAKOUT_ACTIVE_LONG", "candidate_tier": "STRICT",
+                "htf_alignment": "CONFIRMED",
+            },
+            "pre-breakout": {
+                "compression_id": "pre-breakout", "symbol": "PREUSDT", "side": "LONG",
+                "state": "PRE_BREAKOUT", "candidate_tier": "STRICT",
+                "htf_alignment": "CONFIRMED",
+            },
+        }
+        episodes = {
+            "terminal": {
+                "compression_id": "terminal", "symbol": "TERMINALUSDT", "side": "SHORT",
+                "state": "BREAKOUT_FAILED", "candidate_tier": "STRICT",
+                "htf_alignment": "CONFIRMED",
+            },
+        }
+        fresh_outbox = [
+            {
+                "compression_id": "same", "state": "BREAKOUT_FRESH_LONG", "event_at": 10,
+                "live_price": 101.0, "htf_alignment": "UNKNOWN",
+                "structure": {"symbol": "WATCHUSDT", "side": "LONG", "candidate_tier": "WATCH"},
+            },
+            {
+                "compression_id": "terminal", "state": "BREAKOUT_FRESH_SHORT", "event_at": 11,
+                "live_price": 99.0, "htf_alignment": "UNKNOWN",
+                "structure": {"symbol": "TERMINALUSDT", "side": "SHORT", "candidate_tier": "WATCH"},
+            },
+        ]
+        with patch.object(web_ui, "load_compression_state", return_value={
+            "pool": pool, "episodes": episodes, "fresh_outbox": fresh_outbox,
+        }), \
+             patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value={"same"}), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={"same": "pending", "terminal": "pending"}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        rows = {row["compression_id"]: row for row in payload["pool_rows"]}
+        terminal = payload["episode_rows"][0]
+        self.assertEqual(rows["same"]["candidate_tier"], "WATCH")
+        self.assertEqual(rows["same"]["htf_alignment"], "UNKNOWN")
+        self.assertEqual(rows["same"]["wechat_status"], "pending")
+        self.assertEqual(rows["pre-breakout"]["candidate_tier"], "STRICT")
+        self.assertEqual(terminal["candidate_tier"], "WATCH")
+        self.assertEqual(terminal["htf_alignment"], "UNKNOWN")
+        self.assertEqual(terminal["wechat_status"], "pending")
+
+    def test_watch_unknown_new_alert_wakes_delivery_worker_but_ineligible_events_do_not(self):
+        cases = (
+            ("WATCH", "UNKNOWN", True),
+            ("STRICT", "UNKNOWN", False),
+            ("WATCH", "CONFLICT", False),
+        )
+        for tier, alignment, expected in cases:
+            with self.subTest(tier=tier, alignment=alignment), \
+                 patch.object(web_ui, "drain_compression_outbox", return_value=[{
+                     **_fresh_event(alignment), "structure": {"symbol": "BTCUSDT", "side": "LONG", "candidate_tier": tier},
+                 }]):
+                web_ui._compression_alert_wakeup.clear()
+                web_ui._process_compression_events([], 11)
+                self.assertEqual(web_ui._compression_alert_wakeup.is_set(), expected)
+
     def test_only_15m_manual_compression_scan_is_valid(self):
         self.assertEqual(self.client.get("/scan/compression/15m").status_code, 401)
         self._login()
