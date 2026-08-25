@@ -96,6 +96,50 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(len(created), 1)
             self.assertEqual(self.queued_symbols(state), ["AUSDT"])
 
+    def test_strict_to_watch_same_compression_identity_never_appends_or_queues_twice(self):
+        with TemporaryDirectory() as folder:
+            events, state, _ = self.paths(Path(folder))
+            strict = fresh(alignment="CONFIRMED", compression_id="strict-to-watch")
+            watch = fresh(alignment="UNKNOWN", compression_id="strict-to-watch")
+            strict["structure"]["candidate_tier"] = "STRICT"
+            watch["structure"]["candidate_tier"] = "WATCH"
+            created = append_compression_alerts(events, state, [strict], 1_000)
+            created += append_compression_alerts(events, state, [watch], 2_000)
+            self.assertEqual(len(created), 1)
+            self.assertEqual(self.queued_symbols(state), ["AUSDT"])
+
+    def test_delivery_recovery_completes_reconciliation_recovery_and_interrupted_marking(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            dropped = fresh("DROPUSDT", "UNKNOWN", "drop")
+            recovered = fresh("RECOVERUSDT", "UNKNOWN", "recover")
+            inflight = fresh("FLIGHTUSDT", "CONFIRMED", "flight")
+            recovered["structure"]["candidate_tier"] = "WATCH"
+            append_compression_alerts(events, state, [dropped, recovered, inflight], 10)
+            event_by_id = {
+                event["alert_id"]: event
+                for event in read_public_compression_alerts(events, 0)["events"]
+            }
+            state.write_text(json.dumps({
+                "version": 1,
+                "delivery_queue": [
+                    {"alert_id": 1, "event": event_by_id[1], "status": "pending", "attempts": 0,
+                     "last_attempt_at": 0, "next_attempt_at": 10, "last_error": ""},
+                    {"alert_id": 3, "event": event_by_id[3], "status": "in_flight", "attempts": 1,
+                     "last_attempt_at": 10, "next_attempt_at": 0, "last_error": ""},
+                ],
+            }), encoding="utf-8")
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=0)
+            post = Mock()
+            result = deliver_due_compression_wechat(settings, state, events, 0, post=post)
+            queue = {item["alert_id"]: item for item in json.loads(state.read_text(encoding="utf-8"))["delivery_queue"]}
+            self.assertEqual(result, {"status": "waiting_retry", "alert_id": 2})
+            self.assertNotIn(1, queue)
+            self.assertEqual(queue[2]["status"], "pending")
+            self.assertEqual(queue[3]["status"], "indeterminate")
+            self.assertEqual(post.call_count, 0)
+
     def test_recovery_and_persisted_queue_reconciliation_share_tier_eligibility(self):
         with TemporaryDirectory() as folder:
             events, state, settings = self.paths(Path(folder))

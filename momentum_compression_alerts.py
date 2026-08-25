@@ -396,9 +396,10 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             return {"status": "disabled"}
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
-            if (_reconcile_delivery_queue_unlocked(state)
-                    or _recover_eligible_queue_unlocked(state, _read_events_unlocked(events_path))
-                    or _mark_interrupted_deliveries_unlocked(state)):
+            reconciled = _reconcile_delivery_queue_unlocked(state)
+            recovered = _recover_eligible_queue_unlocked(state, _read_events_unlocked(events_path))
+            interrupted = _mark_interrupted_deliveries_unlocked(state)
+            if reconciled or recovered or interrupted:
                 _atomic_write(state_path, state)
             item = next((item for item in state["delivery_queue"] if item["status"] == "pending"), None)
             if item is None:
