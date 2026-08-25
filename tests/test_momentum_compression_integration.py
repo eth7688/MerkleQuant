@@ -553,6 +553,29 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertIn("CURRENTONLYUSDT", current_section)
         self.assertIn("TERMINALONLYUSDT", terminal_section)
 
+    def test_renderer_adds_escaped_copy_buttons_to_all_compression_symbol_cells(self):
+        payload = {
+            "pool_rows": [
+                {"symbol": "LONG&\"USDT", "side": "LONG", "state": "PRE_BREAKOUT"},
+                {"symbol": "SHORTUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT"},
+                {"symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG"},
+            ],
+            "episode_rows": [{"symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED"}],
+        }
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+        self.assertIn("function compressionSymbolHtml(row)", source)
+        self.assertIn("this.getAttribute('data-symbol')", source)
+        self.assertIn("event.stopPropagation()", source)
+
+        result = render_compression_payload_twice(payload)
+        rendered = result["first"]["main"]
+        self.assertIn('data-symbol="LONG&amp;&quot;USDT"', rendered)
+        self.assertIn("LONG&amp;&quot;USDT", rendered)
+        for symbol in ("SHORTUSDT", "CURRENTUSDT", "TERMINALUSDT"):
+            self.assertIn('data-symbol="' + symbol + '"', rendered)
+        self.assertEqual(result["first"], result["second"])
+        self.assertEqual(result["before"], result["after"])
+
     def test_renderer_omits_failure_details_without_a_failure_list(self):
         for scan_failures in ([], {"symbol": "not-a-list"}):
             rendered = render_compression_payload({"scan_failures": scan_failures})["main"]["innerHTML"]
