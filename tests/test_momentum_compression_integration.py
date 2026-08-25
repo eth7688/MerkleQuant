@@ -556,8 +556,8 @@ class CompressionDashboardUiTests(unittest.TestCase):
     def test_renderer_adds_escaped_copy_buttons_to_all_compression_symbol_cells(self):
         payload = {
             "pool_rows": [
-                {"symbol": "LONG&\"USDT", "side": "LONG", "state": "PRE_BREAKOUT"},
-                {"symbol": "SHORTUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT"},
+                {"symbol": "LONGPOOLUSDT", "side": "LONG", "state": "PRE_BREAKOUT"},
+                {"symbol": "SHORTPOOLUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT"},
                 {"symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG"},
             ],
             "episode_rows": [{"symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED"}],
@@ -569,12 +569,53 @@ class CompressionDashboardUiTests(unittest.TestCase):
 
         result = render_compression_payload_twice(payload)
         rendered = result["first"]["main"]
-        self.assertIn('data-symbol="LONG&amp;&quot;USDT"', rendered)
-        self.assertIn("LONG&amp;&quot;USDT", rendered)
-        for symbol in ("SHORTUSDT", "CURRENTUSDT", "TERMINALUSDT"):
-            self.assertIn('data-symbol="' + symbol + '"', rendered)
+        long_section = rendered[rendered.index("LONG 观察池"):rendered.index("SHORT 观察池")]
+        short_section = rendered[rendered.index("SHORT 观察池"):rendered.index("当前突破")]
+        current_section = rendered[rendered.index("当前突破"):rendered.index("终止结构")]
+        terminal_section = rendered[rendered.index("终止结构"):rendered.index("严格级拒绝统计")]
+        for section, expected, absent in (
+            (long_section, ("LONGPOOLUSDT", "CURRENTUSDT"), ("SHORTPOOLUSDT", "TERMINALUSDT")),
+            (short_section, "SHORTPOOLUSDT", ("LONGPOOLUSDT", "CURRENTUSDT", "TERMINALUSDT")),
+            (current_section, "CURRENTUSDT", ("LONGPOOLUSDT", "SHORTPOOLUSDT", "TERMINALUSDT")),
+            (terminal_section, "TERMINALUSDT", ("LONGPOOLUSDT", "SHORTPOOLUSDT", "CURRENTUSDT")),
+        ):
+            expected = (expected,) if isinstance(expected, str) else expected
+            self.assertEqual(section.count('data-symbol="'), len(expected))
+            for symbol in expected:
+                self.assertIn('data-symbol="' + symbol + '"', section)
+            for symbol in absent:
+                self.assertNotIn(symbol, section)
         self.assertEqual(result["first"], result["second"])
         self.assertEqual(result["before"], result["after"])
+
+    def test_renderer_handles_missing_symbols_and_keeps_failure_rows_plain(self):
+        rendered = render_compression_payload({
+            "pool_rows": [{"symbol": None, "side": "LONG", "state": "PRE_BREAKOUT"}],
+            "scan_failures": [{"symbol": "FAILEDUSDT", "stage": "scan", "error_type": "Error", "message": "bad", "attempts": 1}],
+        })["main"]["innerHTML"]
+        long_section = rendered[rendered.index("LONG 观察池"):rendered.index("SHORT 观察池")]
+        failure_section = rendered[rendered.index("扫描失败明细"):rendered.index("LONG 观察池")]
+        self.assertIn(">--<", long_section)
+        self.assertNotIn("copy-sym", failure_section)
+        self.assertNotIn("data-symbol", failure_section)
+
+    def test_copy_symbol_uses_unescaped_dom_attribute_and_marks_button(self):
+        source = Path("web_ui.py").read_text(encoding="utf-8")
+        copy_function = source[source.index("function copySymbol(sym, el)"):source.index("function toggleSidebar()")]
+        raw_symbol = "RAW<&\"'"
+        raw_codes = ",".join(str(ord(char)) for char in raw_symbol)
+        script = (
+            "let textarea={value:'',style:{},select:()=>{},setSelectionRange:()=>{}};"
+            "let copied='';"
+            "global.setTimeout=()=>0;"
+            "global.document={createElement:()=>textarea,body:{appendChild:()=>{},removeChild:()=>{}},execCommand:cmd=>cmd==='copy'};"
+            "let el={getAttribute:name=>String.fromCharCode(" + raw_codes + "),classList:{add:name=>{copied=name;}}};"
+            + copy_function
+            + "copySymbol(el.getAttribute('data-symbol'),el);process.stdout.write(JSON.stringify({value:textarea.value,copied:copied}));"
+        )
+        result = json.loads(subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8").stdout)
+        self.assertEqual(result["value"], "RAW<&\"'")
+        self.assertEqual(result["copied"], "copied")
 
     def test_renderer_omits_failure_details_without_a_failure_list(self):
         for scan_failures in ([], {"symbol": "not-a-list"}):
