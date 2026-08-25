@@ -201,14 +201,16 @@ def legacy_non_length_rules(frame, side, params):
     ema8, ema21 = frame["ema8"], frame["ema21"]
     ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
     ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
+    upper_events = legacy_touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
+    lower_events = legacy_touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
     if side == "LONG":
         if not bool((ema8 > ema21).all()):
             reasons.append("EMA_DIRECTION")
-        directional_events = legacy_touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
+        directional_events, opposite_events = lower_events, upper_events
     else:
         if not bool((ema8 < ema21).all()):
             reasons.append("EMA_DIRECTION")
-        directional_events = legacy_touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
+        directional_events, opposite_events = upper_events, lower_events
     if bool(((frame["c"] >= ema_low) & (frame["c"] <= ema_high)).any()):
         reasons.append("CLOSE_IN_EMA_BAND")
     last_atr = float(atr.iloc[-1])
@@ -226,11 +228,28 @@ def legacy_non_length_rules(frame, side, params):
         reasons.append("INSUFFICIENT_CONTRACTION")
     if len(directional_events) < params.min_directional_boundary_touches:
         reasons.append("INSUFFICIENT_DIRECTIONAL_TOUCHES")
+    if len(opposite_events) < params.min_opposite_boundary_touches:
+        reasons.append("INSUFFICIENT_OPPOSITE_TOUCHES")
+    channel_width_atr = (
+        float(upper.iloc[-1] - lower.iloc[-1]) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0 else float("inf")
+    )
+    if not math.isfinite(channel_width_atr) or channel_width_atr > params.max_channel_width_atr:
+        reasons.append("CHANNEL_TOO_WIDE")
+    midline_slope = (envelope["upper_slope"] + envelope["lower_slope"]) / 2
+    midline_drift_atr = (
+        abs(midline_slope) * (len(frame) - 1) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0 else float("inf")
+    )
+    if not math.isfinite(midline_drift_atr) or midline_drift_atr > params.max_midline_drift_atr:
+        reasons.append("CHANNEL_DRIFT_TOO_LARGE")
     return {
         "rejection_reasons": reasons, "pivot_highs": pivot_highs, "pivot_lows": pivot_lows,
         "envelope": envelope, "directional_events": directional_events,
+        "opposite_events": opposite_events,
         "swing": swing, "contraction_ratio": common["contraction_ratio"],
-        "ema_distance_atr": ema_distance_atr,
+        "ema_distance_atr": ema_distance_atr, "channel_width_atr": channel_width_atr,
+        "midline_drift_atr": midline_drift_atr,
     }
 
 
@@ -324,6 +343,8 @@ def legacy_rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, param
         "compression_end_time": int(frame["ot"].iloc[-1]) if bars and "ot" in frame else 0,
         "upper_boundary_price": None, "lower_boundary_price": None, "atr14": None,
         "breakout_buffer_price": None, "directional_touch_times": [], "score_components": {},
+        "opposite_touch_count": 0, "opposite_touch_times": [],
+        "channel_width_atr": None, "midline_drift_atr": None,
     }
     result["compression_id"] = legacy_compression_identity(result)
     return result
@@ -385,6 +406,10 @@ def independent_legacy_evaluate_side(
         "pivot_low_count": len(metrics["pivot_lows"]),
         "directional_touch_count": len(metrics["directional_events"]),
         "directional_touch_times": [int(window["ot"].iloc[index]) for index in metrics["directional_events"]],
+        "opposite_touch_count": len(metrics["opposite_events"]),
+        "opposite_touch_times": [int(window["ot"].iloc[index]) for index in metrics["opposite_events"]],
+        "channel_width_atr": metrics["channel_width_atr"],
+        "midline_drift_atr": metrics["midline_drift_atr"],
         "breakout_buffer_price": atr14 * params.breakout_buffer_atr,
         "quality_score": score, "score_components": score_components,
         "swing": metrics["swing"],
@@ -572,8 +597,9 @@ class CompressionHistoricalRegressionTests(unittest.TestCase):
             htf_alignment="UNKNOWN",
         )
         self.assertEqual(result["state"], "REJECTED")
-        self.assertIn(
-            "INSUFFICIENT_CONTRACTION", result["strict_rejection_reasons"],
+        self.assertEqual(
+            result["strict_rejection_reasons"],
+            ["INSUFFICIENT_PIVOTS", "WINDOW_TOO_SHORT"],
         )
         indicators = add_compression_indicators(frame)
         former_window = indicators[
@@ -589,7 +615,7 @@ class CompressionHistoricalRegressionTests(unittest.TestCase):
             _non_length_rules(
                 former_window, "SHORT", CompressionParams(),
             )["rejection_reasons"],
-            ["INSUFFICIENT_CONTRACTION"],
+            ["INSUFFICIENT_CONTRACTION", "INSUFFICIENT_OPPOSITE_TOUCHES"],
         )
 
 
@@ -598,7 +624,7 @@ class CompressionRuleTests(unittest.TestCase):
         prepared = add_compression_indicators(valid_compression_frame(40))
         prepared["ema8"] = prepared["c"] - 0.5
         prepared["ema21"] = prepared["c"] - 1.0
-        prepared["atr14"] = 1.0
+        prepared["atr14"] = 4.0
         prepared.loc[invalid_index, ["ema8", "ema21"]] = [
             prepared.loc[invalid_index, "c"] - 1.0,
             prepared.loc[invalid_index, "c"] - 0.5,
@@ -1013,6 +1039,80 @@ class CompressionRuleTests(unittest.TestCase):
         rules = _non_length_rules(add_compression_indicators(two_touch_frame()), "SHORT", CompressionParams())
         self.assertEqual(len(rules["directional_events"]), 2)
         self.assertIn("INSUFFICIENT_DIRECTIONAL_TOUCHES", rules["rejection_reasons"])
+
+    def test_compact_range_guard_parameter_defaults(self):
+        params = CompressionParams()
+        self.assertEqual(params.min_opposite_boundary_touches, 2)
+        self.assertEqual(params.max_channel_width_atr, 3.0)
+        self.assertEqual(params.max_midline_drift_atr, 4.0)
+
+    def test_opposite_boundary_requires_two_events(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        common = _common_structure(indicators, CompressionParams())
+        with patch(
+            "momentum_compression._touch_events", side_effect=([8], [2, 6, 10]),
+        ):
+            rules = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        self.assertEqual(rules["opposite_events"], [8])
+        self.assertIn("INSUFFICIENT_OPPOSITE_TOUCHES", rules["rejection_reasons"])
+
+    def test_two_opposite_boundary_events_are_accepted(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        common = _common_structure(indicators, CompressionParams())
+        with patch(
+            "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
+        ):
+            rules = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        self.assertEqual(rules["opposite_events"], [4, 8])
+        self.assertNotIn("INSUFFICIENT_OPPOSITE_TOUCHES", rules["rejection_reasons"])
+
+    def test_channel_width_accepts_exactly_three_atr_and_rejects_above(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        common = _common_structure(indicators, CompressionParams())
+        common["envelope"] = {
+            "upper": pd.Series([103.0] * len(indicators)),
+            "lower": pd.Series([100.0] * len(indicators)),
+            "upper_slope": 0.0, "lower_slope": 0.0,
+        }
+        indicators.loc[indicators.index[-1], "atr14"] = 1.0
+        with patch(
+            "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
+        ):
+            exact = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        common["envelope"]["upper"] = pd.Series([103.000001] * len(indicators))
+        with patch(
+            "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
+        ):
+            above = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        self.assertEqual(exact["channel_width_atr"], 3.0)
+        self.assertNotIn("CHANNEL_TOO_WIDE", exact["rejection_reasons"])
+        self.assertGreater(above["channel_width_atr"], 3.0)
+        self.assertIn("CHANNEL_TOO_WIDE", above["rejection_reasons"])
+
+    def test_midline_drift_accepts_exactly_four_atr_and_rejects_above(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        common = _common_structure(indicators, CompressionParams())
+        common["envelope"] = {
+            "upper": pd.Series([103.0] * len(indicators)),
+            "lower": pd.Series([100.0] * len(indicators)),
+            "upper_slope": 4.0 / (len(indicators) - 1),
+            "lower_slope": 4.0 / (len(indicators) - 1),
+        }
+        indicators.loc[indicators.index[-1], "atr14"] = 1.0
+        with patch(
+            "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
+        ):
+            exact = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        common["envelope"]["upper_slope"] = 4.000001 / (len(indicators) - 1)
+        common["envelope"]["lower_slope"] = 4.000001 / (len(indicators) - 1)
+        with patch(
+            "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
+        ):
+            above = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
+        self.assertEqual(exact["midline_drift_atr"], 4.0)
+        self.assertNotIn("CHANNEL_DRIFT_TOO_LARGE", exact["rejection_reasons"])
+        self.assertGreater(above["midline_drift_atr"], 4.0)
+        self.assertIn("CHANNEL_DRIFT_TOO_LARGE", above["rejection_reasons"])
 
     def test_higher_high_and_higher_low_are_required_for_long(self):
         indicators = add_compression_indicators(valid_compression_frame())

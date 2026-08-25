@@ -24,6 +24,9 @@ class CompressionParams:
     pre_breakout_distance_atr: float = 0.35
     breakout_buffer_atr: float = 0.05
     min_directional_boundary_touches: int = 3
+    min_opposite_boundary_touches: int = 2
+    max_channel_width_atr: float = 3.0
+    max_midline_drift_atr: float = 4.0
     min_bars: int = 15
     max_bars: int = 100
 
@@ -164,18 +167,16 @@ def _non_length_rules(frame, side, params, *, common=None):
     ema8, ema21 = frame["ema8"], frame["ema21"]
     ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
     ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
+    upper_events = _touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
+    lower_events = _touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
     if side == "LONG":
         if not bool((ema8 > ema21).all()):
             reasons.append("EMA_DIRECTION")
-        directional_events = _touch_events(
-            frame["l"], lower, atr, params.touch_tolerance_atr
-        )
+        directional_events, opposite_events = lower_events, upper_events
     else:
         if not bool((ema8 < ema21).all()):
             reasons.append("EMA_DIRECTION")
-        directional_events = _touch_events(
-            frame["h"], upper, atr, params.touch_tolerance_atr
-        )
+        directional_events, opposite_events = upper_events, lower_events
     if bool(((frame["c"] >= ema_low) & (frame["c"] <= ema_high)).any()):
         reasons.append("CLOSE_IN_EMA_BAND")
     last_atr = float(atr.iloc[-1])
@@ -194,11 +195,30 @@ def _non_length_rules(frame, side, params, *, common=None):
         reasons.append("INSUFFICIENT_CONTRACTION")
     if len(directional_events) < params.min_directional_boundary_touches:
         reasons.append("INSUFFICIENT_DIRECTIONAL_TOUCHES")
+    if len(opposite_events) < params.min_opposite_boundary_touches:
+        reasons.append("INSUFFICIENT_OPPOSITE_TOUCHES")
+    channel_width_atr = (
+        float(upper.iloc[-1] - lower.iloc[-1]) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0
+        else float("inf")
+    )
+    if not math.isfinite(channel_width_atr) or channel_width_atr > params.max_channel_width_atr:
+        reasons.append("CHANNEL_TOO_WIDE")
+    midline_slope = (envelope["upper_slope"] + envelope["lower_slope"]) / 2
+    midline_drift_atr = (
+        abs(midline_slope) * (len(frame) - 1) / last_atr
+        if math.isfinite(last_atr) and last_atr > 0
+        else float("inf")
+    )
+    if not math.isfinite(midline_drift_atr) or midline_drift_atr > params.max_midline_drift_atr:
+        reasons.append("CHANNEL_DRIFT_TOO_LARGE")
     return {
         "rejection_reasons": reasons, "pivot_highs": pivot_highs, "pivot_lows": pivot_lows,
         "envelope": envelope, "directional_events": directional_events,
+        "opposite_events": opposite_events,
         "swing": swing, "contraction_ratio": contraction_ratio,
-        "ema_distance_atr": ema_distance_atr,
+        "ema_distance_atr": ema_distance_atr, "channel_width_atr": channel_width_atr,
+        "midline_drift_atr": midline_drift_atr,
     }
 
 
@@ -347,6 +367,8 @@ def _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params, bar
         "compression_end_time": int(frame["ot"].iloc[-1]) if bars and "ot" in frame else 0,
         "upper_boundary_price": None, "lower_boundary_price": None, "atr14": None,
         "breakout_buffer_price": None, "directional_touch_times": [], "score_components": {},
+        "opposite_touch_count": 0, "opposite_touch_times": [],
+        "channel_width_atr": None, "midline_drift_atr": None,
         "candidate_tier": None,
         "strict_rejection_reasons": list(dict.fromkeys(reasons)),
         "watch_rejection_reasons": list(dict.fromkeys(reasons)),
@@ -478,6 +500,12 @@ def _accepted_evaluation(
         "directional_touch_times": [
             int(window["ot"].iloc[index]) for index in metrics["directional_events"]
         ],
+        "opposite_touch_count": len(metrics["opposite_events"]),
+        "opposite_touch_times": [
+            int(window["ot"].iloc[index]) for index in metrics["opposite_events"]
+        ],
+        "channel_width_atr": metrics["channel_width_atr"],
+        "midline_drift_atr": metrics["midline_drift_atr"],
         "breakout_buffer_price": atr14 * params.breakout_buffer_atr,
         "quality_score": score, "score_components": score_components,
         "swing": metrics["swing"],
