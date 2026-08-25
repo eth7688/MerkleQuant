@@ -732,6 +732,14 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual(result["strict_rejection_reasons"], [])
         self.assertEqual(result["watch_rejection_reasons"], [])
         self.assertEqual(result["ema_confirmation_bars"], result["compression_bars"])
+        self.assertGreaterEqual(result["opposite_touch_count"], 2)
+        self.assertEqual(
+            len(result["opposite_touch_times"]), result["opposite_touch_count"],
+        )
+        self.assertTrue(math.isfinite(result["channel_width_atr"]))
+        self.assertLessEqual(result["channel_width_atr"], 3.0)
+        self.assertTrue(math.isfinite(result["midline_drift_atr"]))
+        self.assertLessEqual(result["midline_drift_atr"], 4.0)
 
     def test_watch_suffix_selection_is_independent_of_strict_ema_suffix(self):
         result = self._evaluate_with_prepared_watch_frame(self._prepared_watch_frame())
@@ -859,6 +867,10 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertIn("INVALID_SIDE", result["rejection_reasons"])
         self.assertIn("INVALID_LIVE_PRICE", result["rejection_reasons"])
         self.assertIn("EMPTY_DATA", result["rejection_reasons"])
+        self.assertEqual(result["opposite_touch_count"], 0)
+        self.assertEqual(result["opposite_touch_times"], [])
+        self.assertIsNone(result["channel_width_atr"])
+        self.assertIsNone(result["midline_drift_atr"])
 
     def test_boundary_requires_two_pivot_highs_and_two_pivot_lows(self):
         frame = compression_frame(15)
