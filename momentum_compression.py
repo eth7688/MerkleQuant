@@ -269,7 +269,7 @@ def _maximal_watch_structural_suffix(indicators, side, params, *, common_cache=N
     if len(indicators) < minimum:
         return indicators, {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
     cache = common_cache if common_cache is not None else {}
-    fallback = None
+    best = None
     for start in range(len(indicators) - minimum + 1):
         candidate = indicators.iloc[start:]
         candidate_length = len(candidate)
@@ -280,9 +280,10 @@ def _maximal_watch_structural_suffix(indicators, side, params, *, common_cache=N
         rules = _watch_non_length_rules(candidate, side, params, common=common)
         if not rules["rejection_reasons"]:
             return candidate, rules
-        if fallback is None:
-            fallback = (candidate, rules)
-    return fallback
+        rank = (len(rules["rejection_reasons"]), -candidate_length)
+        if best is None or rank < best[0]:
+            best = (rank, candidate, rules)
+    return best[1], best[2]
 
 
 def _watch_ema_rejection_reasons(frame: pd.DataFrame, side: str) -> list[str]:
@@ -408,7 +409,7 @@ def _evaluate_prepared_side(
         if watch_reasons:
             result = _rejected(
                 symbol, side, evaluated_at_ms, htf_alignment,
-                watch_reasons, params, watch_bars, watch_window,
+                watch_reasons, params, bars, window,
             )
             result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
             result["watch_rejection_reasons"] = watch_reasons

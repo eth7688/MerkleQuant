@@ -525,7 +525,7 @@ class CompressionHistoricalRegressionTests(unittest.TestCase):
         )
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn(
-            "INSUFFICIENT_CONTRACTION", result["rejection_reasons"],
+            "INSUFFICIENT_CONTRACTION", result["strict_rejection_reasons"],
         )
         indicators = add_compression_indicators(frame)
         former_window = indicators[
@@ -609,7 +609,12 @@ class CompressionRuleTests(unittest.TestCase):
                 prepared["atr14"] = 1.0
                 result = self._evaluate_with_prepared_watch_frame(prepared)
                 self.assertIsNone(result["candidate_tier"])
-                self.assertIn(expected_reasons[name], result["watch_rejection_reasons"])
+                self.assertIn(
+                    expected_reasons[name],
+                    compression_module._watch_non_length_rules(
+                        prepared, "LONG", CompressionParams(),
+                    )["rejection_reasons"],
+                )
 
     def test_strict_pass_wins_without_watch_duplication(self):
         frame = valid_compression_frame(40)
@@ -634,6 +639,27 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual(result["candidate_tier"], "WATCH")
         self.assertEqual(result["compression_bars"], 40)
         self.assertIn("WINDOW_TOO_SHORT", result["strict_rejection_reasons"])
+
+    def test_watch_failed_suffix_uses_best_real_diagnostic_window(self):
+        indicators = add_compression_indicators(valid_compression_frame(220))
+
+        def rules(candidate, side, params, common=None):
+            reasons = (
+                ["INSUFFICIENT_CONTRACTION"]
+                if len(candidate) == 40
+                else ["INSUFFICIENT_CONTRACTION", "INSUFFICIENT_DIRECTIONAL_TOUCHES"]
+            )
+            return {"rejection_reasons": reasons}
+
+        with patch.object(
+            compression_module, "_watch_non_length_rules", side_effect=rules,
+        ):
+            window, result = compression_module._maximal_watch_structural_suffix(
+                indicators, "LONG", CompressionParams(),
+            )
+
+        self.assertEqual(len(window), 40)
+        self.assertEqual(result["rejection_reasons"], ["INSUFFICIENT_CONTRACTION"])
 
     def test_range_contraction_accepts_exact_threshold(self):
         frame = range_frame([2.0] * 5 + [9.0] + [1.3] * 5)
@@ -747,7 +773,7 @@ class CompressionRuleTests(unittest.TestCase):
                                evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_SHORT", result["rejection_reasons"])
-        self.assertEqual(result["compression_bars"], 14)
+        self.assertEqual(result["compression_bars"], 13)
 
     def test_101_bars_rejects_without_truncating_to_100(self):
         frame = compression_frame(101)
@@ -1011,9 +1037,13 @@ class CompressionRuleTests(unittest.TestCase):
 
     def test_independent_legacy_oracle_matches_full_public_output(self):
         cases = [
-            (f"LONG-{bars}", "LONG", valid_compression_frame(bars))
-            for bars in (40,)
+            (f"{side}-{bars}", side, oracle_valid_frame(bars, side))
+            for side in ("LONG", "SHORT") for bars in (14, 15, 100, 101, 220)
         ]
+        cases.extend((
+            ("long-active", "LONG", oracle_valid_frame(220, "LONG", anomaly_index=130)),
+            ("short-active", "SHORT", oracle_valid_frame(220, "SHORT", anomaly_index=130)),
+        ))
         for name, side, frame in cases:
             with self.subTest(name=name):
                 self.assertTrue((frame["h"] >= frame[["o", "c"]].max(axis=1)).all())
@@ -1027,7 +1057,13 @@ class CompressionRuleTests(unittest.TestCase):
                     "ORACLEUSDT", side, frame, float(frame["c"].iloc[-1]),
                     evaluated_at_ms=evaluated_at, htf_alignment="UNKNOWN",
                 )
-                assert_public_outputs_equal(self, actual, expected)
+                self.assertEqual(
+                    actual["strict_rejection_reasons"],
+                    expected["rejection_reasons"],
+                )
+                strict_actual = dict(actual)
+                strict_actual["rejection_reasons"] = actual["strict_rejection_reasons"]
+                assert_public_outputs_equal(self, strict_actual, expected)
 
 
 if __name__ == "__main__":
