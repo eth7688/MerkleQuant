@@ -123,6 +123,28 @@ class CompressionApiTests(unittest.TestCase):
         payload["tier_counts"]["STRICT"] = 0
         self.assertEqual(monitor["tier_counts"]["STRICT"], 2)
 
+    def test_status_keeps_explicit_empty_strict_rejections_over_stale_legacy_map(self):
+        self._login()
+        monitor = {
+            "running": True,
+            "strict_rejection_counts": {},
+            "rejection_counts": {"STALE_LEGACY": 8},
+        }
+        with patch.object(web_ui, "load_compression_state", return_value={
+            "pool": {}, "episodes": {}, "last_scan_failures": [],
+        }), \
+             patch.object(web_ui._compression_monitor, "status", return_value=monitor), \
+             patch.object(web_ui, "_compression_rejection_counts", {"STALE_GLOBAL": 9}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value=set()), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        self.assertEqual(payload["strict_rejection_counts"], {})
+        self.assertEqual(payload["rejection_counts"], {})
+        payload["rejection_counts"]["LOCAL_ONLY"] = 1
+        self.assertEqual(payload["strict_rejection_counts"], {})
+        self.assertEqual(monitor["strict_rejection_counts"], {})
+
     def test_status_marks_unknown_conflict_and_nonconfirmed_rows_not_eligible_for_wechat(self):
         self._login()
         pool = {
@@ -277,6 +299,35 @@ process.stdout.write(JSON.stringify(nodes));
     return json.loads(completed.stdout)
 
 
+def render_compression_payload_twice(payload):
+    source = Path("web_ui.py").read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function escapeRHtml(value)"):
+        source.index("function fmtRValue(value,signed)")
+    ]
+    renderer = source[
+        source.index("var COMPRESSION_ALERT_SOUND_KEY="):
+        source.index("// ===== SCANNING =====")
+    ]
+    script = f"""
+var nodes={{stats:{{innerHTML:''}},main:{{innerHTML:''}}}};
+global.localStorage={{getItem:function(){{return null;}},setItem:function(){{}}}};
+global.window={{}};global.document={{getElementById:function(id){{return nodes[id]||null;}}}};
+{helpers}
+{renderer}
+var payload={json.dumps(payload)};
+var before=JSON.stringify(payload);
+renderMomentumCompression(payload);
+var first={{stats:nodes.stats.innerHTML,main:nodes.main.innerHTML}};
+nodes={{stats:{{innerHTML:''}},main:{{innerHTML:''}}}};
+renderMomentumCompression(payload);
+var second={{stats:nodes.stats.innerHTML,main:nodes.main.innerHTML}};
+process.stdout.write(JSON.stringify({{before:before,after:JSON.stringify(payload),first:first,second:second}}));
+"""
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+    return json.loads(completed.stdout)
+
+
 def run_compression_sound_javascript(body):
     source = Path("web_ui.py").read_text(encoding="utf-8")
     script = source[
@@ -369,6 +420,18 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertLess(rejection_section.index("A_HIGH"), rejection_section.index("Z_HIGH"))
         self.assertLess(rejection_section.index("Z_HIGH"), rejection_section.index("B_MIDDLE"))
         self.assertLess(rejection_section.index("B_MIDDLE"), rejection_section.index("A_LOW"))
+
+    def test_renderer_reuses_payload_without_mutating_breakout_state(self):
+        result = render_compression_payload_twice({
+            "pool_rows": [{
+                "symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG",
+                "candidate_tier": "WATCH",
+            }],
+        })
+
+        self.assertEqual(result["before"], result["after"])
+        self.assertEqual(result["first"], result["second"])
+        self.assertIn("BREAKOUT_ACTIVE_LONG", result["first"]["main"])
 
     def test_renderer_shows_tiers_in_all_tables_and_split_rejections(self):
         rendered = render_compression_payload({
