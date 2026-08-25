@@ -839,6 +839,57 @@ class CompressionMonitorScanTests(unittest.TestCase):
         )
         self.assertEqual(status["last_error"], "manual scan: scan failed")
 
+    def test_successful_scan_publishes_split_diagnostics_with_defensive_copies(self):
+        report = {
+            "evaluated_at": 123,
+            "events": [],
+            "tier_counts": {"STRICT": 2, "WATCH": 3, "IGNORED": 99},
+            "strict_rejection_counts": {"CLOSE_IN_EMA_BAND": 7, 9: 1, "bad": -1},
+            "watch_rejection_counts": {"INSUFFICIENT_PIVOTS": 4},
+        }
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), lambda *args: report)
+            self.assertTrue(monitor.scan_now("manual"))
+            status = monitor.status()
+            status["tier_counts"]["STRICT"] = 999
+            status["strict_rejection_counts"]["CLOSE_IN_EMA_BAND"] = 999
+            later = monitor.status()
+
+        self.assertEqual(later["tier_counts"], {"STRICT": 2, "WATCH": 3})
+        self.assertEqual(later["strict_rejection_counts"], {"CLOSE_IN_EMA_BAND": 7, "9": 1})
+        self.assertEqual(later["watch_rejection_counts"], {"INSUFFICIENT_PIVOTS": 4})
+        self.assertEqual(later["rejection_counts"], later["strict_rejection_counts"])
+        later["rejection_counts"]["MUTATED"] = 1
+        self.assertNotIn("MUTATED", monitor.status()["strict_rejection_counts"])
+
+    def test_failed_scan_keeps_all_last_successful_diagnostic_maps(self):
+        reports = iter((
+            {
+                "evaluated_at": 123,
+                "events": [],
+                "tier_counts": {"STRICT": 1, "WATCH": 2},
+                "strict_rejection_counts": {"EMA_DIRECTION": 3},
+                "watch_rejection_counts": {"INSUFFICIENT_PIVOTS": 4},
+            },
+            RuntimeError("scan failed"),
+        ))
+
+        def scan(*args):
+            report = next(reports)
+            if isinstance(report, Exception):
+                raise report
+            return report
+
+        with TemporaryDirectory() as folder:
+            monitor = self._monitor(Path(folder), scan)
+            self.assertTrue(monitor.scan_now("manual"))
+            self.assertFalse(monitor.scan_now("manual"))
+            status = monitor.status()
+
+        self.assertEqual(status["tier_counts"], {"STRICT": 1, "WATCH": 2})
+        self.assertEqual(status["strict_rejection_counts"], {"EMA_DIRECTION": 3})
+        self.assertEqual(status["watch_rejection_counts"], {"INSUFFICIENT_PIVOTS": 4})
+
     def test_scan_dispatches_only_events_newer_than_enable_cursor_baseline(self):
         events = []
         reports = iter((

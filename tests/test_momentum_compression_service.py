@@ -132,6 +132,29 @@ class HtfAlignmentTests(unittest.TestCase):
         self.assertEqual(result["timeframes"], {"1h": "UNKNOWN", "4h": "UNKNOWN"})
 
 
+class CompressionDiagnosticsTests(unittest.TestCase):
+    def test_split_tier_and_rejection_counts_use_explicit_audit_fields(self):
+        from momentum_compression_service import _compression_diagnostics
+
+        report = _compression_diagnostics([
+            {**eligible_evaluation(symbol="STRICTUSDT"), "candidate_tier": "STRICT",
+             "strict_rejection_reasons": [], "watch_rejection_reasons": []},
+            {**eligible_evaluation(symbol="WATCHUSDT"), "candidate_tier": "WATCH",
+             "strict_rejection_reasons": ["CLOSE_IN_EMA_BAND"], "watch_rejection_reasons": []},
+            {"state": "REJECTED", "candidate_tier": None,
+             "strict_rejection_reasons": ["CLOSE_IN_EMA_BAND"],
+             "watch_rejection_reasons": ["INSUFFICIENT_PIVOTS"],
+             "rejection_reasons": ["IGNORED_TERMINAL_REASON"]},
+        ])
+
+        self.assertEqual(report["tier_counts"], {"STRICT": 1, "WATCH": 1})
+        self.assertEqual(report["strict_rejection_counts"], {"CLOSE_IN_EMA_BAND": 2})
+        self.assertEqual(report["watch_rejection_counts"], {"INSUFFICIENT_PIVOTS": 1})
+        self.assertEqual(report["rejection_counts"], report["strict_rejection_counts"])
+        report["rejection_counts"]["MUTATED"] = 1
+        self.assertNotIn("MUTATED", report["strict_rejection_counts"])
+
+
 class CompressionScanFailureIsolationTests(unittest.TestCase):
     def test_scan_symbol_supports_server_fetch_signature_without_raise_errors(self):
         from momentum_compression_service import _scan_symbol

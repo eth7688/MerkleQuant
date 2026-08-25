@@ -194,6 +194,27 @@ def _mark_unavailable(state: dict, symbol: str) -> None:
             item["data_status"] = "unavailable"
 
 
+def _compression_diagnostics(evaluations: list[dict]) -> dict:
+    """Aggregate tier and rule-profile audit facts from one complete scan."""
+    tier_counts = {"STRICT": 0, "WATCH": 0}
+    strict_rejection_counts = {}
+    watch_rejection_counts = {}
+    for row in evaluations:
+        tier = row.get("candidate_tier")
+        if row.get("state") in _ELIGIBLE_STATES and tier in tier_counts:
+            tier_counts[tier] += 1
+        for reason in row.get("strict_rejection_reasons", []):
+            strict_rejection_counts[reason] = strict_rejection_counts.get(reason, 0) + 1
+        for reason in row.get("watch_rejection_reasons", []):
+            watch_rejection_counts[reason] = watch_rejection_counts.get(reason, 0) + 1
+    return {
+        "tier_counts": tier_counts,
+        "strict_rejection_counts": strict_rejection_counts,
+        "watch_rejection_counts": watch_rejection_counts,
+        "rejection_counts": dict(strict_rejection_counts),
+    }
+
+
 def scan_compression_market(
     state_path: Path,
     snapshot_dir: Path,
@@ -268,11 +289,7 @@ def scan_compression_market(
         state["last_error"] = f"{errors} symbol scan failures" if errors else ""
         save_compression_state(state_path, state)
     eligible_rows = [row for row in evaluations if row["state"] in _ELIGIBLE_STATES]
-    rejection_counts = {}
-    for row in evaluations:
-        if row["state"] == "REJECTED":
-            for reason in row["rejection_reasons"]:
-                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+    diagnostics = _compression_diagnostics(evaluations)
     finished_at = int(time.time() * 1000)
     return {
         "rows": eligible_rows,
@@ -281,7 +298,7 @@ def scan_compression_market(
         "eligible": len(eligible_rows),
         "pool_size": len(state["pool"]),
         "errors": errors,
-        "rejection_counts": rejection_counts,
+        **diagnostics,
         "evaluated_at": now_ms,
         "last_closed_15m_close_time": state["last_closed_15m_close_time"],
         "failed_symbols": failed_symbols,

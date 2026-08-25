@@ -92,6 +92,9 @@ class CompressionMonitor:
         self._next_scan_at = None
         self._last_error = ""
         self._last_rejection_counts = {}
+        self._last_tier_counts = {"STRICT": 0, "WATCH": 0}
+        self._last_strict_rejection_counts = {}
+        self._last_watch_rejection_counts = {}
         self._dropped_price_rows = 0
         self._event_cursor = 0
         self._generation = 0
@@ -151,6 +154,21 @@ class CompressionMonitor:
         except (TypeError, ValueError, OverflowError):
             return None
         return price if math.isfinite(price) and price > 0 else None
+
+    @staticmethod
+    def _diagnostic_counts(raw_counts) -> dict[str, int]:
+        if not isinstance(raw_counts, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in raw_counts.items()
+            if type(value) is int and value >= 0
+        }
+
+    @classmethod
+    def _tier_counts(cls, raw_counts) -> dict[str, int]:
+        counts = cls._diagnostic_counts(raw_counts)
+        return {tier: counts.get(tier, 0) for tier in ("STRICT", "WATCH")}
 
     def handle_message(self, message, *, now_ms=None, source_app=None) -> None:
         if source_app is not None:
@@ -342,14 +360,20 @@ class CompressionMonitor:
         self._scan_started_at = self.time_ms()
         try:
             report = self.scan(self.state_path, self.snapshot_dir)
-            raw_rejection_counts = report.get("rejection_counts", {})
-            rejection_counts = {
-                key: value
-                for key, value in raw_rejection_counts.items()
-                if isinstance(key, str) and type(value) is int and value >= 0
-            } if isinstance(raw_rejection_counts, dict) else {}
-            with self._lifecycle_lock:
-                self._last_rejection_counts = rejection_counts
+            errors = report.get("errors", 0)
+            if type(errors) is int and errors == 0:
+                strict_rejection_counts = self._diagnostic_counts(
+                    report.get("strict_rejection_counts", report.get("rejection_counts", {}))
+                )
+                watch_rejection_counts = self._diagnostic_counts(
+                    report.get("watch_rejection_counts", {})
+                )
+                tier_counts = self._tier_counts(report.get("tier_counts", {}))
+                with self._lifecycle_lock:
+                    self._last_tier_counts = tier_counts
+                    self._last_strict_rejection_counts = strict_rejection_counts
+                    self._last_watch_rejection_counts = watch_rejection_counts
+                    self._last_rejection_counts = dict(strict_rejection_counts)
             events = [
                 event for event in report.get("events", [])
                 if isinstance(event, dict) and isinstance(event.get("event_id"), int)
@@ -477,6 +501,9 @@ class CompressionMonitor:
             price_stream_status = self._price_stream_status
             last_price_message_at = self._last_stream_message_at_ms
             rejection_counts = dict(self._last_rejection_counts)
+            tier_counts = dict(self._last_tier_counts)
+            strict_rejection_counts = dict(self._last_strict_rejection_counts)
+            watch_rejection_counts = dict(self._last_watch_rejection_counts)
         structure_scanning = self._scan_lock.locked()
         return {
             "running": running,
@@ -492,6 +519,9 @@ class CompressionMonitor:
             "next_scan_at": self._next_scan_at.isoformat() if self._next_scan_at else None,
             "last_error": self._last_error or state["last_error"],
             "rejection_counts": rejection_counts,
+            "tier_counts": tier_counts,
+            "strict_rejection_counts": strict_rejection_counts,
+            "watch_rejection_counts": watch_rejection_counts,
             "pool_size": len(state["pool"]),
             "today_fresh": sum(
                 1 for event in state["fresh_outbox"]
