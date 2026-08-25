@@ -59,6 +59,88 @@ class CompressionAlertTests(unittest.TestCase):
             self.assertEqual(self.queued_symbols(state), ["AUSDT"])
             self.assertEqual(compression_sound_available_ids(events), {"AUSDT-long-1", "BUSDT-long-1", "CUSDT-long-1"})
 
+    def test_wechat_delivery_matrix_is_tier_aware_including_legacy_events(self):
+        cases = (
+            (None, "CONFIRMED", True),
+            (None, "UNKNOWN", False),
+            (None, "CONFLICT", False),
+            ("STRICT", "CONFIRMED", True),
+            ("STRICT", "UNKNOWN", False),
+            ("STRICT", "CONFLICT", False),
+            ("WATCH", "CONFIRMED", True),
+            ("WATCH", "UNKNOWN", True),
+            ("WATCH", "CONFLICT", False),
+        )
+        for tier, alignment, expected in cases:
+            with self.subTest(tier=tier, alignment=alignment), TemporaryDirectory() as folder:
+                events, state, _ = self.paths(Path(folder))
+                source = fresh(alignment=alignment)
+                if tier is not None:
+                    source["structure"]["candidate_tier"] = tier
+                append_compression_alerts(events, state, [source], 1_000)
+                queue = json.loads(state.read_text(encoding="utf-8"))["delivery_queue"]
+                self.assertEqual(bool(queue), expected)
+                if tier is None:
+                    stored = read_public_compression_alerts(events, 0)["events"][0]
+                    self.assertEqual(stored["structure"]["candidate_tier"], "STRICT")
+
+    def test_tier_change_with_same_compression_identity_never_appends_or_queues_twice(self):
+        with TemporaryDirectory() as folder:
+            events, state, _ = self.paths(Path(folder))
+            watch = fresh(alignment="UNKNOWN", compression_id="same-tier-identity")
+            strict = fresh(alignment="CONFIRMED", compression_id="same-tier-identity")
+            watch["structure"]["candidate_tier"] = "WATCH"
+            strict["structure"]["candidate_tier"] = "STRICT"
+            created = append_compression_alerts(events, state, [watch], 1_000)
+            created += append_compression_alerts(events, state, [strict], 2_000)
+            self.assertEqual(len(created), 1)
+            self.assertEqual(self.queued_symbols(state), ["AUSDT"])
+
+    def test_recovery_and_persisted_queue_reconciliation_share_tier_eligibility(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            watch = fresh(alignment="UNKNOWN", compression_id="watch-recovery")
+            watch["structure"]["candidate_tier"] = "WATCH"
+            with patch("momentum_compression_alerts._atomic_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    append_compression_alerts(events, state, [watch], 10)
+            self.assertEqual(append_compression_alerts(events, state, [watch], 11), [])
+            self.assertTrue(state.exists())
+            self.assertEqual(self.queued_symbols(state), ["AUSDT"])
+
+            stored_events = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+            stored_events[0]["structure"]["candidate_tier"] = "STRICT"
+            events.write_text("".join(json.dumps(event) + "\n" for event in stored_events), encoding="utf-8")
+            stored_state = json.loads(state.read_text(encoding="utf-8"))
+            stored_state["delivery_queue"][0]["event"]["structure"]["candidate_tier"] = "STRICT"
+            state.write_text(json.dumps(stored_state), encoding="utf-8")
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            post = Mock()
+            self.assertEqual(deliver_due_compression_wechat(settings, state, events, 20, post=post)["status"], "idle")
+            self.assertEqual(post.call_count, 0)
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["delivery_queue"], [])
+
+    def test_watch_unknown_remains_eligible_on_retry(self):
+        with TemporaryDirectory() as folder:
+            events, state, settings = self.paths(Path(folder))
+            watch = fresh(alignment="UNKNOWN")
+            watch["structure"]["candidate_tier"] = "WATCH"
+            append_compression_alerts(events, state, [watch], 10)
+            save_alert_settings(settings, wechat_enabled=True,
+                wechat_webhook="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret", updated_by="7", now_ms=1)
+            rejected = Mock(); rejected.raise_for_status.return_value = None; rejected.json.return_value = {"errcode": 93000}
+            self.assertEqual(
+                deliver_due_compression_wechat(settings, state, events, 10, post=Mock(return_value=rejected))["status"],
+                "retry_pending",
+            )
+            retry_at = json.loads(state.read_text(encoding="utf-8"))["delivery_queue"][0]["next_attempt_at"]
+            accepted = Mock(); accepted.raise_for_status.return_value = None; accepted.json.return_value = {"errcode": 0}
+            self.assertEqual(
+                deliver_due_compression_wechat(settings, state, events, retry_at, post=Mock(return_value=accepted))["status"],
+                "delivered",
+            )
+
     def test_delivery_statuses_are_keyed_by_confirmed_compression_identity(self):
         with TemporaryDirectory() as folder:
             events, state, settings = self.paths(Path(folder))
@@ -109,6 +191,19 @@ class CompressionAlertTests(unittest.TestCase):
         text = format_compression_wechat_markdown(event)
         for field in ("触发价格", "突破边界/缓冲", "上沿", "下沿", "ATR14", "质量", "K线", "方向触碰", "收敛", "1H", "4H", "快照", "北京时间"):
             self.assertIn(field, text)
+
+    def test_tiered_markdown_uses_immutable_event_time_audit_facts(self):
+        for tier, title, bars in (("STRICT", "动能压缩｜严格级突破", 21), ("WATCH", "动能压缩｜观察级突破", 3)):
+            with self.subTest(tier=tier):
+                event = fresh(alignment="UNKNOWN")
+                event["structure"].update({
+                    "candidate_tier": tier, "ema_confirmation_bars": bars,
+                    "directional_touch_count": 3, "contraction_ratio": 0.5,
+                })
+                event = {**event, "alert_id": 1, "created_at": 10}
+                text = format_compression_wechat_markdown(event)
+                for value in (title, f"等级：{tier}", f"EMA确认：最近 {bars} 根已收盘K线", "方向触碰：3", "收敛：0.5", "汇总：UNKNOWN"):
+                    self.assertIn(value, text)
 
     def test_retry_recovers_confirmed_queue_after_state_write_fails_post_append(self):
         with TemporaryDirectory() as folder:

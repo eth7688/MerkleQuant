@@ -31,6 +31,9 @@ _EVENT_THREAD_LOCK = threading.RLock()
 _DELIVERY_THREAD_LOCK = threading.Lock()
 _STATE_VERSION = 1
 _DEFAULT_STATE = {"version": _STATE_VERSION, "delivery_queue": []}
+_STRICT_TIER = "STRICT"
+_WATCH_TIER = "WATCH"
+_CANDIDATE_TIERS = {_STRICT_TIER, _WATCH_TIER}
 
 
 class _CompressionPreSendValidationError(Exception):
@@ -111,6 +114,17 @@ def _finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def _with_tier_defaults(event: dict) -> dict:
+    normalized = copy.deepcopy(event)
+    structure = normalized.get("structure")
+    if isinstance(structure, dict):
+        structure.setdefault("candidate_tier", _STRICT_TIER)
+        structure.setdefault("strict_rejection_reasons", [])
+        structure.setdefault("watch_rejection_reasons", [])
+        structure.setdefault("ema_confirmation_bars", structure.get("compression_bars"))
+    return normalized
+
+
 def _validate_event(event: dict) -> None:
     if not isinstance(event, dict):
         raise ValueError("compression alert event is invalid")
@@ -127,9 +141,26 @@ def _validate_event(event: dict) -> None:
             or not isinstance(event["structure"], dict)):
         raise ValueError("compression alert event is invalid")
     structure = event["structure"]
+    strict_reasons = structure.get("strict_rejection_reasons")
+    watch_reasons = structure.get("watch_rejection_reasons")
     if (not isinstance(structure.get("symbol"), str) or not structure["symbol"]
-            or structure.get("side") not in {"LONG", "SHORT"}):
+            or structure.get("side") not in {"LONG", "SHORT"}
+            or structure.get("candidate_tier") not in _CANDIDATE_TIERS
+            or not isinstance(strict_reasons, list) or not isinstance(watch_reasons, list)
+            or not all(isinstance(reason, str) for reason in strict_reasons)
+            or not all(isinstance(reason, str) for reason in watch_reasons)):
         raise ValueError("compression alert event is invalid")
+    confirmation_bars = structure.get("ema_confirmation_bars")
+    if confirmation_bars is not None and (not _is_int(confirmation_bars) or confirmation_bars <= 0):
+        raise ValueError("compression alert event is invalid")
+
+
+def _wechat_eligible(event: dict) -> bool:
+    structure = event["structure"]
+    tier = structure.get("candidate_tier", _STRICT_TIER)
+    alignment = event["htf_alignment"]
+    return (alignment == "CONFIRMED" if tier == _STRICT_TIER
+            else alignment in {"CONFIRMED", "UNKNOWN"})
 
 
 def _read_events_unlocked(events_path: Path) -> list[dict]:
@@ -141,7 +172,7 @@ def _read_events_unlocked(events_path: Path) -> list[dict]:
             for line in handle:
                 if not line.strip():
                     continue
-                event = json.loads(line)
+                event = _with_tier_defaults(json.loads(line))
                 _validate_event(event)
                 events.append(event)
     except (OSError, json.JSONDecodeError) as error:
@@ -176,8 +207,10 @@ def _load_state_unlocked(state_path: Path) -> dict:
                 or not _is_int(item["next_attempt_at"]) or item["next_attempt_at"] < 0
                 or not isinstance(item["last_error"], str) or not isinstance(event, dict)):
             raise ValueError("compression alert delivery state is invalid")
+        item["event"] = _with_tier_defaults(event)
+        event = item["event"]
         _validate_event(event)
-        if item["alert_id"] != event["alert_id"] or event["htf_alignment"] != "CONFIRMED" or item["alert_id"] in ids:
+        if item["alert_id"] != event["alert_id"] or item["alert_id"] in ids:
             raise ValueError("compression alert delivery state is invalid")
         ids.add(item["alert_id"])
     return state
@@ -190,16 +223,24 @@ def _public_event(source: dict, alert_id: int, now_ms: int) -> dict:
         "live_price": source.get("live_price"), "htf_alignment": source.get("htf_alignment"),
         "structure": copy.deepcopy(source.get("structure")), "created_at": now_ms,
     }
+    event = _with_tier_defaults(event)
     _validate_event(event)
     return event
 
 
-def _recover_confirmed_queue_unlocked(state: dict, events: list[dict]) -> bool:
+def _reconcile_delivery_queue_unlocked(state: dict) -> bool:
+    retained = [item for item in state["delivery_queue"] if _wechat_eligible(item["event"])]
+    changed = len(retained) != len(state["delivery_queue"])
+    state["delivery_queue"] = retained
+    return changed
+
+
+def _recover_eligible_queue_unlocked(state: dict, events: list[dict]) -> bool:
     """Restore queue rows lost after a durable JSONL append but before state write."""
     queued_ids = {item["alert_id"] for item in state["delivery_queue"]}
     recovered = False
     for event in events:
-        if event["htf_alignment"] != "CONFIRMED" or event["alert_id"] in queued_ids:
+        if not _wechat_eligible(event) or event["alert_id"] in queued_ids:
             continue
         state["delivery_queue"].append({
             "alert_id": event["alert_id"], "event": copy.deepcopy(event),
@@ -234,7 +275,8 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
     with _event_lock(events_path):
         stored = _read_events_unlocked(events_path)
         state = _load_state_unlocked(state_path)
-        recovered = _recover_confirmed_queue_unlocked(state, stored)
+        reconciled = _reconcile_delivery_queue_unlocked(state)
+        recovered = _recover_eligible_queue_unlocked(state, stored)
         known = {event["compression_id"] for event in stored}
         created = []
         for source in events:
@@ -243,7 +285,7 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
                 continue
             known.add(candidate["compression_id"])
             created.append(candidate)
-            if candidate["htf_alignment"] == "CONFIRMED":
+            if _wechat_eligible(candidate):
                 state["delivery_queue"].append({
                     "alert_id": candidate["alert_id"], "event": copy.deepcopy(candidate),
                     "status": "pending", "attempts": 0, "last_attempt_at": 0,
@@ -256,7 +298,7 @@ def append_compression_alerts(events_path: Path, state_path: Path, events: list[
                     handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
                 handle.flush(); os.fsync(handle.fileno())
             _atomic_write(state_path, state)
-        elif recovered:
+        elif reconciled or recovered:
             _atomic_write(state_path, state)
         return copy.deepcopy(created)
 
@@ -290,6 +332,7 @@ def compression_delivery_statuses(state_path: Path) -> dict[str, str]:
     """Return the durable WeChat queue state by immutable compression identity."""
     with _delivery_lock(Path(state_path)):
         state = _load_state_unlocked(Path(state_path))
+        _reconcile_delivery_queue_unlocked(state)
         return {
             item["event"]["compression_id"]: ("indeterminate" if item["status"] == "in_flight" else item["status"])
             for item in state["delivery_queue"]
@@ -305,11 +348,14 @@ def _safe_error(error: object, webhook: str) -> str:
 
 def format_compression_wechat_markdown(event: dict) -> str:
     structure = event["structure"]
+    tier = structure.get("candidate_tier", _STRICT_TIER)
+    title = "动能压缩｜严格级突破" if tier == _STRICT_TIER else "动能压缩｜观察级突破"
     observed = datetime.fromtimestamp(event["event_at"] / 1000, ZoneInfo("Asia/Shanghai"))
     return "\n".join((
-        "【AXIOM 动能压缩破位警报】", "",
+        f"【AXIOM {title}】", "",
         f"{structure['symbol']} · {structure['side']}",
         f"触发价格：{event['live_price']}", f"状态：{event['state']}",
+        f"等级：{tier} · EMA确认：最近 {structure.get('ema_confirmation_bars', '--')} 根已收盘K线",
         f"突破边界/缓冲：{structure.get('upper_boundary_price', '--') if structure['side'] == 'LONG' else structure.get('lower_boundary_price', '--')} / {structure.get('breakout_buffer_price', '--')}",
         f"上沿：{structure.get('upper_boundary_price', '--')}",
         f"下沿：{structure.get('lower_boundary_price', '--')}",
@@ -350,7 +396,8 @@ def deliver_due_compression_wechat(settings_path: Path, state_path: Path, events
             return {"status": "disabled"}
         with _event_lock(events_path):
             state = _load_state_unlocked(state_path)
-            if (_recover_confirmed_queue_unlocked(state, _read_events_unlocked(events_path))
+            if (_reconcile_delivery_queue_unlocked(state)
+                    or _recover_eligible_queue_unlocked(state, _read_events_unlocked(events_path))
                     or _mark_interrupted_deliveries_unlocked(state)):
                 _atomic_write(state_path, state)
             item = next((item for item in state["delivery_queue"] if item["status"] == "pending"), None)
