@@ -9,6 +9,9 @@ import pandas as pd
 
 
 REQUIRED_COLUMNS = ("ot", "o", "h", "l", "c", "v")
+STRICT_TIER = "STRICT"
+WATCH_TIER = "WATCH"
+WATCH_EMA_CONFIRMATION_BARS = 3
 
 
 @dataclass(frozen=True)
@@ -248,6 +251,54 @@ def _maximal_structural_suffix(
     return best[1], best[2]
 
 
+def _watch_non_length_rules(frame, side, params, *, common=None):
+    rules = _non_length_rules(frame, side, params, common=common)
+    return {
+        **rules,
+        "rejection_reasons": [
+            reason for reason in rules["rejection_reasons"]
+            if reason not in ("EMA_DIRECTION", "CLOSE_IN_EMA_BAND")
+        ],
+    }
+
+
+def _maximal_watch_structural_suffix(indicators, side, params, *, common_cache=None):
+    if indicators.empty:
+        return indicators, {"rejection_reasons": ["EMPTY_DATA"]}
+    minimum = 2 * params.pivot_span + 1
+    if len(indicators) < minimum:
+        return indicators, {"rejection_reasons": ["INSUFFICIENT_PIVOTS"]}
+    cache = common_cache if common_cache is not None else {}
+    fallback = None
+    for start in range(len(indicators) - minimum + 1):
+        candidate = indicators.iloc[start:]
+        candidate_length = len(candidate)
+        common = cache.get(candidate_length)
+        if common is None:
+            common = _common_structure(candidate, params)
+            cache[candidate_length] = common
+        rules = _watch_non_length_rules(candidate, side, params, common=common)
+        if not rules["rejection_reasons"]:
+            return candidate, rules
+        if fallback is None:
+            fallback = (candidate, rules)
+    return fallback
+
+
+def _watch_ema_rejection_reasons(frame: pd.DataFrame, side: str) -> list[str]:
+    confirmation = frame.iloc[-WATCH_EMA_CONFIRMATION_BARS:]
+    ema8, ema21, close = confirmation["ema8"], confirmation["ema21"], confirmation["c"]
+    ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
+    ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
+    reasons = []
+    ordered = ema8 > ema21 if side == "LONG" else ema8 < ema21
+    if len(confirmation) < WATCH_EMA_CONFIRMATION_BARS or not bool(ordered.all()):
+        reasons.append("EMA_DIRECTION")
+    if bool(((close >= ema_low) & (close <= ema_high)).any()):
+        reasons.append("CLOSE_IN_EMA_BAND")
+    return reasons
+
+
 def _quality_score(metrics: dict, params: CompressionParams) -> tuple[float, dict]:
     contraction = max(0.0, 1.0 - float(metrics.get("contraction_ratio", 1.0)) / params.contraction_ratio_max)
     touches = min(1.0, len(metrics.get("directional_events", [])) / params.min_directional_boundary_touches)
@@ -295,6 +346,10 @@ def _rejected(symbol, side, evaluated_at_ms, htf_alignment, reasons, params, bar
         "compression_end_time": int(frame["ot"].iloc[-1]) if bars and "ot" in frame else 0,
         "upper_boundary_price": None, "lower_boundary_price": None, "atr14": None,
         "breakout_buffer_price": None, "directional_touch_times": [], "score_components": {},
+        "candidate_tier": None,
+        "strict_rejection_reasons": list(dict.fromkeys(reasons)),
+        "watch_rejection_reasons": list(dict.fromkeys(reasons)),
+        "ema_confirmation_bars": WATCH_EMA_CONFIRMATION_BARS,
     }
     result["compression_id"] = compression_identity(result)
     return result
@@ -332,17 +387,39 @@ def _evaluate_prepared_side(
         indicators, side, params, common_cache=common_cache
     )
     bars = len(window)
-    reasons = list(metrics.get("rejection_reasons", []))
+    strict_reasons = list(metrics.get("rejection_reasons", []))
     if bars < params.min_bars:
-        reasons.append("WINDOW_TOO_SHORT")
+        strict_reasons.append("WINDOW_TOO_SHORT")
     if bars > params.max_bars:
-        reasons.append("WINDOW_TOO_LONG")
+        strict_reasons.append("WINDOW_TOO_LONG")
     envelope = metrics.get("envelope", {})
-    if reasons:
-        return _rejected(
-            symbol, side, evaluated_at_ms, htf_alignment,
-            reasons, params, bars, window,
+    if strict_reasons:
+        watch_window, watch_metrics = _maximal_watch_structural_suffix(
+            indicators, side, params, common_cache=common_cache,
         )
+        watch_bars = len(watch_window)
+        watch_reasons = list(watch_metrics.get("rejection_reasons", []))
+        if watch_bars < params.min_bars:
+            watch_reasons.append("WINDOW_TOO_SHORT")
+        if watch_bars > params.max_bars:
+            watch_reasons.append("WINDOW_TOO_LONG")
+        watch_reasons.extend(_watch_ema_rejection_reasons(watch_window, side))
+        watch_reasons = list(dict.fromkeys(watch_reasons))
+        if watch_reasons:
+            result = _rejected(
+                symbol, side, evaluated_at_ms, htf_alignment,
+                watch_reasons, params, watch_bars, watch_window,
+            )
+            result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
+            result["watch_rejection_reasons"] = watch_reasons
+            return result
+        window, metrics, bars, envelope = (
+            watch_window, watch_metrics, watch_bars,
+            watch_metrics["envelope"],
+        )
+        tier = WATCH_TIER
+    else:
+        tier = STRICT_TIER
     upper, lower = envelope["upper"], envelope["lower"]
     atr14 = float(window["atr14"].iloc[-1])
     score, score_components = _quality_score(metrics, params)
@@ -369,6 +446,10 @@ def _evaluate_prepared_side(
         "breakout_buffer_price": atr14 * params.breakout_buffer_atr,
         "quality_score": score, "score_components": score_components,
         "swing": metrics["swing"],
+        "candidate_tier": tier,
+        "strict_rejection_reasons": [] if tier == STRICT_TIER else list(dict.fromkeys(strict_reasons)),
+        "watch_rejection_reasons": [],
+        "ema_confirmation_bars": bars if tier == STRICT_TIER else WATCH_EMA_CONFIRMATION_BARS,
     }
     result["compression_id"] = compression_identity(result)
     result["state"] = _classify_without_episode(result, float(live_price), params)
