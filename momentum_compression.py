@@ -384,6 +384,44 @@ def _evaluate_prepared_side(
     params: CompressionParams,
     common_cache: dict | None = None,
 ) -> dict:
+    strict_result, window, metrics, strict_reasons = _strict_prepared_evaluation(
+        symbol, side, frame, indicators, live_price,
+        evaluated_at_ms=evaluated_at_ms, htf_alignment=htf_alignment,
+        params=params, common_cache=common_cache,
+    )
+    if not strict_reasons:
+        return strict_result
+    watch_window, watch_metrics = _maximal_watch_structural_suffix(
+        indicators, side, params, common_cache=common_cache,
+    )
+    watch_bars = len(watch_window)
+    watch_reasons = list(watch_metrics.get("rejection_reasons", []))
+    if watch_bars < params.min_bars:
+        watch_reasons.append("WINDOW_TOO_SHORT")
+    if watch_bars > params.max_bars:
+        watch_reasons.append("WINDOW_TOO_LONG")
+    watch_reasons.extend(_watch_ema_rejection_reasons(watch_window, side))
+    watch_reasons = list(dict.fromkeys(watch_reasons))
+    if watch_reasons:
+        result = _rejected(
+            symbol, side, evaluated_at_ms, htf_alignment,
+            watch_reasons, params, watch_bars, watch_window,
+        )
+        result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
+        result["watch_rejection_reasons"] = watch_reasons
+        return result
+    return _accepted_evaluation(
+        symbol, side, watch_window, watch_metrics, live_price,
+        evaluated_at_ms=evaluated_at_ms, htf_alignment=htf_alignment,
+        params=params, tier=WATCH_TIER,
+        strict_rejection_reasons=strict_reasons,
+    )
+
+
+def _strict_prepared_evaluation(
+    symbol, side, frame, indicators, live_price, *, evaluated_at_ms,
+    htf_alignment, params, common_cache=None,
+):
     window, metrics = _maximal_structural_suffix(
         indicators, side, params, common_cache=common_cache
     )
@@ -393,34 +431,30 @@ def _evaluate_prepared_side(
         strict_reasons.append("WINDOW_TOO_SHORT")
     if bars > params.max_bars:
         strict_reasons.append("WINDOW_TOO_LONG")
-    envelope = metrics.get("envelope", {})
     if strict_reasons:
-        watch_window, watch_metrics = _maximal_watch_structural_suffix(
-            indicators, side, params, common_cache=common_cache,
+        result = _rejected(
+            symbol, side, evaluated_at_ms, htf_alignment,
+            strict_reasons, params, bars, window,
         )
-        watch_bars = len(watch_window)
-        watch_reasons = list(watch_metrics.get("rejection_reasons", []))
-        if watch_bars < params.min_bars:
-            watch_reasons.append("WINDOW_TOO_SHORT")
-        if watch_bars > params.max_bars:
-            watch_reasons.append("WINDOW_TOO_LONG")
-        watch_reasons.extend(_watch_ema_rejection_reasons(watch_window, side))
-        watch_reasons = list(dict.fromkeys(watch_reasons))
-        if watch_reasons:
-            result = _rejected(
-                symbol, side, evaluated_at_ms, htf_alignment,
-                watch_reasons, params, watch_bars, watch_window,
-            )
-            result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
-            result["watch_rejection_reasons"] = watch_reasons
-            return result
-        window, metrics, bars, envelope = (
-            watch_window, watch_metrics, watch_bars,
-            watch_metrics["envelope"],
-        )
-        tier = WATCH_TIER
-    else:
-        tier = STRICT_TIER
+        result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
+        result["watch_rejection_reasons"] = []
+        return result, window, metrics, strict_reasons
+    return (
+        _accepted_evaluation(
+            symbol, side, window, metrics, live_price,
+            evaluated_at_ms=evaluated_at_ms, htf_alignment=htf_alignment,
+            params=params, tier=STRICT_TIER,
+        ),
+        window, metrics, strict_reasons,
+    )
+
+
+def _accepted_evaluation(
+    symbol, side, window, metrics, live_price, *, evaluated_at_ms,
+    htf_alignment, params, tier, strict_rejection_reasons=None,
+):
+    bars = len(window)
+    envelope = metrics["envelope"]
     upper, lower = envelope["upper"], envelope["lower"]
     atr14 = float(window["atr14"].iloc[-1])
     score, score_components = _quality_score(metrics, params)
@@ -448,7 +482,7 @@ def _evaluate_prepared_side(
         "quality_score": score, "score_components": score_components,
         "swing": metrics["swing"],
         "candidate_tier": tier,
-        "strict_rejection_reasons": [] if tier == STRICT_TIER else list(dict.fromkeys(strict_reasons)),
+        "strict_rejection_reasons": list(dict.fromkeys(strict_rejection_reasons or [])),
         "watch_rejection_reasons": [],
         "ema_confirmation_bars": bars if tier == STRICT_TIER else WATCH_EMA_CONFIRMATION_BARS,
     }

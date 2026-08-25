@@ -1075,28 +1075,22 @@ class CompressionRuleTests(unittest.TestCase):
                 self.assertTrue((frame["h"] >= frame[["o", "c"]].max(axis=1)).all())
                 self.assertTrue((frame["l"] <= frame[["o", "c"]].min(axis=1)).all())
                 evaluated_at = int(frame["ot"].iloc[-1] + 900_000)
-                indicators = add_compression_indicators(frame)
-                actual_window, actual_metrics = _maximal_structural_suffix(
-                    indicators, side, CompressionParams(),
+                prepared_frame, indicators, preparation_reasons = (
+                    compression_module._prepare_evaluation_frame(frame, evaluated_at)
                 )
-                expected_window, expected_metrics = legacy_maximal_structural_suffix(
-                    legacy_add_compression_indicators(frame), side, CompressionParams(),
+                self.assertEqual(preparation_reasons, [])
+                actual, _window, _metrics, _reasons = (
+                    compression_module._strict_prepared_evaluation(
+                        "ORACLEUSDT", side, prepared_frame, indicators,
+                        float(frame["c"].iloc[-1]), evaluated_at_ms=evaluated_at,
+                        htf_alignment="UNKNOWN", params=CompressionParams(),
+                    )
                 )
-                actual_reasons = list(actual_metrics["rejection_reasons"])
-                expected_reasons = list(expected_metrics["rejection_reasons"])
-                if len(actual_window) < CompressionParams().min_bars:
-                    actual_reasons.append("WINDOW_TOO_SHORT")
-                if len(actual_window) > CompressionParams().max_bars:
-                    actual_reasons.append("WINDOW_TOO_LONG")
-                if len(expected_window) < CompressionParams().min_bars:
-                    expected_reasons.append("WINDOW_TOO_SHORT")
-                if len(expected_window) > CompressionParams().max_bars:
-                    expected_reasons.append("WINDOW_TOO_LONG")
-                self.assertEqual(list(actual_window["ot"]), list(expected_window["ot"]))
-                self.assertEqual(
-                    actual_reasons,
-                    expected_reasons,
+                expected = independent_legacy_evaluate_side(
+                    "ORACLEUSDT", side, frame, float(frame["c"].iloc[-1]),
+                    evaluated_at_ms=evaluated_at, htf_alignment="UNKNOWN",
                 )
+                assert_public_outputs_equal(self, actual, expected)
 
 
 if __name__ == "__main__":
