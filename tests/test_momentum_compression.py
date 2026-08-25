@@ -39,6 +39,12 @@ LUMIA_FIXTURE = (
     / "lumiausdt_binance_futures_15m_20260823_1300.json"
 )
 LUMIA_OHLCV_SHA256 = "3e01a5d0e36af34b66953cfd3f38142ec4bd2d11b5160532fd9b8edcf3844e65"
+ARC_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "arcusdt_binance_futures_15m_20260825_2215.json"
+)
+ARC_OHLCV_SHA256 = "2e759524f63b70d777e706fea737d58db0ab9f5df6ece446d285f2461c6e1072"
 
 
 def compression_frame(bars=20, side="LONG"):
@@ -494,6 +500,48 @@ class CompressionIndicatorTests(unittest.TestCase):
 
 
 class CompressionHistoricalRegressionTests(unittest.TestCase):
+    def test_arc_binance_trend_channel_is_rejected(self):
+        payload = json.loads(ARC_FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual(payload["source"], "Binance Futures /fapi/v1/klines")
+        self.assertEqual(payload["symbol"], "ARCUSDT")
+        self.assertEqual(payload["interval"], "15m")
+        self.assertEqual(payload["market_type"], "futures")
+        self.assertFalse(payload["testnet"])
+        self.assertEqual(payload["query"]["limit"], 220)
+        self.assertEqual(payload["query"]["endTime"], 1787668199999)
+        self.assertEqual(len(payload["ohlcv"]), 220)
+        self.assertEqual(payload["ohlcv"][0]["ot"], 1787470200000)
+        self.assertEqual(payload["ohlcv"][-1]["ot"], 1787667300000)
+        self.assertEqual(payload["evaluated_at_ms"], 1787668200000)
+        self.assertEqual(payload["live_price"], 0.07141)
+        self.assertEqual(payload["former_window_start_time"], 1787643900000)
+        self.assertEqual(payload["former_window_end_time"], 1787667300000)
+        self.assertEqual(payload["ohlcv_sha256"], ARC_OHLCV_SHA256)
+        canonical = json.dumps(
+            payload["ohlcv"], sort_keys=True, separators=(",", ":"),
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical.encode()).hexdigest(),
+            ARC_OHLCV_SHA256,
+        )
+        frame = pd.DataFrame(payload["ohlcv"])
+        result = evaluate_side(
+            payload["symbol"],
+            "SHORT",
+            frame,
+            payload["live_price"],
+            evaluated_at_ms=payload["evaluated_at_ms"],
+            htf_alignment="UNKNOWN",
+        )
+        self.assertEqual(result["state"], "REJECTED")
+        self.assertTrue(
+            {
+                "INSUFFICIENT_OPPOSITE_TOUCHES",
+                "CHANNEL_TOO_WIDE",
+                "CHANNEL_DRIFT_TOO_LARGE",
+            }.intersection(result["watch_rejection_reasons"])
+        )
+
     def test_lumia_binance_window_is_rejected_for_insufficient_contraction(self):
         payload = json.loads(LUMIA_FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(payload["source"], "Binance Futures /fapi/v1/klines")
