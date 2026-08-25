@@ -36,12 +36,48 @@ def evaluation(**overrides):
         "compression_bars": 20,
         "rejection_reasons": [],
         "directional_touch_times": [100, 400, 700],
+        "candidate_tier": "STRICT",
+        "strict_rejection_reasons": [],
+        "watch_rejection_reasons": [],
+        "ema_confirmation_bars": 20,
     }
     row.update(overrides)
     return row
 
 
 class CompressionStateMachineTests(unittest.TestCase):
+    def test_watch_to_strict_same_identity_never_reemits(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(candidate_tier="WATCH")], 1_000)
+        state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, result = reconcile_structure_scan(state, [evaluation(candidate_tier="STRICT")], 3_000)
+
+        self.assertEqual(state["pool"]["long-episode-1"]["candidate_tier"], "STRICT")
+        self.assertTrue(state["pool"]["long-episode-1"]["fresh_emitted"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(result["fresh_events"], [])
+
+    def test_strict_to_watch_same_identity_never_reemits(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(candidate_tier="STRICT")], 1_000)
+        state, first = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, result = reconcile_structure_scan(state, [evaluation(candidate_tier="WATCH")], 3_000)
+
+        self.assertEqual(state["pool"]["long-episode-1"]["candidate_tier"], "WATCH")
+        self.assertTrue(state["pool"]["long-episode-1"]["fresh_emitted"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(result["fresh_events"], [])
+
+    def test_fresh_event_keeps_event_time_tier_facts(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation(
+            candidate_tier="WATCH", strict_rejection_reasons=["EMA_DIRECTION"],
+            ema_confirmation_bars=3,
+        )], 1_000)
+        state, events = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = reconcile_structure_scan(state, [evaluation(candidate_tier="STRICT")], 3_000)
+
+        self.assertEqual(events[0]["structure"]["candidate_tier"], "WATCH")
+        self.assertEqual(events[0]["structure"]["strict_rejection_reasons"], ["EMA_DIRECTION"])
+        self.assertEqual(events[0]["structure"]["ema_confirmation_bars"], 3)
+
     def test_new_start_retires_old_symbol_side_before_any_new_live_fresh(self):
         state, _ = reconcile_structure_scan(default_state(), [evaluation(compression_id="old", compression_start_time=100)], 1_000)
         state, _ = reconcile_structure_scan(state, [evaluation(compression_id="new", compression_start_time=200)], 2_000)
@@ -220,6 +256,53 @@ class CompressionStateMachineTests(unittest.TestCase):
 
 
 class CompressionStatePersistenceTests(unittest.TestCase):
+    def test_legacy_pool_item_without_tier_loads_as_strict_without_rewrite(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        for key in ("candidate_tier", "strict_rejection_reasons", "watch_rejection_reasons", "ema_confirmation_bars"):
+            state["pool"]["long-episode-1"].pop(key)
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            original = path.read_bytes()
+            loaded = load_compression_state(path)
+            self.assertEqual(path.read_bytes(), original)
+
+        self.assertEqual(loaded["pool"]["long-episode-1"]["candidate_tier"], "STRICT")
+        self.assertEqual(loaded["pool"]["long-episode-1"]["strict_rejection_reasons"], [])
+        self.assertEqual(loaded["pool"]["long-episode-1"]["watch_rejection_reasons"], [])
+        self.assertEqual(loaded["pool"]["long-episode-1"]["ema_confirmation_bars"], 20)
+
+    def test_legacy_event_structure_without_tier_loads_as_strict(self):
+        state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 110.6}, 2_000)
+        state, _ = apply_live_prices(state, {"TESTUSDT": 105.0}, 3_000)
+        for key in ("candidate_tier", "strict_rejection_reasons", "watch_rejection_reasons", "ema_confirmation_bars"):
+            state["fresh_outbox"][0]["structure"].pop(key)
+            state["episodes"]["long-episode-1"].pop(key)
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            loaded = load_compression_state(path)
+
+        self.assertEqual(loaded["fresh_outbox"][0]["structure"]["candidate_tier"], "STRICT")
+        self.assertEqual(loaded["episodes"]["long-episode-1"]["candidate_tier"], "STRICT")
+
+    def test_tier_fields_reject_invalid_values(self):
+        cases = (
+            ("candidate_tier", "OTHER"),
+            ("strict_rejection_reasons", ["OK", 1]),
+            ("watch_rejection_reasons", "EMA_DIRECTION"),
+            ("ema_confirmation_bars", 0),
+            ("ema_confirmation_bars", 3.0),
+        )
+        for field, value in cases:
+            with self.subTest(field=field), TemporaryDirectory() as folder:
+                state, _ = reconcile_structure_scan(default_state(), [evaluation()], 1_000)
+                state["pool"]["long-episode-1"][field] = value
+                path = Path(folder) / "state.json"
+                path.write_text(json.dumps(state), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_compression_state(path)
     def test_current_version_without_failure_field_migrates_to_empty_list(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"

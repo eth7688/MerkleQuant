@@ -31,6 +31,7 @@ _POST_FRESH_STATES = {
     "BREAKOUT_ACTIVE_LONG", "BREAKOUT_ACTIVE_SHORT",
     "BREAKOUT_RETRACING_LONG", "BREAKOUT_RETRACING_SHORT",
 }
+_CANDIDATE_TIERS = {"STRICT", "WATCH"}
 
 
 def default_state():
@@ -62,6 +63,35 @@ def _require_nonnegative_int(value, name):
 def _require_finite_number(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise ValueError(f"{name} must be finite")
+
+
+def _with_tier_defaults(item):
+    """Map records written before candidate tiers to strict-tier facts."""
+    normalized = copy.deepcopy(item)
+    normalized.setdefault("candidate_tier", "STRICT")
+    normalized.setdefault("strict_rejection_reasons", [])
+    normalized.setdefault("watch_rejection_reasons", [])
+    compression_bars = normalized.get("compression_bars")
+    default_bars = compression_bars if _is_int(compression_bars) and compression_bars > 0 else 1
+    normalized.setdefault("ema_confirmation_bars", default_bars)
+    return normalized
+
+
+def _normalize_state_tier_fields(state):
+    """Normalize in memory only; callers decide whether the state is persisted."""
+    normalized = copy.deepcopy(state)
+    for container_name in ("pool", "episodes"):
+        container = normalized.get(container_name)
+        if isinstance(container, dict):
+            for compression_id, item in list(container.items()):
+                if isinstance(item, dict):
+                    container[compression_id] = _with_tier_defaults(item)
+    outbox = normalized.get("fresh_outbox")
+    if isinstance(outbox, list):
+        for event in outbox:
+            if isinstance(event, dict) and isinstance(event.get("structure"), dict):
+                event["structure"] = _with_tier_defaults(event["structure"])
+    return normalized
 
 
 @contextmanager
@@ -123,6 +153,14 @@ def _validate_item(compression_id, item, *, allow_failed=False):
         _require_nonnegative_int(item["last_price_at"], "last_price_at")
     if "live_price" in item:
         _require_finite_number(item["live_price"], "live_price")
+    if item.get("candidate_tier") not in _CANDIDATE_TIERS:
+        raise ValueError("invalid candidate tier")
+    for key in ("strict_rejection_reasons", "watch_rejection_reasons"):
+        if (not isinstance(item.get(key), list)
+                or not all(isinstance(reason, str) for reason in item[key])):
+            raise ValueError(f"invalid {key}")
+    if not _is_int(item.get("ema_confirmation_bars")) or item["ema_confirmation_bars"] <= 0:
+        raise ValueError("invalid ema_confirmation_bars")
 
 
 def _validate_fresh_event(event):
@@ -213,6 +251,9 @@ def _migrate_v1_state(state: dict) -> dict:
     events_by_compression_id = {}
     event_ids = {}
     for event in queued_events:
+        if isinstance(event, dict) and isinstance(event.get("structure"), dict):
+            event = dict(event)
+            event["structure"] = _with_tier_defaults(event["structure"])
         _validate_fresh_event(event)
         if event["htf_alignment"] != "CONFIRMED":
             raise ValueError("v1 delivery queue contains a non-confirmed event")
@@ -244,7 +285,7 @@ def _migrate_v1_state(state: dict) -> dict:
         if not isinstance(source, dict):
             unpublished_ids.append(event_id)
             continue
-        structure = copy.deepcopy(source)
+        structure = _with_tier_defaults(source)
         side = structure.get("side")
         structure["compression_id"] = compression_id
         structure["fresh_emitted"] = True
@@ -287,11 +328,13 @@ def load_compression_state(path: Path) -> dict:
             state = dict(state)
             state.setdefault("legacy_unpublished_event_ids", [])
             state.setdefault("last_scan_failures", [])
+    state = _normalize_state_tier_fields(state)
     _validate_state(state)
     return state
 
 
 def save_compression_state(path: Path, state: dict) -> None:
+    state = _normalize_state_tier_fields(state)
     _validate_state(state)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +406,7 @@ def reconcile_structure_scan(state: dict, evaluations: list[dict], now_ms: int, 
             raise ValueError("evaluation symbol and side are required")
         observed_pairs.add((symbol, side))
         if _eligible(evaluation):
+            evaluation = _with_tier_defaults(evaluation)
             durable_id = effective_compression_id(out, evaluation)
             if durable_id != compression_id:
                 evaluation = copy.deepcopy(evaluation)
