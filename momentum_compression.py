@@ -409,7 +409,7 @@ def _evaluate_prepared_side(
         if watch_reasons:
             result = _rejected(
                 symbol, side, evaluated_at_ms, htf_alignment,
-                watch_reasons, params, bars, window,
+                watch_reasons, params, watch_bars, watch_window,
             )
             result["strict_rejection_reasons"] = list(dict.fromkeys(strict_reasons))
             result["watch_rejection_reasons"] = watch_reasons

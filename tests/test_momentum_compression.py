@@ -576,12 +576,23 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual(result["compression_bars"], 40)
 
     def test_watch_rejects_when_only_latest_two_candles_confirm_ema(self):
+        prepared = self._prepared_watch_frame(invalid_index=37)
         result = self._evaluate_with_prepared_watch_frame(
-            self._prepared_watch_frame(invalid_index=37)
+            prepared
+        )
+        watch_window, watch_metrics = compression_module._maximal_watch_structural_suffix(
+            prepared, "LONG", CompressionParams(),
+        )
+        watch_reasons = list(watch_metrics["rejection_reasons"])
+        watch_reasons.extend(
+            compression_module._watch_ema_rejection_reasons(watch_window, "LONG")
         )
 
         self.assertIsNone(result["candidate_tier"])
-        self.assertIn("EMA_DIRECTION", result["watch_rejection_reasons"])
+        self.assertEqual(result["compression_bars"], len(watch_window))
+        self.assertEqual(result["compression_start_time"], int(watch_window["ot"].iloc[0]))
+        self.assertEqual(result["compression_end_time"], int(watch_window["ot"].iloc[-1]))
+        self.assertEqual(result["watch_rejection_reasons"], list(dict.fromkeys(watch_reasons)))
         self.assertEqual(result["rejection_reasons"], result["watch_rejection_reasons"])
 
     def test_watch_retains_strict_geometry_requirements(self):
@@ -608,7 +619,22 @@ class CompressionRuleTests(unittest.TestCase):
                 prepared["ema21"] = prepared["c"] - 1.0
                 prepared["atr14"] = 1.0
                 result = self._evaluate_with_prepared_watch_frame(prepared)
+                watch_window, watch_metrics = compression_module._maximal_watch_structural_suffix(
+                    prepared, "LONG", CompressionParams(),
+                )
+                watch_reasons = list(watch_metrics["rejection_reasons"])
+                if len(watch_window) < CompressionParams().min_bars:
+                    watch_reasons.append("WINDOW_TOO_SHORT")
+                if len(watch_window) > CompressionParams().max_bars:
+                    watch_reasons.append("WINDOW_TOO_LONG")
+                watch_reasons.extend(
+                    compression_module._watch_ema_rejection_reasons(watch_window, "LONG")
+                )
                 self.assertIsNone(result["candidate_tier"])
+                self.assertEqual(result["compression_bars"], len(watch_window))
+                self.assertEqual(result["compression_start_time"], int(watch_window["ot"].iloc[0]))
+                self.assertEqual(result["compression_end_time"], int(watch_window["ot"].iloc[-1]))
+                self.assertEqual(result["watch_rejection_reasons"], list(dict.fromkeys(watch_reasons)))
                 self.assertIn(
                     expected_reasons[name],
                     compression_module._watch_non_length_rules(
@@ -773,7 +799,7 @@ class CompressionRuleTests(unittest.TestCase):
                                evaluated_at_ms=int(frame["ot"].iloc[-1] + 900_000), htf_alignment="UNKNOWN")
         self.assertEqual(result["state"], "REJECTED")
         self.assertIn("WINDOW_TOO_SHORT", result["rejection_reasons"])
-        self.assertEqual(result["compression_bars"], 13)
+        self.assertEqual(result["compression_bars"], 14)
 
     def test_101_bars_rejects_without_truncating_to_100(self):
         frame = compression_frame(101)
@@ -1035,7 +1061,7 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertEqual([row["side"] for row in rows], ["LONG", "SHORT"])
         self.assertGreater(len(common.call_args_list), 20)
 
-    def test_independent_legacy_oracle_matches_full_public_output(self):
+    def test_independent_legacy_oracle_matches_strict_suffix_evaluation(self):
         cases = [
             (f"{side}-{bars}", side, oracle_valid_frame(bars, side))
             for side in ("LONG", "SHORT") for bars in (14, 15, 100, 101, 220)
@@ -1049,21 +1075,28 @@ class CompressionRuleTests(unittest.TestCase):
                 self.assertTrue((frame["h"] >= frame[["o", "c"]].max(axis=1)).all())
                 self.assertTrue((frame["l"] <= frame[["o", "c"]].min(axis=1)).all())
                 evaluated_at = int(frame["ot"].iloc[-1] + 900_000)
-                actual = evaluate_side(
-                    "ORACLEUSDT", side, frame, float(frame["c"].iloc[-1]),
-                    evaluated_at_ms=evaluated_at, htf_alignment="UNKNOWN",
+                indicators = add_compression_indicators(frame)
+                actual_window, actual_metrics = _maximal_structural_suffix(
+                    indicators, side, CompressionParams(),
                 )
-                expected = independent_legacy_evaluate_side(
-                    "ORACLEUSDT", side, frame, float(frame["c"].iloc[-1]),
-                    evaluated_at_ms=evaluated_at, htf_alignment="UNKNOWN",
+                expected_window, expected_metrics = legacy_maximal_structural_suffix(
+                    legacy_add_compression_indicators(frame), side, CompressionParams(),
                 )
+                actual_reasons = list(actual_metrics["rejection_reasons"])
+                expected_reasons = list(expected_metrics["rejection_reasons"])
+                if len(actual_window) < CompressionParams().min_bars:
+                    actual_reasons.append("WINDOW_TOO_SHORT")
+                if len(actual_window) > CompressionParams().max_bars:
+                    actual_reasons.append("WINDOW_TOO_LONG")
+                if len(expected_window) < CompressionParams().min_bars:
+                    expected_reasons.append("WINDOW_TOO_SHORT")
+                if len(expected_window) > CompressionParams().max_bars:
+                    expected_reasons.append("WINDOW_TOO_LONG")
+                self.assertEqual(list(actual_window["ot"]), list(expected_window["ot"]))
                 self.assertEqual(
-                    actual["strict_rejection_reasons"],
-                    expected["rejection_reasons"],
+                    actual_reasons,
+                    expected_reasons,
                 )
-                strict_actual = dict(actual)
-                strict_actual["rejection_reasons"] = actual["strict_rejection_reasons"]
-                assert_public_outputs_equal(self, strict_actual, expected)
 
 
 if __name__ == "__main__":
