@@ -99,6 +99,30 @@ class CompressionApiTests(unittest.TestCase):
         self.assertEqual(payload["scan_failures"], failures)
         self.assertEqual(payload["scan"]["errors"], len(payload["scan_failures"]))
 
+    def test_status_exposes_copied_tier_and_split_rejection_maps(self):
+        self._login()
+        monitor = {
+            "running": True,
+            "tier_counts": {"STRICT": 2, "WATCH": 5},
+            "strict_rejection_counts": {"CLOSE_IN_EMA_BAND": 9},
+            "watch_rejection_counts": {"INSUFFICIENT_PIVOTS": 4},
+            "rejection_counts": {"CLOSE_IN_EMA_BAND": 9},
+        }
+        with patch.object(web_ui, "load_compression_state", return_value={
+            "pool": {}, "episodes": {}, "last_scan_failures": [],
+        }), \
+             patch.object(web_ui._compression_monitor, "status", return_value=monitor), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value=set()), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        self.assertEqual(payload["tier_counts"], {"STRICT": 2, "WATCH": 5})
+        self.assertEqual(payload["strict_rejection_counts"], {"CLOSE_IN_EMA_BAND": 9})
+        self.assertEqual(payload["watch_rejection_counts"], {"INSUFFICIENT_PIVOTS": 4})
+        self.assertEqual(payload["rejection_counts"], {"CLOSE_IN_EMA_BAND": 9})
+        payload["tier_counts"]["STRICT"] = 0
+        self.assertEqual(monitor["tier_counts"]["STRICT"], 2)
+
     def test_status_marks_unknown_conflict_and_nonconfirmed_rows_not_eligible_for_wechat(self):
         self._login()
         pool = {
@@ -113,6 +137,23 @@ class CompressionApiTests(unittest.TestCase):
             payload = self.client.get("/api/compression/status").get_json()
 
         self.assertEqual({row["wechat_status"] for row in payload["pool_rows"]}, {"not_eligible"})
+
+    def test_status_keeps_watch_unknown_rows_eligible_for_wechat_delivery(self):
+        self._login()
+        pool = {
+            "watch": {
+                "compression_id": "watch", "symbol": "WATCHUSDT", "side": "LONG",
+                "state": "BREAKOUT_ACTIVE_LONG", "candidate_tier": "WATCH",
+                "htf_alignment": "UNKNOWN",
+            },
+        }
+        with patch.object(web_ui, "load_compression_state", return_value={"pool": pool, "episodes": {}}), \
+             patch.object(web_ui._compression_monitor, "status", return_value={"running": False}), \
+             patch.object(web_ui, "compression_sound_available_ids", return_value=set()), \
+             patch.object(web_ui, "compression_delivery_statuses", return_value={"watch": "pending"}):
+            payload = self.client.get("/api/compression/status").get_json()
+
+        self.assertEqual(payload["pool_rows"][0]["wechat_status"], "pending")
 
     def test_only_15m_manual_compression_scan_is_valid(self):
         self.assertEqual(self.client.get("/scan/compression/15m").status_code, 401)
@@ -328,6 +369,44 @@ class CompressionDashboardUiTests(unittest.TestCase):
         self.assertLess(rejection_section.index("A_HIGH"), rejection_section.index("Z_HIGH"))
         self.assertLess(rejection_section.index("Z_HIGH"), rejection_section.index("B_MIDDLE"))
         self.assertLess(rejection_section.index("B_MIDDLE"), rejection_section.index("A_LOW"))
+
+    def test_renderer_shows_tiers_in_all_tables_and_split_rejections(self):
+        rendered = render_compression_payload({
+            "tier_counts": {"STRICT": 1, "WATCH": 2},
+            "strict_rejection_counts": {"A_STRICT": 3, "B_STRICT": 1},
+            "watch_rejection_counts": {"A_WATCH": 4, "B_WATCH": 2},
+            "pool_rows": [
+                {"symbol": "STRICTUSDT", "side": "LONG", "state": "PRE_BREAKOUT", "candidate_tier": "STRICT"},
+                {"symbol": "WATCHUSDT", "side": "SHORT", "state": "COMPRESSION_ACTIVE_SHORT", "candidate_tier": "WATCH"},
+                {"symbol": "CURRENTUSDT", "side": "LONG", "state": "BREAKOUT_ACTIVE_LONG", "candidate_tier": "WATCH"},
+            ],
+            "episode_rows": [
+                {"symbol": "TERMINALUSDT", "side": "SHORT", "state": "BREAKOUT_FAILED", "candidate_tier": "STRICT"},
+            ],
+        })["main"]["innerHTML"]
+
+        self.assertIn("严格级", rendered)
+        self.assertIn("观察级", rendered)
+        self.assertIn("严格级拒绝统计", rendered)
+        self.assertIn("观察级拒绝统计", rendered)
+        long_section = rendered[rendered.index("LONG 观察池"):rendered.index("SHORT 观察池")]
+        short_section = rendered[rendered.index("SHORT 观察池"):rendered.index("当前突破")]
+        breakout_section = rendered[rendered.index("当前突破"):rendered.index("终止结构")]
+        terminal_section = rendered[rendered.index("终止结构"):rendered.index("严格级拒绝统计")]
+        self.assertIn("等级", long_section)
+        self.assertIn("等级", short_section)
+        self.assertIn("严格级", long_section)
+        self.assertIn("观察级", short_section)
+        self.assertIn("观察级", breakout_section)
+        self.assertIn("严格级", terminal_section)
+
+    def test_renderer_treats_legacy_rows_as_strict(self):
+        rendered = render_compression_payload({
+            "pool_rows": [{"symbol": "LEGACYUSDT", "side": "LONG", "state": "PRE_BREAKOUT"}],
+        })["main"]["innerHTML"]
+        pool_section = rendered[rendered.index("LONG 观察池"):rendered.index("SHORT 观察池")]
+        self.assertIn("LEGACYUSDT", pool_section)
+        self.assertIn("严格级", pool_section)
 
     def test_renderer_retains_full_symbols_in_each_compression_table(self):
         rendered = render_compression_payload({

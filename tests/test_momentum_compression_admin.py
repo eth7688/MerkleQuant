@@ -40,6 +40,9 @@ class CompressionInternalApiTests(unittest.TestCase):
             "last_price_message_at": 88,
             "last_error": "",
             "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+            "tier_counts": {"STRICT": 2, "WATCH": 1},
+            "strict_rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+            "watch_rejection_counts": {"DIRECTIONAL_TOUCHES": 3},
             "unexpected": "must not leak",
         }
         with patch.object(web_ui._compression_monitor, "status", return_value=monitor), patch.object(
@@ -69,9 +72,30 @@ class CompressionInternalApiTests(unittest.TestCase):
                     "eligible": 3,
                     "errors": 1,
                     "rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+                    "tier_counts": {"STRICT": 2, "WATCH": 1},
+                    "strict_rejection_counts": {"INSUFFICIENT_PIVOTS": 7},
+                    "watch_rejection_counts": {"DIRECTIONAL_TOUCHES": 3},
                 },
             },
         )
+
+    def test_loopback_status_excludes_pool_alert_and_webhook_facts(self):
+        monitor = {
+            "tier_counts": {"STRICT": 1, "WATCH": 2},
+            "strict_rejection_counts": {"A": 3},
+            "watch_rejection_counts": {"B": 4},
+        }
+        with patch.object(web_ui._compression_monitor, "status", return_value=monitor):
+            response = self.client.get("/internal/compression/status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["scan"]["tier_counts"], {"STRICT": 1, "WATCH": 2})
+        self.assertEqual(payload["scan"]["strict_rejection_counts"], {"A": 3})
+        self.assertEqual(payload["scan"]["watch_rejection_counts"], {"B": 4})
+        serialized = str(payload)
+        for forbidden in ("pool_rows", "symbol", "alert", "delivery_queue", "webhook"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_loopback_boolean_enable_uses_monitor_switch(self):
         with patch.object(
