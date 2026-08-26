@@ -479,7 +479,49 @@ def oracle_valid_frame(bars, side="LONG", anomaly_index=None):
     return frame
 
 
+def real_geometry_indicators(side, *, opposite_events, width=3.0, drift=0.0):
+    """Build real wick/boundary geometry without mocking touch detection."""
+    bars = 15
+    indexes = np.arange(bars, dtype=float)
+    direction = 1.0 if side == "LONG" else -1.0
+    slope = direction * drift / (bars - 1)
+    midline = 101.5 + slope * indexes
+    upper = midline + width / 2
+    lower = midline - width / 2
+    close = midline + (0.2 if side == "LONG" else -0.2)
+    high, low = upper - 0.5, lower + 0.5
+    directional_events = (2, 7, 12)
+    if side == "LONG":
+        high[list(opposite_events)] = upper[list(opposite_events)]
+        low[list(directional_events)] = lower[list(directional_events)]
+        ema8, ema21 = close - 0.5, close - 1.0
+    else:
+        high[list(directional_events)] = upper[list(directional_events)]
+        low[list(opposite_events)] = lower[list(opposite_events)]
+        ema8, ema21 = close + 0.5, close + 1.0
+    frame = pd.DataFrame({
+        "ot": BASE_OT + indexes.astype(int) * 900_000,
+        "o": close, "h": high, "l": low, "c": close,
+        "v": np.full(bars, 1000.0),
+    })
+    indicators = add_compression_indicators(frame)
+    indicators["ema8"], indicators["ema21"], indicators["atr14"] = ema8, ema21, 1.0
+    common = {
+        "pivot_highs": [2, 12], "pivot_lows": [2, 12],
+        "envelope": {
+            "upper": pd.Series(upper), "lower": pd.Series(lower),
+            "upper_slope": slope, "lower_slope": slope,
+        },
+        "contraction_ratio": 0.5,
+    }
+    return indicators, common
+
+
 class CompressionIndicatorTests(unittest.TestCase):
+    def test_benchmark_inputs_keep_production_220_bar_histories(self):
+        frames = [benchmark_frame_for(seed)[0] for seed in range(500)]
+        self.assertTrue(all(len(frame) == 220 for frame in frames))
+
     def test_default_parameters_match_approved_spec(self):
         params = CompressionParams()
         self.assertEqual(params.pivot_span, 2)
@@ -746,6 +788,77 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertLessEqual(result["channel_width_atr"], 3.0)
         self.assertTrue(math.isfinite(result["midline_drift_atr"]))
         self.assertLessEqual(result["midline_drift_atr"], 4.0)
+
+    def test_public_evaluate_side_reuses_each_overlap_geometry_across_strict_and_watch(self):
+        raw = valid_compression_frame(220)
+        prepared = add_compression_indicators(raw)
+        prepared.loc[:179, ["ema8", "ema21", "c"]] = [100.0, 101.0, 99.0]
+        prepared.loc[180:, ["ema8", "ema21", "c"]] = [101.0, 100.0, 102.0]
+        params = CompressionParams(min_bars=50)
+        lengths = []
+        with patch(
+            "momentum_compression.add_compression_indicators", return_value=prepared,
+        ), patch(
+            "momentum_compression._maximal_watch_structural_suffix",
+            wraps=compression_module._maximal_watch_structural_suffix,
+        ) as watch, patch(
+            "momentum_compression._touch_events",
+            wraps=compression_module._touch_events,
+        ) as touch_events:
+            result = evaluate_side(
+                "CACHEUSDT", "LONG", raw, float(raw["c"].iloc[-1]),
+                evaluated_at_ms=int(raw["ot"].iloc[-1] + 900_000),
+                htf_alignment="UNKNOWN", params=params,
+            )
+            lengths = [len(call.args[0]) for call in touch_events.call_args_list]
+
+        self.assertEqual(result["state"], "REJECTED")
+        self.assertIn("WINDOW_TOO_SHORT", result["strict_rejection_reasons"])
+        self.assertEqual(watch.call_count, 1)
+        self.assertTrue(all(lengths.count(length) == 2 for length in range(16, 41)))
+
+    def test_real_geometry_rules_cover_boundary_counts_and_exact_thresholds_for_both_sides(self):
+        cases = []
+        for side in ("LONG", "SHORT"):
+            cases.extend((
+                (side, "one_opposite", (5,), 3.0, 4.0, "INSUFFICIENT_OPPOSITE_TOUCHES"),
+                (side, "two_opposite", (5, 10), 3.0, 4.0, None),
+                (side, "wide", (5, 10), 3.000001, 4.0, "CHANNEL_TOO_WIDE"),
+                (side, "drifting", (5, 10), 3.0, 4.000001, "CHANNEL_DRIFT_TOO_LARGE"),
+            ))
+        for side, name, opposite, width, drift, expected_reason in cases:
+            with self.subTest(side=side, name=name):
+                indicators, common = real_geometry_indicators(
+                    side, opposite_events=opposite, width=width, drift=drift,
+                )
+                rules = _non_length_rules(
+                    indicators, side, CompressionParams(), common=common,
+                )
+                self.assertEqual(len(rules["opposite_events"]), len(opposite))
+                self.assertAlmostEqual(rules["channel_width_atr"], width)
+                self.assertAlmostEqual(rules["midline_drift_atr"], drift)
+                if expected_reason:
+                    self.assertIn(expected_reason, rules["rejection_reasons"])
+                else:
+                    self.assertNotIn("INSUFFICIENT_OPPOSITE_TOUCHES", rules["rejection_reasons"])
+                    self.assertNotIn("CHANNEL_TOO_WIDE", rules["rejection_reasons"])
+                    self.assertNotIn("CHANNEL_DRIFT_TOO_LARGE", rules["rejection_reasons"])
+
+    def test_real_watch_evaluation_retains_geometry_rejections_for_long_and_short(self):
+        for side, reason in (
+            ("LONG", "CHANNEL_TOO_WIDE"),
+            ("SHORT", "CHANNEL_DRIFT_TOO_LARGE"),
+        ):
+            with self.subTest(side=side):
+                indicators, _common = real_geometry_indicators(
+                    side, opposite_events=(5, 10),
+                    width=3.000001 if side == "LONG" else 3.0,
+                    drift=4.0 if side == "LONG" else 4.000001,
+                )
+                rules = compression_module._watch_non_length_rules(
+                    indicators, side, CompressionParams(), common=_common,
+                )
+                self.assertIn(reason, rules["rejection_reasons"])
 
     def test_watch_suffix_selection_is_independent_of_strict_ema_suffix(self):
         result = self._evaluate_with_prepared_watch_frame(self._prepared_watch_frame())

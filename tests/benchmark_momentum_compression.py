@@ -28,18 +28,33 @@ def frame_for(seed, bars=220):
     deep = seed < 100
     side = "LONG" if seed % 2 == 0 else "SHORT"
     if not deep:
-        indexes = np.arange(40, dtype=float)
-        pulse = np.sin(indexes * np.pi / 3)
+        prefix_bars = bars - 40
+        tail_indexes = np.arange(prefix_bars, bars, dtype=float)
+        tail_offsets = np.arange(40, dtype=float)
         direction = 1.0 if side == "LONG" else -1.0
-        frame = pd.DataFrame({
-            "ot": BASE_OT + indexes.astype(int) * 900_000,
-            "o": 100.0 + direction * 0.4 * indexes,
-            "h": 105.0 + direction * (0.3 if side == "LONG" else 0.5) * indexes + pulse,
-            "l": 95.0 + direction * (0.5 if side == "LONG" else 0.3) * indexes + pulse,
-            "c": 100.0 + direction * 0.4 * indexes,
-            "v": np.full(len(indexes), 1000.0 + seed),
+        prefix_indexes = np.arange(prefix_bars, dtype=float)
+        prefix_close = 170.0 - direction * 0.4 * prefix_indexes
+        prefix = pd.DataFrame({
+            "ot": BASE_OT + prefix_indexes.astype(int) * 900_000,
+            "o": prefix_close,
+            "h": prefix_close + 5.0,
+            "l": prefix_close - 5.0,
+            "c": prefix_close,
+            "v": np.full(prefix_bars, 1000.0 + seed),
         })
-        return frame, {"cohort": "normal", "intended_side": side}
+        pulse = np.sin(tail_offsets * np.pi / 3)
+        tail_close = 100.0 + direction * 0.4 * tail_offsets
+        tail = pd.DataFrame({
+            "ot": BASE_OT + tail_indexes.astype(int) * 900_000,
+            "o": tail_close,
+            "h": 105.0 + direction * (0.3 if side == "LONG" else 0.5) * tail_offsets + pulse,
+            "l": 95.0 + direction * (0.5 if side == "LONG" else 0.3) * tail_offsets + pulse,
+            "c": tail_close,
+            "v": np.full(len(tail_indexes), 1000.0 + seed),
+        })
+        return pd.concat((prefix, tail), ignore_index=True), {
+            "cohort": "normal", "intended_side": side,
+        }
     direction = 1.0 if side == "LONG" else -1.0
     slope = 0.09 + 0.002 * (seed % 5)
     close = 100.0 + 0.01 * (seed % 17) + direction * slope * indexes
@@ -54,10 +69,8 @@ def frame_for(seed, bars=220):
         "c": close,
         "v": np.full(bars, 1000.0 + seed),
     })
-    # The normal anomaly enters the selected suffix's first third, forcing a
-    # late qualifying window under the range-contraction rule.
-    anomaly_index = 20 + (seed % 3) if deep else 180 + (seed % 5)
-    anomaly_size = 20.0 if deep else 80.0 + 0.1 * (seed % 3)
+    anomaly_index = 20 + (seed % 3)
+    anomaly_size = 20.0
     if side == "LONG":
         frame.loc[anomaly_index, "h"] += anomaly_size
     else:
@@ -75,10 +88,12 @@ def _validate_rows(rows):
 
 
 def run_benchmark():
+    inputs = [(seed, *frame_for(seed)) for seed in range(500)]
+    if any(len(frame) != 220 for _seed, frame, _metadata in inputs):
+        raise AssertionError("all 500 benchmark frames must contain 220 candles")
     records = []
     started = time.perf_counter()
-    for seed in range(500):
-        frame, metadata = frame_for(seed)
+    for seed, frame, metadata in inputs:
         if not (frame["h"] >= frame[["o", "c"]].max(axis=1)).all():
             raise AssertionError(f"invalid high at seed {seed}")
         if not (frame["l"] <= frame[["o", "c"]].min(axis=1)).all():
@@ -102,24 +117,29 @@ def run_benchmark():
     deep_window_too_long = sum(
         "WINDOW_TOO_LONG" in record["row"]["rejection_reasons"] for record in deep_intended
     )
-    normal_active_sides = {
+    normal_active_sides = Counter(
         record["row"]["side"] for record in records
-        if record["cohort"] == "normal" and not record["row"]["rejection_reasons"]
-    }
+        if record["cohort"] == "normal"
+        and record["row"]["side"] == record["intended_side"]
+        and not record["row"]["rejection_reasons"]
+    )
     if len(deep_intended) != 100 or deep_window_too_long != 100:
         raise AssertionError(
             f"deep traversal evidence missing: intended={len(deep_intended)} "
             f"window_too_long={deep_window_too_long}"
         )
-    if normal_active_sides != {"LONG", "SHORT"}:
-        raise AssertionError(f"normal cases did not exercise active both-side paths: {normal_active_sides}")
+    if normal_active_sides != {"LONG": 200, "SHORT": 200}:
+        raise AssertionError(
+            "normal cases did not preserve 200 active directions per side: "
+            f"{dict(normal_active_sides)}"
+        )
     return elapsed, {
         "records": len(records),
         "states": dict(sorted(states.items())),
         "rejections": dict(sorted(rejections.items())),
         "deep_intended_rows": len(deep_intended),
         "deep_window_too_long": deep_window_too_long,
-        "normal_active_sides": sorted(normal_active_sides),
+        "normal_active_sides": dict(sorted(normal_active_sides.items())),
     }
 
 

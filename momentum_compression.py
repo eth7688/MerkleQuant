@@ -431,6 +431,7 @@ def _evaluate_prepared_side(
     params: CompressionParams,
     common_cache: dict | None = None,
 ) -> dict:
+    common_cache = {} if common_cache is None else common_cache
     strict_result, window, metrics, strict_reasons = _strict_prepared_evaluation(
         symbol, side, frame, indicators, live_price,
         evaluated_at_ms=evaluated_at_ms, htf_alignment=htf_alignment,
