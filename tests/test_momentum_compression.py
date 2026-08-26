@@ -231,8 +231,14 @@ def legacy_non_length_rules(frame, side, params):
     if len(opposite_events) < params.min_opposite_boundary_touches:
         reasons.append("INSUFFICIENT_OPPOSITE_TOUCHES")
     channel_width_atr = (
-        float(upper.iloc[-1] - lower.iloc[-1]) / last_atr
-        if math.isfinite(last_atr) and last_atr > 0 else float("inf")
+        (float(upper.iloc[-1]) - float(lower.iloc[-1])) / last_atr
+        if (
+            math.isfinite(float(upper.iloc[-1]))
+            and math.isfinite(float(lower.iloc[-1]))
+            and float(upper.iloc[-1]) > float(lower.iloc[-1])
+            and math.isfinite(last_atr)
+            and last_atr > 0
+        ) else float("inf")
     )
     if not math.isfinite(channel_width_atr) or channel_width_atr > params.max_channel_width_atr:
         reasons.append("CHANNEL_TOO_WIDE")
@@ -1092,6 +1098,7 @@ class CompressionRuleTests(unittest.TestCase):
         ):
             exact = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
         common["envelope"]["upper"] = pd.Series([103.000001] * len(indicators))
+        common.pop("compact_geometry", None)
         with patch(
             "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
         ):
@@ -1100,6 +1107,63 @@ class CompressionRuleTests(unittest.TestCase):
         self.assertNotIn("CHANNEL_TOO_WIDE", exact["rejection_reasons"])
         self.assertGreater(above["channel_width_atr"], 3.0)
         self.assertIn("CHANNEL_TOO_WIDE", above["rejection_reasons"])
+
+    def test_channel_width_rejects_equal_and_inverted_boundaries(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        for name, upper, lower in (
+            ("equal", 100.0, 100.0),
+            ("inverted", 99.0, 100.0),
+        ):
+            with self.subTest(name=name):
+                common = _common_structure(indicators, CompressionParams())
+                common["envelope"] = {
+                    "upper": pd.Series([upper] * len(indicators)),
+                    "lower": pd.Series([lower] * len(indicators)),
+                    "upper_slope": 0.0, "lower_slope": 0.0,
+                }
+                indicators.loc[indicators.index[-1], "atr14"] = 1.0
+                rules = _non_length_rules(
+                    indicators, "LONG", CompressionParams(), common=common,
+                )
+                self.assertEqual(rules["channel_width_atr"], float("inf"))
+                self.assertIn("CHANNEL_TOO_WIDE", rules["rejection_reasons"])
+
+    def test_shared_common_reuses_geometry_for_long_and_short(self):
+        indicators = add_compression_indicators(valid_compression_frame(15))
+        common = _common_structure(indicators, CompressionParams())
+        with patch(
+            "momentum_compression._touch_events", wraps=compression_module._touch_events,
+        ) as touch_events:
+            long_rules = _non_length_rules(
+                indicators, "LONG", CompressionParams(), common=common,
+            )
+            short_rules = _non_length_rules(
+                indicators, "SHORT", CompressionParams(), common=common,
+            )
+        self.assertEqual(touch_events.call_count, 2)
+        self.assertEqual(long_rules["directional_events"], short_rules["opposite_events"])
+        self.assertEqual(long_rules["opposite_events"], short_rules["directional_events"])
+
+    def test_watch_retains_new_geometry_reasons_for_both_sides(self):
+        for side in ("LONG", "SHORT"):
+            for reason in (
+                "INSUFFICIENT_OPPOSITE_TOUCHES",
+                "CHANNEL_TOO_WIDE",
+                "CHANNEL_DRIFT_TOO_LARGE",
+            ):
+                with self.subTest(side=side, reason=reason), patch.object(
+                    compression_module,
+                    "_non_length_rules",
+                    return_value={
+                        "rejection_reasons": [
+                            "EMA_DIRECTION", "CLOSE_IN_EMA_BAND", reason,
+                        ],
+                    },
+                ):
+                    rules = compression_module._watch_non_length_rules(
+                        pd.DataFrame(), side, CompressionParams(),
+                    )
+                self.assertEqual(rules["rejection_reasons"], [reason])
 
     def test_midline_drift_accepts_exactly_four_atr_and_rejects_above(self):
         indicators = add_compression_indicators(valid_compression_frame(15))
@@ -1117,6 +1181,7 @@ class CompressionRuleTests(unittest.TestCase):
             exact = _non_length_rules(indicators, "LONG", CompressionParams(), common=common)
         common["envelope"]["upper_slope"] = 4.000001 / (len(indicators) - 1)
         common["envelope"]["lower_slope"] = 4.000001 / (len(indicators) - 1)
+        common.pop("compact_geometry", None)
         with patch(
             "momentum_compression._touch_events", side_effect=([4, 8], [2, 6, 10]),
         ):

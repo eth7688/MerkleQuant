@@ -17,14 +17,29 @@ PUBLIC_AUDIT_FIELDS = {
     "rejection_reasons", "compression_bars", "compression_start_time",
     "compression_end_time", "upper_boundary_price", "lower_boundary_price", "atr14",
     "breakout_buffer_price", "directional_touch_times", "score_components", "compression_id",
+    "opposite_touch_count", "opposite_touch_times", "channel_width_atr",
+    "midline_drift_atr",
 }
 
 
 def frame_for(seed, bars=220):
-    """Deterministic, valid OHLCV path; seed controls cohort and geometry."""
+    """Deterministic active and rejection-heavy OHLCV benchmark cohorts."""
     indexes = np.arange(bars, dtype=float)
     deep = seed < 100
     side = "LONG" if seed % 2 == 0 else "SHORT"
+    if not deep:
+        indexes = np.arange(40, dtype=float)
+        pulse = np.sin(indexes * np.pi / 3)
+        direction = 1.0 if side == "LONG" else -1.0
+        frame = pd.DataFrame({
+            "ot": BASE_OT + indexes.astype(int) * 900_000,
+            "o": 100.0 + direction * 0.4 * indexes,
+            "h": 105.0 + direction * (0.3 if side == "LONG" else 0.5) * indexes + pulse,
+            "l": 95.0 + direction * (0.5 if side == "LONG" else 0.3) * indexes + pulse,
+            "c": 100.0 + direction * 0.4 * indexes,
+            "v": np.full(len(indexes), 1000.0 + seed),
+        })
+        return frame, {"cohort": "normal", "intended_side": side}
     direction = 1.0 if side == "LONG" else -1.0
     slope = 0.09 + 0.002 * (seed % 5)
     close = 100.0 + 0.01 * (seed % 17) + direction * slope * indexes

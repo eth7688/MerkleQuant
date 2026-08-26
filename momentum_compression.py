@@ -163,12 +163,49 @@ def _non_length_rules(frame, side, params, *, common=None):
             "envelope": envelope,
         }
     upper, lower = envelope["upper"], envelope["lower"]
-    atr = frame["atr14"].replace(0, np.nan)
+    geometry = common.get("compact_geometry")
+    if geometry is None:
+        atr = frame["atr14"].replace(0, np.nan)
+        last_atr = float(atr.iloc[-1])
+        last_upper = float(upper.iloc[-1])
+        last_lower = float(lower.iloc[-1])
+        channel_width_atr = (
+            (last_upper - last_lower) / last_atr
+            if (
+                math.isfinite(last_upper)
+                and math.isfinite(last_lower)
+                and last_upper > last_lower
+                and math.isfinite(last_atr)
+                and last_atr > 0
+            )
+            else float("inf")
+        )
+        midline_slope = (envelope["upper_slope"] + envelope["lower_slope"]) / 2
+        midline_drift_atr = (
+            abs(midline_slope) * (len(frame) - 1) / last_atr
+            if math.isfinite(last_atr) and last_atr > 0
+            else float("inf")
+        )
+        geometry = {
+            "upper_events": _touch_events(
+                frame["h"], upper, atr, params.touch_tolerance_atr,
+            ),
+            "lower_events": _touch_events(
+                frame["l"], lower, atr, params.touch_tolerance_atr,
+            ),
+            "last_atr": last_atr,
+            "channel_width_atr": channel_width_atr,
+            "midline_drift_atr": midline_drift_atr,
+        }
+        common["compact_geometry"] = geometry
+    upper_events = geometry["upper_events"]
+    lower_events = geometry["lower_events"]
+    last_atr = geometry["last_atr"]
+    channel_width_atr = geometry["channel_width_atr"]
+    midline_drift_atr = geometry["midline_drift_atr"]
     ema8, ema21 = frame["ema8"], frame["ema21"]
     ema_low = pd.concat((ema8, ema21), axis=1).min(axis=1)
     ema_high = pd.concat((ema8, ema21), axis=1).max(axis=1)
-    upper_events = _touch_events(frame["h"], upper, atr, params.touch_tolerance_atr)
-    lower_events = _touch_events(frame["l"], lower, atr, params.touch_tolerance_atr)
     if side == "LONG":
         if not bool((ema8 > ema21).all()):
             reasons.append("EMA_DIRECTION")
@@ -179,7 +216,6 @@ def _non_length_rules(frame, side, params, *, common=None):
         directional_events, opposite_events = upper_events, lower_events
     if bool(((frame["c"] >= ema_low) & (frame["c"] <= ema_high)).any()):
         reasons.append("CLOSE_IN_EMA_BAND")
-    last_atr = float(atr.iloc[-1])
     ema_distance_atr = (
         abs(float(frame["c"].iloc[-1] - ema8.iloc[-1])) / last_atr
         if math.isfinite(last_atr) and last_atr > 0
@@ -197,19 +233,8 @@ def _non_length_rules(frame, side, params, *, common=None):
         reasons.append("INSUFFICIENT_DIRECTIONAL_TOUCHES")
     if len(opposite_events) < params.min_opposite_boundary_touches:
         reasons.append("INSUFFICIENT_OPPOSITE_TOUCHES")
-    channel_width_atr = (
-        float(upper.iloc[-1] - lower.iloc[-1]) / last_atr
-        if math.isfinite(last_atr) and last_atr > 0
-        else float("inf")
-    )
     if not math.isfinite(channel_width_atr) or channel_width_atr > params.max_channel_width_atr:
         reasons.append("CHANNEL_TOO_WIDE")
-    midline_slope = (envelope["upper_slope"] + envelope["lower_slope"]) / 2
-    midline_drift_atr = (
-        abs(midline_slope) * (len(frame) - 1) / last_atr
-        if math.isfinite(last_atr) and last_atr > 0
-        else float("inf")
-    )
     if not math.isfinite(midline_drift_atr) or midline_drift_atr > params.max_midline_drift_atr:
         reasons.append("CHANNEL_DRIFT_TOO_LARGE")
     return {
