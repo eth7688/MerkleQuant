@@ -40,6 +40,10 @@ backtest_runs/
 backups/
 video_frames/
 
+# Node dependencies (vendor tree, never commit)
+node_modules/
+dist/
+
 # Local agent state and private project memory
 .agents/
 .codex/
